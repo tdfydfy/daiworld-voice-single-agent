@@ -114,7 +114,7 @@
   }
   function setVoiceState(state){
     voiceState=state;
-    const labels={idle:'等待说话',connecting:'正在启动麦克风…',listening:'正在听…',transcribing:'正在识别…',thinking:'Agent思考中，可直接插话',speaking:'Agent播报中，可直接插话',off:'语音未开启',approval:'等待你的审批：同意或拒绝'};
+    const labels={idle:'等待说话',connecting:'启动中…',listening:'正在听…',transcribing:'识别中…',thinking:'思考中…',speaking:'播报中…',off:'语音未开启',approval:'等待审批'};
     voiceStatus.textContent=labels[state]||state;
     voiceStatus.classList.toggle('active',voiceEnabled&&state!=='off');
     $('mic').querySelector('.mic-label').textContent=voiceEnabled?'结束实时对话':'开启实时对话';
@@ -135,7 +135,7 @@
   }
   function closeGateway(){if(ws){try{ws.close()}catch{}ws=null}pending.forEach(p=>p.reject(new Error('连接关闭')));pending.clear();sessionId=null;storedSessionId=null;stopVoiceConversation(false);stopSpeech(true)}
   function profileName(){return profileEl.options[profileEl.selectedIndex]?.text||'Agent'}
-  function applyRuntimeInfo(info={}){runtime.textContent=`${profileName()} · ${info.model||'模型加载中'}${info.provider?' · '+info.provider:''}`}
+  function applyRuntimeInfo(info={}){runtime.textContent=matchMedia('(max-width:640px)').matches?`${profileName()}${info.model?' · '+info.model:''}`:`${profileName()} · ${info.model||'模型加载中'}${info.provider?' · '+info.provider:''}`}
   async function createSession(){const r=await rpc('session.create',{cols:100});sessionId=r.session_id;storedSessionId=r.stored_session_id||r.session_key||null;applyRuntimeInfo(r.info||{});if(matchMedia('(min-width:761px)').matches)void openHistory();else void refreshHistoryCount()}
   function historyDate(value){if(!value)return '';return new Date(Number(value)*1000).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false})}
   function closeHistory(){if(matchMedia('(min-width:761px)').matches)return;historyBackdrop.hidden=true}
@@ -243,7 +243,7 @@
     }
     else if(ev.type==='approval.request')renderApproval({...p});
     else if(ev.type==='clarify.request')renderClarify({...p});
-    else if(ev.type==='status.update')runtime.textContent=`${profileEl.options[profileEl.selectedIndex].text} · ${p.text||p.kind||'处理中'}`;
+    else if(ev.type==='status.update')runtime.textContent=`${profileEl.options[profileEl.selectedIndex].text}${matchMedia('(max-width:640px)').matches?'': ' · '+(p.text||p.kind||'处理中')}`;
     else if(ev.type==='error'){
       busy=false;$('stop').disabled=true;stopSpeech(true);message('system',p.message||'Hermes执行失败');
       if(voiceEnabled&&!bargeCapturing){stopBargeMonitor();setVoiceState('idle');scheduleListening()}
