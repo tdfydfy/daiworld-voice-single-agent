@@ -1,7 +1,7 @@
 # Daiworld Voice — Single Agent Edition
 
-> 当前分支：`native-open-source`
-> 开源基线：当前分支首个清理提交
+> 当前分支：`main`
+> 当前基线：Web v21 + HarmonyOS 1.0
 > 当前入口：<https://your-gateway.example/voice-native/>
 
 Daiworld Voice 有两种并存的产品形态，单 Agent 版不是主持人多 Agent 版的替代品。
@@ -11,7 +11,7 @@ Daiworld Voice 有两种并存的产品形态，单 Agent 版不是主持人多 
 | 产品形态 | 网页版 | HarmonyOS 版 | 定位 |
 |---|---|---|---|
 | 主持人多 Agent 版 | 已有，保持现状 | 已有，保持现状 | 最终高级形态。主持人负责理解意图、调度多个 Agent、组织互动、共享上下文和分配任务；各 Agent 按主持人的安排工作 |
-| 单 Agent 版 | **v21 已稳定** | **下一阶段迁移目标** | 简化形态。用户直接选择并面对一个 Agent，由该 Agent自行理解、调用工具、完成任务；用于技术探索、能力验证和聚焦式工作 |
+| 单 Agent 版 | **v21 已稳定** | **1.0 已完成并通过真机验证** | 简化形态。用户直接选择并面对一个 Agent，由该 Agent 自行理解、调用工具、完成任务；用于技术探索、能力验证和聚焦式工作 |
 
 本分支只描述和维护**单 Agent 形态**。主持人版网页和主持人版 HarmonyOS 当前不调整，它们拥有独立的交互协议和产品职责。
 
@@ -21,7 +21,7 @@ Daiworld Voice 有两种并存的产品形态，单 Agent 版不是主持人多 
 
 ### 1. Hermes 原生，而不是再造 Agent
 
-网页直接复用 Hermes 官方能力：
+Web 和 HarmonyOS 客户端直接复用 Hermes 官方能力：
 
 - `session.create / session.list / session.resume / session.delete`；
 - `prompt.submit(queued=true)`；
@@ -29,7 +29,7 @@ Daiworld Voice 有两种并存的产品形态，单 Agent 版不是主持人多 
 - 工具事件、思考事件、审批和澄清；
 - Hermes Profile、模型、历史、上下文和工具权限。
 
-网页不维护第二套 Agent 会话，不复制工具调度，不伪造“已调用某个 Agent”。
+客户端不维护第二套 Agent 会话，不复制工具调度，不伪造“已调用某个 Agent”。
 
 ### 2. 一次开启、持续对话
 
@@ -114,6 +114,19 @@ Agent 显式返回 `MEDIA:<path>` 后：
 - 历史时间和模型来自 Hermes 官方 REST；
 - 当前会话禁止删除。
 
+### 10. HarmonyOS 原生语音客户端
+
+`clients/harmony` 已实现可独立安装的 Stage 模型客户端：
+
+- 支持 HarmonyOS 6.1 / API 24，使用 ArkTS 和系统 `CoreSpeechKit`；
+- ASR/TTS 可分别选择鸿蒙离线能力或 Adapter 远端能力；
+- 本地 TTS 按短首段、长续段增量朗读，降低长回复的首句等待；
+- 麦克风持续监听，用户开口暂停当前播报，非停止指令完成后恢复播报并排队提交；
+- 精确整句“停止/stop”会中断任务与播放，并保留在对话上下文中；
+- 使用 `AUDIO_RECORDING` 长时任务支持后台和息屏监听，实际持续时间仍受设备电源策略约束；
+- 网关、Profile、语音后端、音色、语速和登录状态均持久化保存；
+- 历史按 20 条增量加载，恢复真实日期、模型、耗时、思考和工具过程；工具原始 JSON 不进入回复气泡或 TTS。
+
 ---
 
 ## 二、当前功能清单
@@ -122,15 +135,16 @@ Agent 显式返回 `MEDIA:<path>` 后：
 |---|---|
 | Agent | 三个独立 Profile 可选：`default / hexiaoma / hexiaoxin`；每次只直接面对一个 Agent |
 | 文字 | 流式回答、工具过程、思考过程、模型与耗时元数据 |
-| 语音输入 | 连续 PCM16/16k、SeedASR-2.0 partial/final、断线重连、首句 PCM 缓冲 |
-| 语音输出 | 豆包流式 TTS、Edge fallback、PCM24k 队列、真实播放排空 |
+| 语音输入 | Web：SeedASR-2.0 连续 PCM16/16k；HarmonyOS：CoreSpeechKit 离线识别或远端流式 ASR |
+| 语音输出 | Web：豆包流式 TTS + Edge fallback；HarmonyOS：系统离线 TTS 增量分段或远端 PCM24k |
 | 全双工 | Agent 思考/播报期间持续监听、真人语音暂停/恢复、补充排队 |
 | 控制 | 精确整句“停止/stop”才中断；其他语音默认作为下一轮输入 |
 | 审批 | 高风险卡、按钮、语音同意/拒绝、失败关闭 |
 | 澄清 | `clarify.request` 选择卡 |
 | 文件 | MEDIA 图片预览、附件下载、短期令牌、历史附件恢复 |
-| 历史 | 官方 list/resume/delete、20 条增量、模型/时间/总耗时 |
-| UI | 深色 Linear 风格、桌面/390px 移动端适配、对话自动跟随 |
+| 历史 | 官方 list/resume/delete、20 条增量、完整日期、模型、耗时、思考与工具过程 |
+| 后台 | HarmonyOS `AUDIO_RECORDING` 长时任务、息屏监听、连接与语音状态恢复 |
+| UI | Web 深色 Linear 桌面/移动端适配；HarmonyOS 原生语音优先界面与持久化设置 |
 | 部署 | 三个 Hermes Profile 后端 + 一个同源 FastAPI Adapter + HTTPS/WSS 反代 |
 
 ---
@@ -166,6 +180,16 @@ Agent 显式返回 `MEDIA:<path>` 后：
 - Hermes 事件渲染；
 - 历史和附件 UI。
 
+### HarmonyOS 客户端补充
+
+`clients/harmony` 负责：
+
+- ArkTS 原生消息、历史、审批、澄清、附件和 Profile 界面；
+- Hermes JSON-RPC 与 ASR/TTS WebSocket 连接；
+- CoreSpeechKit 离线识别与朗读、PCM 采集和播放；
+- 播报队列、语音暂停/恢复、硬停止和声音状态提示；
+- Preferences 长期设置、后台录音任务和生命周期恢复。
+
 ### 明确不包含
 
 单 Agent 版不包含：
@@ -187,10 +211,11 @@ Agent 显式返回 `MEDIA:<path>` 后：
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)：单 Agent v21 当前架构、状态所有权、数据流和安全边界。
 - [`docs/INTERACTION_AND_PORTING_SPEC.md`](docs/INTERACTION_AND_PORTING_SPEC.md)：跨端交互、JSON-RPC、ASR/TTS、审批、附件和历史契约。
 - [`docs/HARMONYOS_SINGLE_AGENT_MIGRATION.md`](docs/HARMONYOS_SINGLE_AGENT_MIGRATION.md)：只针对单 Agent 鸿蒙形态的迁移分层、文件落点、阶段与验收。
-- [`docs/NATIVE_TEST_MATRIX.md`](docs/NATIVE_TEST_MATRIX.md)：单 Agent专属自动化、真实服务证据、缺口及HarmonyOS L1-L6验证阶梯。
+- [`docs/NATIVE_TEST_MATRIX.md`](docs/NATIVE_TEST_MATRIX.md)：单 Agent 专属自动化、真实服务证据、缺口及 HarmonyOS L1-L6 验证阶梯。
 - [`README_NATIVE.md`](README_NATIVE.md)：本地启动和运行速查。
+- [`clients/harmony/README.md`](clients/harmony/README.md)：HarmonyOS 工程、签名、构建、语音边界和真机检查说明。
 
-旧主持人版架构仍保留在它自己的分支、网页和 HarmonyOS `main`，不以本分支文档为准。
+旧主持人版架构仍保留在它自己的项目和历史分支中，不以本仓库 `main` 的单 Agent 文档为准。
 
 ---
 
@@ -215,6 +240,18 @@ python -m uvicorn app.native_main:app \
 
 打开 `http://127.0.0.1:8844/`。
 
+### HarmonyOS 客户端
+
+使用 DevEco Studio 打开 `clients/harmony`，安装 HarmonyOS 6.1 / API 24 SDK，并在 Signing 页面启用自动签名。依赖安装和命令行构建：
+
+```powershell
+cd clients/harmony
+ohpm install
+hvigorw assembleHap --mode module -p product=default -p buildMode=debug
+```
+
+首次启动时填写 Adapter 的 HTTPS 基地址和 `VOICE_ACCESS_TOKEN`。详细环境变量、产物路径与离线语音边界见 [`clients/harmony/README.md`](clients/harmony/README.md)。
+
 ---
 
 ## 六、验证
@@ -222,15 +259,25 @@ python -m uvicorn app.native_main:app \
 ```bash
 python -m pytest -q -o 'addopts='
 node --check web_native/app.js
-node --test tests/voice_filters.test.js tests/media_speech_filter.test.js
+node --test tests/voice_filters.test.js tests/media_speech_filter.test.js tests/mobile_ui.test.js
+node clients/harmony/scripts/verify.mjs
+```
+
+安装 DevEco Studio、HarmonyOS SDK 和 Hvigor 后，再执行 HarmonyOS 完整构建：
+
+```powershell
+cd clients/harmony
+hvigorw assembleHap --mode module -p product=default -p buildMode=debug
 ```
 
 稳定基线验证记录：
 
 ```text
-Python：8 passed
-Node：7 passed
-Native专属代码：`app/native_main.py`、`app/artifacts.py`、`web_native/`
+Python：8 passed（既有服务器基线）
+Node：11 passed
+HarmonyOS：14 个 ETS 文件静态校验通过，ArkTS/Hvigor 构建通过
+真机：网关登录、持续离线 ASR、增量离线 TTS、暂停/恢复、硬停止、后台任务、历史恢复已验证
+Native/HarmonyOS 专属代码：`app/native_main.py`、`app/artifacts.py`、`web_native/`、`clients/harmony/`
 桌面/移动端真实服务证据：见 `docs/NATIVE_TEST_MATRIX.md`
 ```
 
