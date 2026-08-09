@@ -1,0 +1,12 @@
+# HarmonyOS project ignores
+.idea/
+.hvigor/
+oh_modules/
+build/
+entry/build/
+local.properties
+**/signingConfigs/*.p12
+**/*.cer
+**/*.p7b
+**/*.jks
+node_modules/

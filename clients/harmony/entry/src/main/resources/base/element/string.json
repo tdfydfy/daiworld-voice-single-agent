@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "Daiworld Voice Single Agent 客户端"
+    },
+    {
+      "name": "entry_desc",
+      "value": "单Agent实时语音客户端"
+    },
+    {
+      "name": "microphone_reason",
+      "value": "用于实时语音对话识别"
+    }
+  ]
+}
