@@ -1,7 +1,8 @@
 (()=>{
   const $=id=>document.getElementById(id);
   const convo=$('conversation'),profileEl=$('profile'),runtime=$('runtime'),connection=$('connection');
-  const voiceStatus=$('voiceStatus'),historyBackdrop=$('historyBackdrop'),historyList=$('historyList');
+  const historyBackdrop=$('historyBackdrop'),historyList=$('historyList');
+  const composerBar=document.querySelector('.composer-bar'),textToggle=$('textToggle');
   const token=()=>{let v=localStorage.getItem('native_voice_token');if(!v){v=prompt('请输入内部访问口令')||'';if(v)localStorage.setItem('native_voice_token',v)}return v};
   const base=location.pathname.endsWith('/')?location.pathname:location.pathname.replace(/[^/]*$/,'');
   const voiceFilters=globalThis.VoiceFilters;
@@ -23,8 +24,10 @@
   function clock(){return new Date().toLocaleTimeString('zh-CN',{hour12:false})}
   function compactAgentIdentity(label=''){
     const parts=String(label).split('·').map(x=>x.trim()).filter(Boolean),name=profileEl.options[profileEl.selectedIndex]?.text||'Agent';
-    const model=parts.find(x=>/(gpt|deepseek|claude|gemini|qwen|glm|kimi|doubao|llama|mistral)/i.test(x))||parts[1]||'';
-    return model?`${name} · ${model}`:name;
+    const modelIndex=parts.findIndex(x=>/(gpt|deepseek|claude|gemini|qwen|glm|kimi|doubao|llama|mistral)/i.test(x));
+    const model=modelIndex>=0?parts[modelIndex]:(parts[1]||'');
+    const provider=modelIndex>=0?(parts[modelIndex+1]||''):'';
+    return model?`${name} · ${model}${provider?' · '+provider:''}`:name;
   }
   function setAgentMeta(el,identity,timing){
     if(!el)return;let m=el.querySelector('.meta');if(!m){m=document.createElement('span');m.className='meta';el.append(m)}
@@ -52,7 +55,10 @@
     }
     if(!wrap.children.length)return;const meta=el.querySelector('.meta');meta?el.insertBefore(wrap,meta):el.append(wrap);scrollIfFollowing(follow);
   }
-  function setConnected(ok,text){connection.className=ok?'online':'offline';connection.textContent=text}
+  function setConnected(ok,text){
+    const state=ok?'online':text.includes('连接中')?'connecting':'offline';
+    connection.className='conn '+state;connection.textContent=text;
+  }
   function wsUrl(path,params={}){const u=new URL(base+path,location.href);u.protocol=location.protocol==='https:'?'wss:':'ws:';Object.entries(params).forEach(([k,v])=>u.searchParams.set(k,v));return u.toString()}
   function rpc(method,params={}){return new Promise((resolve,reject)=>{if(!ws||ws.readyState!==1)return reject(new Error('Hermes未连接'));const id=String(++reqId);pending.set(id,{resolve,reject});ws.send(JSON.stringify({jsonrpc:'2.0',id,method,params}));setTimeout(()=>{if(pending.has(id)){pending.delete(id);reject(new Error(method+'超时'))}},30000)})}
   function ensureActivity(){
@@ -114,13 +120,12 @@
   }
   function setVoiceState(state){
     voiceState=state;
-    const labels={idle:'等待说话',connecting:'启动中…',listening:'正在听…',transcribing:'识别中…',thinking:'思考中…',speaking:'播报中…',off:'语音未开启',approval:'等待审批'};
-    voiceStatus.textContent=labels[state]||state;
-    voiceStatus.classList.toggle('active',voiceEnabled&&state!=='off');
-    $('mic').querySelector('.mic-label').textContent=voiceEnabled?'结束实时对话':'开启实时对话';
-    $('mic').classList.toggle('recording',voiceEnabled&&(state==='listening'||state==='transcribing'));
-    $('mic').classList.toggle('live',voiceEnabled&&(state==='thinking'||state==='speaking'||state==='approval'));
-    $('mic').classList.toggle('listening',voiceEnabled&&state==='listening');
+    const mic=$('mic');
+    mic.querySelector('.mic-label').textContent=voiceEnabled?'关闭实时对话':'开启实时对话';
+    mic.setAttribute('aria-pressed',String(voiceEnabled));
+    mic.classList.toggle('recording',voiceEnabled&&(state==='listening'||state==='transcribing'));
+    mic.classList.toggle('live',voiceEnabled&&(state==='thinking'||state==='speaking'||state==='approval'));
+    mic.classList.toggle('listening',voiceEnabled&&state==='listening');
   }
 
   async function establishSession(){const response=await fetch(base+'api/auth/session',{method:'POST',headers:{'X-Voice-Token':token()},cache:'no-store'});if(!response.ok){let detail='访问口令错误';try{detail=(await response.json()).detail||detail}catch{}throw new Error(detail)}}
@@ -135,7 +140,7 @@
   }
   function closeGateway(){if(ws){try{ws.close()}catch{}ws=null}pending.forEach(p=>p.reject(new Error('连接关闭')));pending.clear();sessionId=null;storedSessionId=null;stopVoiceConversation(false);stopSpeech(true)}
   function profileName(){return profileEl.options[profileEl.selectedIndex]?.text||'Agent'}
-  function applyRuntimeInfo(info={}){runtime.textContent=matchMedia('(max-width:640px)').matches?`${profileName()}${info.model?' · '+info.model:''}`:`${profileName()} · ${info.model||'模型加载中'}${info.provider?' · '+info.provider:''}`}
+  function applyRuntimeInfo(info={}){runtime.textContent=`${profileName()} · ${info.model||'模型加载中'}${info.provider?' · '+info.provider:''}`}
   async function createSession(){const r=await rpc('session.create',{cols:100});sessionId=r.session_id;storedSessionId=r.stored_session_id||r.session_key||null;applyRuntimeInfo(r.info||{});if(matchMedia('(min-width:761px)').matches)void openHistory();else void refreshHistoryCount()}
   function historyDate(value){if(!value)return '';return new Date(Number(value)*1000).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false})}
   function closeHistory(){if(matchMedia('(min-width:761px)').matches)return;historyBackdrop.hidden=true}
@@ -243,7 +248,10 @@
     }
     else if(ev.type==='approval.request')renderApproval({...p});
     else if(ev.type==='clarify.request')renderClarify({...p});
-    else if(ev.type==='status.update')runtime.textContent=`${profileEl.options[profileEl.selectedIndex].text}${matchMedia('(max-width:640px)').matches?'': ' · '+(p.text||p.kind||'处理中')}`;
+    else if(ev.type==='status.update'){
+      const text=p.text||p.kind||'处理中';
+      if(currentAgent||busy){const row=activityRow('status','当前状态',text);row.querySelector('.activity-icon').textContent='•';}
+    }
     else if(ev.type==='error'){
       busy=false;$('stop').disabled=true;stopSpeech(true);message('system',p.message||'Hermes执行失败');
       if(voiceEnabled&&!bargeCapturing){stopBargeMonitor();setVoiceState('idle');scheduleListening()}
@@ -490,8 +498,13 @@
   function playPcm(buffer){const view=new DataView(buffer),samples=new Float32Array(buffer.byteLength/2);for(let i=0;i<samples.length;i++)samples[i]=view.getInt16(i*2,true)/32768;const rate=speechCtx.sampleRate||24000,audio=speechCtx.createBuffer(1,samples.length,24000);audio.copyToChannel(samples,0);const src=speechCtx.createBufferSource();src.buffer=audio;src.connect(speechCtx.destination);speechNext=Math.max(speechNext,speechCtx.currentTime+.02);src.start(speechNext);speechNext+=audio.duration}
 
   function syncComposer(){const t=$('text'),v=t.value.trim(),s=document.querySelector('.send');if(s)s.disabled=!v;t.style.height='auto';t.style.height=Math.min(t.scrollHeight,200)+'px'}
-  $('composer').onsubmit=e=>{e.preventDefault();const text=$('text').value;if(!text.trim())return;$('text').value='';syncComposer();submit(text).catch(err=>message('system',err.message))};
+  function setTextComposer(open){
+    composerBar.classList.toggle('text-open',open);textToggle.setAttribute('aria-expanded',String(open));
+    if(open)setTimeout(()=>$('text').focus(),0);
+  }
+  $('composer').onsubmit=e=>{e.preventDefault();const text=$('text').value;if(!text.trim())return;$('text').value='';syncComposer();if(matchMedia('(max-width:640px)').matches)setTextComposer(false);submit(text).catch(err=>message('system',err.message))};
   $('text').addEventListener('input',syncComposer);syncComposer();
+  textToggle.onclick=()=>setTextComposer(textToggle.getAttribute('aria-expanded')!=='true');
   $('mic').onclick=()=>void toggleVoice();
   $('stop').onclick=()=>interrupt(false).catch(e=>message('system',e.message));
   $('historyButton').onclick=()=>void openHistory();
