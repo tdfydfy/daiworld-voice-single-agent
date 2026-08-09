@@ -9,6 +9,7 @@ export const TTS_SAMPLE_RATE_DEFAULT: number = 24000;
 export class AsrFrame {
   type: string = 'transcript';
   text: string = '';
+  message: string = '';
   interim: boolean = false;
   final: boolean = false;
 }

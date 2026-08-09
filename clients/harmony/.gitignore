@@ -10,3 +10,4 @@ local.properties
 **/*.p7b
 **/*.jks
 node_modules/
+/*.jpeg

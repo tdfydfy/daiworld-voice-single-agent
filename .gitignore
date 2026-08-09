@@ -7,3 +7,8 @@ credentials.json
 *.credential
 *.pyc
 .hermes/
+clients/harmony/oh_modules/
+clients/harmony/.hvigor/
+clients/harmony/.idea/
+clients/harmony/**/build/
+clients/harmony/local.properties

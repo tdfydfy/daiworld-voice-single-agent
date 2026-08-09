@@ -5,7 +5,7 @@ export interface JsonRpcRequest {
   jsonrpc: string;
   id: string;
   method: string;
-  params: Record<string, Object>;
+  params: Object;
 }
 
 export interface JsonRpcError {

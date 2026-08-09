@@ -1,7 +1,7 @@
 {
   "modelVersion": "5.0.0",
   "name": "daiworld-voice-single-agent-harmony-entry",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Entry module of the Single-Agent HarmonyOS client",
   "main": "",
   "author": "Daiworld",

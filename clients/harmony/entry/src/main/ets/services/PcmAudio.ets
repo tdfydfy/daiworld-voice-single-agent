@@ -6,6 +6,7 @@
 import { abilityAccessCtrl, common, Permissions } from '@kit.AbilityKit';
 import { audio } from '@kit.AudioKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { BusinessError } from '@kit.BasicServicesKit';
 
 const AUDIO_LOG_DOMAIN = 0xD002;
 const AUDIO_LOG_TAG = 'SingleAgentAudio';
@@ -17,20 +18,27 @@ export class PcmCapture {
   private capturer?: audio.AudioCapturer;
   private listener?: AudioChunkListener;
   private lastReadAt: number = 0;
+  private lastHealthLogAt: number = 0;
   private readCount: number = 0;
 
   async requestPermission(context: common.UIAbilityContext): Promise<boolean> {
     const manager = abilityAccessCtrl.createAtManager();
     const permissions: Permissions[] = ['ohos.permission.MICROPHONE'];
-    const result = await manager.requestPermissionsFromUser(context, permissions);
-    return result.authResults.length > 0 && result.authResults[0] === 0;
+    try {
+      const result = await manager.requestPermissionsFromUser(context, permissions);
+      return result.authResults.length > 0 && result.authResults[0] === 0;
+    } catch (error) {
+      const businessError = error as BusinessError;
+      throw new Error(businessError.message);
+    }
   }
 
   async start(listener: AudioChunkListener): Promise<void> {
+    this.listener = listener;
     if (this.capturer) {
       return;
     }
-    this.listener = listener;
+    const source = this.selectCaptureSource();
     const options: audio.AudioCapturerOptions = {
       streamInfo: {
         samplingRate: audio.AudioSamplingRate.SAMPLE_RATE_16000,
@@ -39,42 +47,108 @@ export class PcmCapture {
         encodingType: audio.AudioEncodingType.ENCODING_TYPE_RAW
       },
       capturerInfo: {
-        source: audio.SourceType.SOURCE_TYPE_VOICE_COMMUNICATION,
+        source: source,
         capturerFlags: 0
       }
     };
     const capturer = await audio.createAudioCapturer(options);
-    capturer.on('readData', (buffer: ArrayBuffer) => {
-      const now = Date.now();
-      const gap = this.lastReadAt > 0 ? now - this.lastReadAt : 0;
-      this.lastReadAt = now;
-      this.readCount += 1;
-      if (this.readCount <= 5 || gap > 150) {
-        hilog.info(
-          AUDIO_LOG_DOMAIN,
-          AUDIO_LOG_TAG,
-          'capture bytes=%{public}d gapMs=%{public}d',
-          buffer.byteLength,
-          gap
-        );
-      }
-      this.listener?.(buffer);
-    });
-    await capturer.start();
-    this.capturer = capturer;
+    try {
+      capturer.on('readData', (buffer: ArrayBuffer) => {
+        const now = Date.now();
+        const gap = this.lastReadAt > 0 ? now - this.lastReadAt : 0;
+        this.lastReadAt = now;
+        this.readCount += 1;
+        if (this.readCount <= 5 || gap > 150 || now - this.lastHealthLogAt >= 15000) {
+          this.lastHealthLogAt = now;
+          hilog.info(
+            AUDIO_LOG_DOMAIN,
+            AUDIO_LOG_TAG,
+            'capture bytes=%{public}d gapMs=%{public}d',
+            buffer.byteLength,
+            gap
+          );
+        }
+        this.listener?.(buffer);
+      });
+      await capturer.start();
+      this.capturer = capturer;
+      hilog.info(AUDIO_LOG_DOMAIN, AUDIO_LOG_TAG, 'capture started');
+    } catch (error) {
+      await capturer.release().catch(() => undefined);
+      const businessError = error as BusinessError;
+      throw new Error(businessError.message);
+    }
   }
 
   async stop(): Promise<void> {
     const capturer = this.capturer;
     this.capturer = undefined;
     this.lastReadAt = 0;
+    this.lastHealthLogAt = 0;
     this.readCount = 0;
+    this.listener = undefined;
     if (!capturer) {
       return;
     }
-    capturer.off('readData');
+    try {
+      capturer.off('readData');
+    } catch (error) {
+      // A stopped capturer may already have removed the callback.
+    }
     await capturer.stop();
     await capturer.release();
+    hilog.info(AUDIO_LOG_DOMAIN, AUDIO_LOG_TAG, 'capture stopped');
+  }
+
+  private selectCaptureSource(): audio.SourceType {
+    const recognition = audio.SourceType.SOURCE_TYPE_VOICE_RECOGNITION;
+    const communication = audio.SourceType.SOURCE_TYPE_VOICE_COMMUNICATION;
+    try {
+      const manager = audio.getAudioManager();
+      const rendererInfo: audio.AudioRendererInfo = {
+        content: audio.ContentType.CONTENT_TYPE_SPEECH,
+        usage: audio.StreamUsage.STREAM_USAGE_VOICE_ASSISTANT,
+        rendererFlags: 0
+      };
+      const devices = manager.getRoutingManager()
+        .getPreferredOutputDeviceForRendererInfoSync(rendererInfo);
+      for (const device of devices) {
+        if (this.isPrivateOutput(device.deviceType)) {
+          hilog.info(
+            AUDIO_LOG_DOMAIN,
+            AUDIO_LOG_TAG,
+            'capture route=headset deviceType=%{public}d source=recognition',
+            device.deviceType
+          );
+          return recognition;
+        }
+      }
+      hilog.info(
+        AUDIO_LOG_DOMAIN,
+        AUDIO_LOG_TAG,
+        'capture route=speaker source=communication'
+      );
+      return communication;
+    } catch (error) {
+      hilog.warn(
+        AUDIO_LOG_DOMAIN,
+        AUDIO_LOG_TAG,
+        'capture route query failed; source=recognition'
+      );
+      return recognition;
+    }
+  }
+
+  private isPrivateOutput(deviceType: audio.DeviceType): boolean {
+    return deviceType === audio.DeviceType.EARPIECE ||
+      deviceType === audio.DeviceType.WIRED_HEADSET ||
+      deviceType === audio.DeviceType.WIRED_HEADPHONES ||
+      deviceType === audio.DeviceType.BLUETOOTH_SCO ||
+      deviceType === audio.DeviceType.BLUETOOTH_A2DP ||
+      deviceType === audio.DeviceType.USB_HEADSET ||
+      deviceType === audio.DeviceType.USB_DEVICE ||
+      deviceType === audio.DeviceType.HEARING_AID ||
+      deviceType === audio.DeviceType.NEARLINK;
   }
 }
 
@@ -86,6 +160,8 @@ export class PcmPlayer {
   private generation: number = 0;
   private paused: boolean = false;
   private pendingDrain: DrainedListener | undefined = undefined;
+  private drainTimer: number | undefined = undefined;
+  private lastBufferDurationMs: number = 0;
   private sampleRate: number = 24000;
 
   private async ensureRenderer(): Promise<audio.AudioRenderer> {
@@ -116,18 +192,26 @@ export class PcmPlayer {
         encodingType: audio.AudioEncodingType.ENCODING_TYPE_RAW
       },
       rendererInfo: {
-        content: audio.ContentType.CONTENT_TYPE_SPEECH,
         usage: audio.StreamUsage.STREAM_USAGE_VOICE_ASSISTANT,
         rendererFlags: 0
       }
     };
     const renderer = await audio.createAudioRenderer(options);
-    renderer.on('writeData', (buffer: ArrayBuffer) => {
-      this.fillPlaybackBuffer(buffer);
-    });
-    await renderer.start();
+    try {
+      renderer.on('writeData', (buffer: ArrayBuffer) => {
+        this.fillPlaybackBuffer(buffer);
+      });
+      await renderer.start();
+    } catch (error) {
+      await renderer.release().catch(() => undefined);
+      const businessError = error as BusinessError;
+      throw new Error(businessError.message);
+    }
     if (generation !== this.generation) {
-      renderer.off('writeData');
+      try {
+        renderer.off('writeData');
+      } catch (error) {
+      }
       await renderer.stop();
       await renderer.release();
       throw new Error('Playback was interrupted');
@@ -183,7 +267,7 @@ export class PcmPlayer {
   // Fires when the queue has been fully consumed by the renderer.
   waitForDrain(listener: DrainedListener): void {
     if (this.queue.length === 0) {
-      listener();
+      this.scheduleDrain(listener);
       return;
     }
     this.pendingDrain = listener;
@@ -195,6 +279,10 @@ export class PcmPlayer {
     this.queueOffset = 0;
     this.paused = false;
     this.pendingDrain = undefined;
+    if (this.drainTimer !== undefined) {
+      clearTimeout(this.drainTimer);
+      this.drainTimer = undefined;
+    }
     const renderer = this.renderer;
     this.renderer = undefined;
     const creating = this.rendererCreating;
@@ -204,7 +292,10 @@ export class PcmPlayer {
     if (!renderer) {
       return;
     }
-    renderer.off('writeData');
+    try {
+      renderer.off('writeData');
+    } catch (error) {
+    }
     await renderer.stop();
     await renderer.release();
   }
@@ -231,10 +322,24 @@ export class PcmPlayer {
     if (outputOffset < output.length) {
       output.fill(0, outputOffset);
     }
+    this.lastBufferDurationMs = Math.ceil(
+      (outputOffset / (Math.max(this.sampleRate, 1) * 2)) * 1000
+    );
     if (this.queue.length === 0 && this.pendingDrain) {
       const listener = this.pendingDrain;
       this.pendingDrain = undefined;
-      listener();
+      this.scheduleDrain(listener);
     }
+  }
+
+  private scheduleDrain(listener: DrainedListener): void {
+    if (this.lastBufferDurationMs <= 0) {
+      listener();
+      return;
+    }
+    this.drainTimer = setTimeout((): void => {
+      this.drainTimer = undefined;
+      listener();
+    }, this.lastBufferDurationMs);
   }
 }

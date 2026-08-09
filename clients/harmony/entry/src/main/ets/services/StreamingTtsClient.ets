@@ -6,13 +6,14 @@ import { webSocket } from '@kit.NetworkKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { TTS_SAMPLE_RATE_DEFAULT, VoiceCommands } from '../models/VoiceProtocol';
 
-export interface TtsJobListener {
-  onJobStarted(sampleRate: number): void;
-  onJobPcm(pcm: ArrayBuffer): void;
-  onJobEnded(): void;
-  onJobFallback(): void;
-  onError(message: string): void;
-  onClosed(): void;
+export abstract class TtsJobListener {
+  abstract onReady(): void;
+  abstract onJobStarted(sampleRate: number): void;
+  abstract onJobPcm(pcm: ArrayBuffer): void;
+  abstract onJobEnded(): void;
+  abstract onJobFallback(): void;
+  abstract onError(message: string): void;
+  abstract onClosed(): void;
 }
 
 export class StreamingTtsClient {
@@ -20,6 +21,7 @@ export class StreamingTtsClient {
   private listener: TtsJobListener | undefined = undefined;
   private connected: boolean = false;
   private sampleRate: number = TTS_SAMPLE_RATE_DEFAULT;
+  private pendingFrames: string[] = [];
 
   setListener(listener: TtsJobListener): void {
     this.listener = listener;
@@ -40,6 +42,12 @@ export class StreamingTtsClient {
     socket.on('open', (err: BusinessError, value: Object) => {
       if (!err) {
         this.connected = true;
+        this.flushPendingFrames();
+        if (this.listener) {
+          this.listener.onReady();
+        }
+      } else if (this.listener) {
+        this.listener.onError(err.message);
       }
     });
     socket.on('message', (err: BusinessError, data: string | ArrayBuffer) => {
@@ -64,10 +72,11 @@ export class StreamingTtsClient {
         this.listener.onError(err.message);
       }
     });
-    const options: webSocket.WebSocketRequestOptions = { header: {} };
+    const headers: Record<string, string> = {};
     if (cookie.length > 0) {
-      options.header['Cookie'] = cookie;
+      headers['Cookie'] = cookie;
     }
+    const options: webSocket.WebSocketRequestOptions = { header: headers };
     socket.connect(url, options).catch((error: BusinessError) => {
       if (this.listener) {
         this.listener.onError(error.message);
@@ -76,30 +85,22 @@ export class StreamingTtsClient {
   }
 
   sendText(text: string): void {
-    if (!this.socket || !this.connected) {
-      return;
-    }
     const frame: Record<string, Object> = {};
     frame['text'] = text;
-    this.socket.send(JSON.stringify(frame)).catch(() => undefined);
+    this.sendFrame(JSON.stringify(frame));
   }
 
   sendDone(): void {
-    if (!this.socket || !this.connected) {
-      return;
-    }
     const frame: Record<string, Object> = {};
     frame[VoiceCommands.TTS_DONE] = true;
-    this.socket.send(JSON.stringify(frame)).catch(() => undefined);
+    this.sendFrame(JSON.stringify(frame));
   }
 
   sendStop(): void {
-    if (!this.socket || !this.connected) {
-      return;
-    }
+    this.pendingFrames = [];
     const frame: Record<string, Object> = {};
     frame[VoiceCommands.TTS_STOP] = true;
-    this.socket.send(JSON.stringify(frame)).catch(() => undefined);
+    this.sendFrame(JSON.stringify(frame));
   }
 
   close(): void {
@@ -113,6 +114,26 @@ export class StreamingTtsClient {
       this.socket = undefined;
     }
     this.connected = false;
+    this.pendingFrames = [];
+  }
+
+  private sendFrame(frame: string): void {
+    if (!this.socket || !this.connected) {
+      this.pendingFrames.push(frame);
+      return;
+    }
+    this.socket.send(frame).catch(() => undefined);
+  }
+
+  private flushPendingFrames(): void {
+    if (!this.socket || !this.connected || this.pendingFrames.length === 0) {
+      return;
+    }
+    const frames = this.pendingFrames;
+    this.pendingFrames = [];
+    for (const frame of frames) {
+      this.socket.send(frame).catch(() => undefined);
+    }
   }
 
   private handleText(data: string): void {

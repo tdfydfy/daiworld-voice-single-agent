@@ -16,13 +16,19 @@ const REQUIRED_FILES = [
   'entry/src/main/ets/models/SingleAgentState.ets',
   'entry/src/main/ets/services/AuthSessionClient.ets',
   'entry/src/main/ets/services/HermesGatewayClient.ets',
+  'entry/src/main/ets/services/HermesSessionDetailClient.ets',
   'entry/src/main/ets/services/StreamingAsrClient.ets',
   'entry/src/main/ets/services/StreamingTtsClient.ets',
   'entry/src/main/ets/services/SingleAgentController.ets',
   'entry/src/main/ets/services/PcmAudio.ets',
+  'entry/src/main/ets/services/AudioCuePlayer.ets',
+  'entry/src/main/ets/services/SystemSpeechService.ets',
   'entry/src/main/ets/pages/Index.ets',
+  'AppScope/resources/base/media/app_icon.svg',
+  'entry/src/main/resources/base/media/app_icon.svg',
   'AppScope/app.json5',
   'build-profile.json5',
+  'entry/build-profile.json5',
   'entry/src/main/module.json5'
 ];
 
@@ -34,7 +40,18 @@ const REQUIRED_TOKENS = [
   ['transcribe-stream', 'streaming ASR route'],
   ['speak-stream', 'streaming TTS route'],
   ['gateway.ready', 'gateway ready event'],
-  ['message.complete', 'message complete event']
+  ['message.complete', 'message complete event'],
+  ['requestPermission', 'runtime microphone permission'],
+  ['respondApproval', 'approval response'],
+  ['respondClarify', 'clarification response'],
+  ['@kit.CoreSpeechKit', 'HarmonyOS system speech API'],
+  ['online: 1', 'offline system speech mode'],
+  ['startBackgroundRunning', 'continuous background voice task'],
+  ['BackgroundMode.AUDIO_RECORDING', 'background audio recording mode'],
+  ['recognitionWanted', 'persistent local speech capture state'],
+  ['ensureRecognitionCapture', 'persistent local speech capture startup'],
+  ['stopRecognitionCapture', 'explicit local speech capture cleanup'],
+  ['stopBackgroundRunning', 'background task cleanup']
 ];
 
 // Host-only protocol remnants that must NOT appear in the single-agent client.
@@ -57,6 +74,48 @@ const CREDENTIAL_PATTERNS = [
   /native-dev-token/
 ];
 
+const HISTORY_PAGINATION_CHECKS = [
+  ['entry/src/main/ets/services/SingleAgentController.ets', /listHistory\(limit: number = 20\)/, 'history starts with 20 entries'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /historyLoading\)\s*\{\s*return;/, 'duplicate history requests are blocked'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /historyLimit \+ 20/, 'history grows in 20-entry steps'],
+  ['entry/src/main/ets/services/HermesGatewayClient.ets', /new ListSessionsParams\(limit\)/, 'history limit reaches the gateway request'],
+  ['entry/src/main/ets/pages/Index.ets', /\.onReachEnd\(\(\) => \{\s*this\.controller\.loadMoreHistory\(\);/, 'scroll end requests the next history page']
+];
+
+const AUDIO_CUE_CHECKS = [
+  ['entry/src/main/ets/services/AudioCuePlayer.ets', /playAccepted\(\)/, 'input accepted cue'],
+  ['entry/src/main/ets/services/AudioCuePlayer.ets', /setRunning\(active: boolean\)/, 'running pulse cue'],
+  ['entry/src/main/ets/services/AudioCuePlayer.ets', /playStop\(\)/, 'stop cue'],
+  ['entry/src/main/ets/services/AudioCuePlayer.ets', /playError\(\)/, 'error cue'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /this\.audioCues\.playAccepted\(\)/, 'ASR accepted cue integration'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /this\.audioCues\.playStop\(\)/, 'hard stop cue integration'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /this\.audioCues\.setRunning\(running\)/, 'agent running cue integration'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /this\.audioCues\.playError\(\)/, 'voice error cue integration']
+];
+
+const HISTORY_TIMESTAMP_CHECKS = [
+  ['entry/src/main/ets/services/HermesSessionDetailClient.ets', /\/api\/hermes\/sessions\//, 'timestamped history detail route'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /completeSessionResume\(result, detail\)/, 'history detail resume integration'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /message\.timestamp = this\.parseTimestamp/, 'stored message timestamp restoration'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /this\.timestampMillis\(message\.timestamp\)/, 'history duration timestamp normalization'],
+  ['entry/src/main/ets/pages/Index.ets', /date\.getFullYear\(\) === now\.getFullYear\(\)/, 'today-aware message timestamp formatting'],
+  ['entry/src/main/ets/pages/Index.ets', /year \+ '-' \+ month \+ '-' \+ day/, 'full date for older messages']
+];
+
+const HISTORY_TOOL_CHECKS = [
+  ['entry/src/main/ets/services/SingleAgentController.ets', /if \(roleValue === 'tool'\)/, 'stored tool messages excluded from reply bubbles'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /restoreHistoryToolResult\(row, pendingActivities\)/, 'stored tool results restored as process activities'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /message\.activities = pendingActivities/, 'stored activities attached to the assistant response']
+];
+
+const SYSTEM_TTS_STREAM_CHECKS = [
+  ['entry/src/main/ets/services/SingleAgentController.ets', /SYSTEM_TTS_FIRST_MIN = 20/, 'small first speech chunk'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /SYSTEM_TTS_HARD_MAX = 300/, 'system TTS hard text limit'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /appendSystemSpeechStream\(text\)/, 'delta-fed system TTS'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /finishSystemSpeechStream\(speechText\)/, 'final system TTS flush'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /systemSpeechChunkEnd\(/, 'punctuation-aware TTS chunking']
+];
+
 const ERRORS = [];
 const warnings = [];
 
@@ -66,6 +125,18 @@ function readRel(rel) {
     return '';
   }
   return fs.readFileSync(full, 'utf8');
+}
+
+const systemSpeechSource = readRel('entry/src/main/ets/services/SystemSpeechService.ets');
+for (const callback of ['onComplete', 'onError']) {
+  const callbackStart = systemSpeechSource.indexOf(`${callback}: (sessionId: string`);
+  const callbackEnd = callbackStart >= 0 ? systemSpeechSource.indexOf('\n      }', callbackStart) : -1;
+  const callbackSource = callbackStart >= 0 && callbackEnd > callbackStart
+    ? systemSpeechSource.slice(callbackStart, callbackEnd)
+    : '';
+  if (callbackSource.includes('capture.stop')) {
+    ERRORS.push(`system STT ${callback} must not stop persistent microphone capture`);
+  }
 }
 
 function scanDir(dir, out) {
@@ -109,6 +180,28 @@ for (const pattern of CREDENTIAL_PATTERNS) {
   const match = allSource.match(pattern);
   if (match) {
     ERRORS.push(`credential-like content found: ${match[0].slice(0, 32)}`);
+  }
+}
+
+for (const [rel, pattern, label] of HISTORY_PAGINATION_CHECKS) {
+  if (!pattern.test(readRel(rel))) {
+    ERRORS.push(`missing history pagination behavior (${label})`);
+  }
+}
+
+for (const [rel, pattern, label] of AUDIO_CUE_CHECKS) {
+  if (!pattern.test(readRel(rel))) {
+    ERRORS.push(`missing audio cue behavior (${label})`);
+  }
+}
+
+for (const [rel, pattern, label] of [
+  ...HISTORY_TIMESTAMP_CHECKS,
+  ...HISTORY_TOOL_CHECKS,
+  ...SYSTEM_TTS_STREAM_CHECKS
+]) {
+  if (!pattern.test(readRel(rel))) {
+    ERRORS.push(`missing restored history/TTS streaming behavior (${label})`);
   }
 }
 

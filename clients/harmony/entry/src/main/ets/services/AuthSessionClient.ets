@@ -5,16 +5,22 @@
 
 import { http } from '@kit.NetworkKit';
 
+export class AuthSessionResult {
+  cookie: string = '';
+  error: string = '';
+}
+
 export class AuthSessionClient {
   private static readonly COOKIE_HEADER: string = 'Set-Cookie';
-  private static readonly SESSION_COOKIE_PREFIX: string = 'voice_session=';
 
-  // Returns the voice_session cookie value (without attribute flags), or ''.
-  async acquireSessionCookie(baseUrl: string, accessToken: string): Promise<string> {
+  // Returns a Cookie request header containing only the short-lived session.
+  async acquireSessionCookie(baseUrl: string, accessToken: string): Promise<AuthSessionResult> {
+    const result = new AuthSessionResult();
+    const normalizedBaseUrl = this.normalizeBaseUrl(baseUrl);
     const request = http.createHttp();
     try {
       const response = await request.request(
-        baseUrl + '/api/auth/session',
+        normalizedBaseUrl + '/api/auth/session',
         {
           method: http.RequestMethod.POST,
           header: {
@@ -27,35 +33,39 @@ export class AuthSessionClient {
         }
       );
       if (response.responseCode !== 200) {
-        return '';
+        result.error = response.responseCode === 401
+          ? '访问口令错误，请填写服务器的 VOICE_ACCESS_TOKEN'
+          : '网关返回 HTTP ' + String(response.responseCode);
+        return result;
       }
-      return this.extractSessionCookie(response.header);
+      result.cookie = this.extractSessionCookie(response.header);
+      if (result.cookie.length === 0) {
+        result.error = '网关未返回登录会话';
+      }
+      return result;
     } catch (error) {
-      return '';
+      result.error = '无法连接网关';
+      return result;
     } finally {
       request.destroy();
     }
   }
 
+  private normalizeBaseUrl(baseUrl: string): string {
+    const trimmed = baseUrl.trim();
+    return trimmed.endsWith('/') ? trimmed.substring(0, trimmed.length - 1) : trimmed;
+  }
+
   private extractSessionCookie(header: Object): string {
     const headers = header as Record<string, Object>;
-    const raw = headers[AuthSessionClient.COOKIE_HEADER];
-    if (raw === undefined) {
-      return '';
-    }
-    const rawString = String(raw);
-    const entries = rawString.split('\n');
-    for (const entry of entries) {
-      const trimmed = entry.trim();
-      if (trimmed.startsWith(AuthSessionClient.SESSION_COOKIE_PREFIX)) {
-        const firstSemicolon = trimmed.indexOf(';');
-        if (firstSemicolon === -1) {
-          return trimmed.substring(AuthSessionClient.SESSION_COOKIE_PREFIX.length);
-        }
-        return trimmed.substring(
-          AuthSessionClient.SESSION_COOKIE_PREFIX.length,
-          firstSemicolon
-        );
+    for (const key of Object.keys(headers)) {
+      if (key.toLowerCase() !== AuthSessionClient.COOKIE_HEADER.toLowerCase()) {
+        continue;
+      }
+      const rawString = String(headers[key]);
+      const match = rawString.match(/(?:^|[,\r\n\s])voice_session=([^;,\s]+)/i);
+      if (match && match.length > 1) {
+        return 'voice_session=' + match[1];
       }
     }
     return '';

@@ -6,11 +6,11 @@ import { webSocket } from '@kit.NetworkKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { ASR_CHUNK_BYTES, AsrFrame, VoiceCommands } from '../models/VoiceProtocol';
 
-export interface AsrListener {
-  onReady(): void;
-  onTranscript(text: string, interim: boolean, final: boolean): void;
-  onError(message: string): void;
-  onClosed(): void;
+export abstract class AsrListener {
+  abstract onReady(): void;
+  abstract onTranscript(text: string, interim: boolean, final: boolean): void;
+  abstract onError(message: string): void;
+  abstract onClosed(): void;
 }
 
 export class StreamingAsrClient {
@@ -59,10 +59,11 @@ export class StreamingAsrClient {
         this.listener.onError(err.message);
       }
     });
-    const options: webSocket.WebSocketRequestOptions = { header: {} };
+    const headers: Record<string, string> = {};
     if (cookie.length > 0) {
-      options.header['Cookie'] = cookie;
+      headers['Cookie'] = cookie;
     }
+    const options: webSocket.WebSocketRequestOptions = { header: headers };
     socket.connect(url, options).catch((error: BusinessError) => {
       if (this.listener) {
         this.listener.onError(error.message);
