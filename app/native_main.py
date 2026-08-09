@@ -50,6 +50,7 @@ class NativeSettings:
     def __init__(self) -> None:
         self.access_token = os.getenv("VOICE_ACCESS_TOKEN", "")
         self.hermes_token = os.getenv("HERMES_DASHBOARD_SESSION_TOKEN", "")
+        self.cookie_secure = os.getenv("VOICE_COOKIE_SECURE", "").lower() in {"1", "true", "yes"}
         self.backends = {
             "default": os.getenv("HERMES_DEFAULT_URL", "http://127.0.0.1:9120"),
             "hexiaoma": os.getenv("HERMES_HEXIAOMA_URL", "http://127.0.0.1:9121"),
@@ -92,7 +93,7 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
             settings.access_token,
             max_age=3600,
             httponly=True,
-            secure=request.url.scheme == "https",
+            secure=settings.cookie_secure or request.url.scheme == "https",
             samesite="strict",
             path="/",
         )
