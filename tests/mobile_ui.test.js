@@ -18,7 +18,7 @@ test('mobile footer is voice-first and text composer is secondary', () => {
   assert.match(mobileCss(), /\.text-composer-row\{display:none/);
   assert.match(mobileCss(), /\.composer-bar\.text-open \.text-composer-row\{display:flex/);
   assert.match(mobileCss(), /\.voice-row\{display:flex/);
-  assert.match(mobileCss(), /\.stop:disabled\{display:none\}/);
+  assert.doesNotMatch(mobileCss(), /\.stop:disabled\{display:none\}/);
 });
 
 test('microphone button exposes only enabled and disabled labels', () => {

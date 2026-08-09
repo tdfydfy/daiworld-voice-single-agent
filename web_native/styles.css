@@ -225,7 +225,6 @@ button,select,textarea{font-family:inherit}
   .mic{flex:1}
   .mic-label{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .stop,.text-toggle{flex:none;min-width:56px}
-  .stop:disabled{display:none}
   .text-toggle{display:inline-flex;align-items:center;justify-content:center}
   .text-toggle[aria-expanded="true"]{background:var(--accent-soft);border-color:rgba(113,112,255,.4);color:var(--accent-strong)}
   .approval-actions{flex-direction:row}
