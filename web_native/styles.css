@@ -38,6 +38,9 @@ button,select,textarea{font-family:inherit}
 .brand-text{min-width:0}
 .brand-text b{display:block;font-size:16px;font-weight:700;letter-spacing:-.2px;line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .brand-text small{display:block;color:var(--text-3);font-size:12px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.topbar-right{display:flex;align-items:center;gap:8px}
+.help-trigger{display:grid;place-items:center;width:30px;height:30px;padding:0;border:1px solid var(--line);border-radius:50%;background:rgba(255,255,255,.035);color:var(--text-3);font-size:14px;font-weight:700;cursor:pointer}
+.help-trigger:hover{background:rgba(255,255,255,.09);color:var(--text)}
 .conn{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:500;padding:5px 10px;border-radius:999px;border:1px solid var(--line)}
 .conn::before{content:'';width:8px;height:8px;border-radius:50%;background:currentColor;flex:none}
 .conn.online{color:var(--green);background:var(--green-soft);border-color:rgba(39,166,68,.3)}
@@ -91,6 +94,16 @@ button,select,textarea{font-family:inherit}
   .history-panel{width:280px;box-shadow:none;animation:none}
   .history-head button,.history-trigger{display:none}
 }
+
+/* ---------- help tips ---------- */
+.help-backdrop{position:fixed;inset:0;z-index:70;display:grid;place-items:center;padding:20px;background:rgba(0,0,0,.62);backdrop-filter:blur(3px)}
+.help-card{width:min(460px,100%);overflow:hidden;border:1px solid var(--line-strong);border-radius:14px;background:#101214;box-shadow:0 24px 80px rgba(0,0,0,.5)}
+.help-head{display:flex;align-items:center;justify-content:space-between;padding:13px 16px;border-bottom:1px solid var(--line)}
+.help-head b{font-size:15px}
+.help-head button{width:34px;height:34px;border:0;background:transparent;color:var(--text-3);font-size:24px;line-height:1;cursor:pointer}
+.help-content{display:grid;gap:10px;padding:15px 16px 17px}
+.help-content p{position:relative;margin:0;padding-left:19px;color:var(--text-2);font-size:13.5px;line-height:1.6}
+.help-content p::before{content:'•';position:absolute;left:3px;color:var(--accent-strong)}
 
 /* ---------- conversation ---------- */
 .conversation{overflow-y:auto;padding:20px 20px 24px;scroll-behavior:smooth;overscroll-behavior:contain}
@@ -189,6 +202,9 @@ button,select,textarea{font-family:inherit}
   .topbar{padding:10px 14px 8px}
   .brand-text b{font-size:15px}
   .brand-text small{max-width:52vw}
+  .help-trigger{width:28px;height:28px}
+  .help-backdrop{place-items:end center;padding:10px 10px calc(10px + env(safe-area-inset-bottom,0px))}
+  .help-card{width:100%;border-radius:14px}
   .toolbar{flex-wrap:nowrap;justify-content:space-between;padding:8px 14px 10px;gap:8px}
   .profile-label{flex:none}
   .profile-label select{min-height:40px;max-width:118px;padding:6px 28px 6px 10px;font-size:12.5px}

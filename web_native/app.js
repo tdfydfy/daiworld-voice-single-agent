@@ -1,7 +1,7 @@
 (()=>{
   const $=id=>document.getElementById(id);
   const convo=$('conversation'),profileEl=$('profile'),runtime=$('runtime'),connection=$('connection');
-  const historyBackdrop=$('historyBackdrop'),historyList=$('historyList');
+  const historyBackdrop=$('historyBackdrop'),historyList=$('historyList'),helpBackdrop=$('helpBackdrop');
   const composerBar=document.querySelector('.composer-bar'),textToggle=$('textToggle');
   const token=()=>{let v=localStorage.getItem('native_voice_token');if(!v){v=prompt('请输入内部访问口令')||'';if(v)localStorage.setItem('native_voice_token',v)}return v};
   const base=location.pathname.endsWith('/')?location.pathname:location.pathname.replace(/[^/]*$/,'');
@@ -144,6 +144,8 @@
   async function createSession(){const r=await rpc('session.create',{cols:100});sessionId=r.session_id;storedSessionId=r.stored_session_id||r.session_key||null;applyRuntimeInfo(r.info||{});if(matchMedia('(min-width:761px)').matches)void openHistory();else void refreshHistoryCount()}
   function historyDate(value){if(!value)return '';return new Date(Number(value)*1000).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false})}
   function closeHistory(){if(matchMedia('(min-width:761px)').matches)return;historyBackdrop.hidden=true}
+  function openHelp(){helpBackdrop.hidden=false}
+  function closeHelp(){helpBackdrop.hidden=true}
   function renderHistoryRows(sessions){
     const priorScroll=historyList.scrollTop;historyList.replaceChildren();$('historyCount').textContent=sessions.length?(historyHasMore?`${sessions.length}+`:String(sessions.length)):'';
     if(!sessions.length){const empty=document.createElement('p');empty.className='history-empty';empty.textContent='这个Agent还没有历史对话。';historyList.append(empty);return}
@@ -508,10 +510,13 @@
   $('mic').onclick=()=>void toggleVoice();
   $('stop').onclick=()=>interrupt(false).catch(e=>message('system',e.message));
   $('historyButton').onclick=()=>void openHistory();
+  $('helpButton').onclick=openHelp;
+  $('helpClose').onclick=closeHelp;
+  helpBackdrop.onclick=e=>{if(e.target===helpBackdrop)closeHelp()};
   historyList.addEventListener('scroll',()=>{if(historyList.scrollHeight-historyList.scrollTop-historyList.clientHeight<100)void loadHistory(false)});
   $('historyClose').onclick=closeHistory;
   historyBackdrop.onclick=e=>{if(e.target===historyBackdrop)closeHistory()};
-  window.addEventListener('keydown',e=>{if(e.key==='Escape'&&!historyBackdrop.hidden)closeHistory()});
+  window.addEventListener('keydown',e=>{if(e.key==='Escape'){if(!helpBackdrop.hidden)closeHelp();else if(!historyBackdrop.hidden)closeHistory()}});
   $('newSession').onclick=()=>{closeHistory();convo.innerHTML='<p class="empty">新对话已创建。</p>';connect()};
   profileEl.onchange=()=>{closeHistory();$('historyCount').textContent='';convo.innerHTML='<p class="empty">已切换Agent，正在创建独立Hermes会话。</p>';connect()};
   window.addEventListener('beforeunload',closeGateway);setVoiceState('off');connect();

@@ -27,6 +27,16 @@ test('microphone button exposes only enabled and disabled labels', () => {
   assert.match(app, /aria-pressed/);
 });
 
+test('usage tips are concise and live behind the help entry', () => {
+  assert.match(html, /id="helpButton"/);
+  assert.match(html, /id="helpBackdrop"[^>]*hidden/);
+  assert.equal((html.match(/<div class="help-content">[\s\S]*?<\/div>/)?.[0].match(/<p>/g) || []).length, 4);
+  assert.match(html, /说“停止”或点击“停止”可终止当前任务/);
+  assert.doesNotMatch(html, /模型、Provider和执行过程/);
+  assert.match(app, /\$\('helpButton'\)\.onclick=openHelp/);
+  assert.match(app, /helpBackdrop\.onclick/);
+});
+
 test('mobile header hides runtime detail while message identity keeps provider', () => {
   assert.match(mobileCss(), /\.runtime\{display:none\}/);
   assert.match(app, /provider\?' · '\+provider/);

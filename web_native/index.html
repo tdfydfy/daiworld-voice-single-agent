@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="./assets/styles.css?v=14">
+  <link rel="stylesheet" href="./assets/styles.css?v=15">
 </head>
 <body>
   <div class="app-shell">
@@ -23,6 +23,7 @@
       </div>
       <div class="topbar-right">
         <span id="connection" class="conn offline">未连接</span>
+        <button id="helpButton" class="help-trigger" type="button" aria-label="打开使用贴士">?</button>
       </div>
     </header>
 
@@ -71,8 +72,23 @@
     </aside>
   </div>
 
+  <div id="helpBackdrop" class="help-backdrop" hidden>
+    <section class="help-card" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
+      <header class="help-head">
+        <b id="helpTitle">使用贴士</b>
+        <button id="helpClose" type="button" aria-label="关闭使用贴士">×</button>
+      </header>
+      <div class="help-content">
+        <p>在顶部选择Agent，连接灯变绿后即可使用；历史对话可随时恢复。</p>
+        <p>点击“开启实时对话”后直接说话，可连续交流；任务中也能继续补充。</p>
+        <p>说“停止”或点击“停止”可终止当前任务；关闭实时对话只停止收音。</p>
+        <p>需要文字输入时，点击“文字”即可。</p>
+      </div>
+    </section>
+  </div>
+
   <script src="./assets/voice_filters.js?v=1"></script>
   <script src="./assets/media_speech_filter.js?v=1"></script>
-  <script src="./assets/app.js?v=22" defer></script>
+  <script src="./assets/app.js?v=24" defer></script>
 </body>
 </html>
