@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#08090a">
+  <title>Hermes Native Voice</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./assets/styles.css?v=12">
+</head>
+<body>
+  <div class="app-shell">
+
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-dot" aria-hidden="true"></span>
+        <div class="brand-text">
+          <b>Hermes Native Voice</b>
+          <small>官方Agent语音能力 · Web远程入口</small>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <span id="connection" class="conn offline">未连接</span>
+      </div>
+    </header>
+
+    <section class="toolbar">
+      <label class="profile-label">Agent
+        <select id="profile">
+          <option value="default">赫准行</option>
+          <option value="hexiaoma" selected>赫小码</option>
+          <option value="hexiaoxin">赫小新</option>
+        </select>
+      </label>
+      <div id="runtime" class="runtime">等待连接</div>
+      <button id="historyButton" class="ghost history-trigger" type="button">历史对话 <span id="historyCount"></span></button>
+    </section>
+
+    <section id="conversation" class="conversation" aria-live="polite">
+      <p class="empty">选择Agent后开始说话或输入文字。</p>
+    </section>
+
+    <footer class="composer-bar">
+      <div class="composer-row">
+        <form id="composer" class="composer">
+          <textarea id="text" rows="1" placeholder="输入内容，或开启实时语音对话"></textarea>
+          <button class="send" type="submit">发送</button>
+        </form>
+      </div>
+      <div class="voice-row">
+        <button id="mic" class="mic" type="button">
+          <span class="mic-dot" aria-hidden="true"></span><span class="mic-label">开启实时对话</span>
+        </button>
+        <span id="voiceStatus" class="voice-status">语音未开启</span>
+        <button id="stop" class="stop" type="button" disabled>停止</button>
+      </div>
+    </footer>
+
+  </div>
+
+  <div id="historyBackdrop" class="history-backdrop" hidden>
+    <aside class="history-panel" role="dialog" aria-modal="true" aria-labelledby="historyTitle">
+      <header class="history-head">
+        <div><b id="historyTitle">对话</b><small id="historyProfile">完整Hermes记录</small></div>
+        <button id="historyClose" type="button" aria-label="关闭历史对话">×</button>
+      </header>
+      <button id="newSession" class="history-new" type="button">＋ 新对话</button>
+      <div id="historyList" class="history-list"><p class="history-empty">正在加载…</p></div>
+    </aside>
+  </div>
+
+  <script src="./assets/voice_filters.js?v=1"></script>
+  <script src="./assets/media_speech_filter.js?v=1"></script>
+  <script src="./assets/app.js?v=21" defer></script>
+</body>
+</html>

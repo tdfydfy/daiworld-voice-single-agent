@@ -1,0 +1,36 @@
+[Unit]
+Description=Daiworld Native Hermes Web Adapter
+After=network-online.target hermes-native-profile@default.service hermes-native-profile@hexiaoma.service hermes-native-profile@hexiaoxin.service
+Wants=network-online.target
+Requires=hermes-native-profile@default.service hermes-native-profile@hexiaoma.service hermes-native-profile@hexiaoxin.service
+
+[Service]
+Type=simple
+User=daiworld-voice
+Group=daiworld-voice
+WorkingDirectory=/opt/daiworld-voice-native
+EnvironmentFile=/etc/daiworld-voice-native/native.env
+UMask=0077
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+PrivateUsers=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/daiworld-voice-native
+ExecStart=/opt/daiworld-voice-native/.venv/bin/uvicorn app.native_main:app --host 127.0.0.1 --port 8844 --proxy-headers --forwarded-allow-ips=127.0.0.1 --no-access-log
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

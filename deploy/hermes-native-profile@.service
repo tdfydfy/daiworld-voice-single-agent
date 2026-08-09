@@ -1,0 +1,33 @@
+[Unit]
+Description=Hermes isolated Profile for Daiworld Native Voice (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=daiworld-voice
+Group=daiworld-voice
+WorkingDirectory=/var/lib/daiworld-voice-native
+EnvironmentFile=/etc/daiworld-voice-native/native.env
+UMask=0077
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectSystem=strict
+PrivateDevices=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/daiworld-voice-native
+ExecStart=/bin/sh -c 'case "%i" in default) p=default; port=9120;; hexiaoma) p=hexiaoma; port=9121;; hexiaoxin) p=hexiaoxin; port=9122;; *) exit 64;; esac; exec /opt/hermes-agent/venv/bin/hermes -p "$p" serve --isolated --host 127.0.0.1 --port "$port" --skip-build'
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
