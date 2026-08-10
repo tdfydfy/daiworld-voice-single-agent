@@ -182,6 +182,10 @@ historyView      = closed | list | resumed
 6. 审批期间普通 final 不得进入 Agent 队列。
 7. 历史显示用持久 ID，继续对话用 resume 返回的新运行时 ID。
 8. 文件读取权限由 Agent/OS 决定，浏览器不能传服务器路径。
+9. HarmonyOS 的麦克风按钮只控制 `AudioCapturer` 和 ASR 输入；关闭输入不得中断 Agent 或 TTS。
+10. `停止` 才是当前 Agent turn 的破坏性中断，负责 `session.interrupt` 和清空 TTS 播放队列，但不改变麦克风开关。
+11. HarmonyOS 语音后端由用户显式选择；`harmony_offline` 失败时不得自动切换或连接远端 ASR/TTS。
+12. HarmonyOS 全双工语音统一声明为 `VOICE_COMMUNICATION`，无配件时的通信输出默认设为听筒，用户可以显式切换扬声器；配件选择和麦克风回退由系统自动管理，设备变化只更新诊断与界面状态，不触发手工选路或采集器重建。
 
 ## 7. 文字和 Agent 数据流
 
@@ -348,6 +352,7 @@ Public           /voice-native/
 
 ## 16. 当前限制
 
+- HarmonyOS 当前开发版本会在 CoreSpeech 系统 TTS 播放前持有 `VOICE_COMMUNICATION` AudioSession，而系统 TTS 内部使用 `VOICE_ASSISTANT` 播放流；真机已确认合成完成后因音频焦点冲突报 `6800301`，自动播报尚未恢复。系统 TTS 与应用自管通信 PCM 的会话所有权需要分离；
 - 首次HTTP鉴权换取1小时HttpOnly Cookie；上游Hermes仍可能在内部URL使用其协议要求的token；
 - 浏览器 ScriptProcessor 是当前稳定实现，后续可换 AudioWorklet；
 - 回音文本判断是 AEC 后的兜底，不等于硬件级全双工保证；

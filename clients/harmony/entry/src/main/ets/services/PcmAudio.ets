@@ -10,16 +10,279 @@ import { BusinessError } from '@kit.BasicServicesKit';
 
 const AUDIO_LOG_DOMAIN = 0xD002;
 const AUDIO_LOG_TAG = 'SingleAgentAudio';
+const AUDIO_SESSION_RECOVERY_DELAYS_MS: number[] = [100, 500, 1500];
 
 export type AudioChunkListener = (buffer: ArrayBuffer) => void;
 export type DrainedListener = () => void;
+export type InputRouteListener = (label: string) => void;
+
+class CommunicationAudioSession {
+  private users: number = 0;
+  private activation?: Promise<void>;
+  private deactivation?: Promise<void>;
+  private speakerphoneEnabled: boolean = false;
+  private recoveryAttempt: number = 0;
+  private recoveryTimer?: number;
+  private listenerInstalled: boolean = false;
+  private sessionDeactivatedListener = (event: audio.AudioSessionDeactivatedEvent): void => {
+    hilog.warn(
+      AUDIO_LOG_DOMAIN,
+      AUDIO_LOG_TAG,
+      'communication audio session deactivated reason=%{public}d users=%{public}d',
+      event.reason,
+      this.users
+    );
+    if (this.users > 0) {
+      this.scheduleRecovery();
+    }
+  };
+
+  async acquire(): Promise<void> {
+    this.users += 1;
+    try {
+      this.installListener();
+      const deactivation = this.deactivation;
+      if (deactivation) {
+        await deactivation.catch(() => undefined);
+      }
+      await this.ensureActivated();
+    } catch (error) {
+      this.users = Math.max(0, this.users - 1);
+      const businessError = error as BusinessError;
+      throw new Error(businessError.message);
+    }
+  }
+
+  async release(): Promise<void> {
+    this.users = Math.max(0, this.users - 1);
+    if (this.users > 0) {
+      return;
+    }
+    this.cancelRecovery();
+    const activation = this.activation;
+    if (activation) {
+      await activation.catch(() => undefined);
+    }
+    if (this.users > 0) {
+      return;
+    }
+    const sessionManager = audio.getAudioManager().getSessionManager();
+    if (!sessionManager.isAudioSessionActivated()) {
+      return;
+    }
+    const existing = this.deactivation;
+    if (existing) {
+      await existing.catch(() => undefined);
+      return;
+    }
+    let deactivation: Promise<void>;
+    try {
+      deactivation = sessionManager.deactivateAudioSession();
+    } catch (error) {
+      const businessError = error as BusinessError;
+      hilog.warn(
+        AUDIO_LOG_DOMAIN,
+        AUDIO_LOG_TAG,
+        'communication audio session deactivation failed: %{public}s',
+        businessError.message
+      );
+      return;
+    }
+    this.deactivation = deactivation;
+    try {
+      await deactivation;
+      hilog.info(AUDIO_LOG_DOMAIN, AUDIO_LOG_TAG, 'communication audio session deactivated');
+    } catch (error) {
+      const businessError = error as BusinessError;
+      hilog.warn(
+        AUDIO_LOG_DOMAIN,
+        AUDIO_LOG_TAG,
+        'communication audio session deactivation failed: %{public}s',
+        businessError.message
+      );
+    } finally {
+      if (this.deactivation === deactivation) {
+        this.deactivation = undefined;
+      }
+    }
+  }
+
+  async setSpeakerphoneEnabled(enabled: boolean): Promise<void> {
+    this.speakerphoneEnabled = enabled;
+    if (this.users <= 0) {
+      return;
+    }
+    await this.ensureActivated();
+    await this.applyOutputPreference();
+  }
+
+  private installListener(): void {
+    if (this.listenerInstalled) {
+      return;
+    }
+    try {
+      audio.getAudioManager().getSessionManager().on(
+        'audioSessionDeactivated',
+        this.sessionDeactivatedListener
+      );
+      this.listenerInstalled = true;
+    } catch (error) {
+      const businessError = error as BusinessError;
+      hilog.warn(
+        AUDIO_LOG_DOMAIN,
+        AUDIO_LOG_TAG,
+        'communication audio session listener setup failed: %{public}s',
+        businessError.message
+      );
+    }
+  }
+
+  private async ensureActivated(): Promise<void> {
+    const sessionManager = audio.getAudioManager().getSessionManager();
+    if (sessionManager.isAudioSessionActivated()) {
+      return;
+    }
+    const existing = this.activation;
+    if (existing) {
+      await existing;
+      return;
+    }
+    const activation = this.activate();
+    this.activation = activation;
+    try {
+      await activation;
+    } finally {
+      if (this.activation === activation) {
+        this.activation = undefined;
+      }
+    }
+  }
+
+  private async activate(): Promise<void> {
+    const sessionManager = audio.getAudioManager().getSessionManager();
+    try {
+      sessionManager.setAudioSessionScene(audio.AudioSessionScene.AUDIO_SESSION_SCENE_VOICE_COMMUNICATION);
+      const strategy: audio.AudioSessionStrategy = {
+        concurrencyMode: audio.AudioConcurrencyMode.CONCURRENCY_DEFAULT
+      };
+      await sessionManager.activateAudioSession(strategy);
+      hilog.info(AUDIO_LOG_DOMAIN, AUDIO_LOG_TAG, 'communication audio session activated');
+    } catch (error) {
+      const businessError = error as BusinessError;
+      throw new Error(businessError.message);
+    }
+    await this.applyOutputPreference();
+  }
+
+  private async applyOutputPreference(): Promise<void> {
+    const sessionManager = audio.getAudioManager().getSessionManager();
+    const device = this.speakerphoneEnabled ? audio.DeviceType.SPEAKER : audio.DeviceType.EARPIECE;
+    try {
+      await sessionManager.setDefaultOutputDevice(device);
+      hilog.info(
+        AUDIO_LOG_DOMAIN,
+        AUDIO_LOG_TAG,
+        'communication fallback output=%{public}s',
+        this.speakerphoneEnabled ? 'speaker' : 'earpiece'
+      );
+    } catch (error) {
+      const businessError = error as BusinessError;
+      hilog.warn(
+        AUDIO_LOG_DOMAIN,
+        AUDIO_LOG_TAG,
+        'communication fallback output setup failed: %{public}s',
+        businessError.message
+      );
+    }
+  }
+
+  private scheduleRecovery(): void {
+    if (this.users <= 0 || this.recoveryTimer !== undefined) {
+      return;
+    }
+    if (this.recoveryAttempt >= AUDIO_SESSION_RECOVERY_DELAYS_MS.length) {
+      hilog.error(
+        AUDIO_LOG_DOMAIN,
+        AUDIO_LOG_TAG,
+        'communication audio session recovery exhausted users=%{public}d',
+        this.users
+      );
+      this.recoveryAttempt = 0;
+      return;
+    }
+    const delay = AUDIO_SESSION_RECOVERY_DELAYS_MS[this.recoveryAttempt];
+    this.recoveryAttempt += 1;
+    this.recoveryTimer = setTimeout((): void => {
+      this.recoveryTimer = undefined;
+      if (this.users <= 0) {
+        this.recoveryAttempt = 0;
+        return;
+      }
+      this.ensureActivated().then((): void => {
+        this.recoveryAttempt = 0;
+        hilog.info(
+          AUDIO_LOG_DOMAIN,
+          AUDIO_LOG_TAG,
+          'communication audio session recovered users=%{public}d',
+          this.users
+        );
+      }).catch((error: BusinessError): void => {
+        hilog.warn(
+          AUDIO_LOG_DOMAIN,
+          AUDIO_LOG_TAG,
+          'communication audio session recovery failed: %{public}s',
+          error.message
+        );
+        this.scheduleRecovery();
+      });
+    }, delay);
+  }
+
+  private cancelRecovery(): void {
+    if (this.recoveryTimer !== undefined) {
+      clearTimeout(this.recoveryTimer);
+      this.recoveryTimer = undefined;
+    }
+    this.recoveryAttempt = 0;
+  }
+}
+
+const COMMUNICATION_AUDIO_SESSION = new CommunicationAudioSession();
+
+export function setCommunicationSpeakerphoneEnabled(enabled: boolean): Promise<void> {
+  return COMMUNICATION_AUDIO_SESSION.setSpeakerphoneEnabled(enabled);
+}
+
+export class CommunicationAudioSessionLease {
+  private acquired: boolean = false;
+
+  async acquire(): Promise<void> {
+    if (this.acquired) {
+      return;
+    }
+    await COMMUNICATION_AUDIO_SESSION.acquire();
+    this.acquired = true;
+  }
+
+  async release(): Promise<void> {
+    if (!this.acquired) {
+      return;
+    }
+    this.acquired = false;
+    await COMMUNICATION_AUDIO_SESSION.release();
+  }
+}
 
 export class PcmCapture {
   private capturer?: audio.AudioCapturer;
   private listener?: AudioChunkListener;
+  private routeListener?: InputRouteListener;
   private lastReadAt: number = 0;
   private lastHealthLogAt: number = 0;
   private readCount: number = 0;
+  private activeInputLabel: string = '';
+  private captureGeneration: number = 0;
+  private session: CommunicationAudioSessionLease = new CommunicationAudioSessionLease();
 
   async requestPermission(context: common.UIAbilityContext): Promise<boolean> {
     const manager = abilityAccessCtrl.createAtManager();
@@ -33,12 +296,20 @@ export class PcmCapture {
     }
   }
 
-  async start(listener: AudioChunkListener): Promise<void> {
+  async start(listener: AudioChunkListener, routeListener?: InputRouteListener): Promise<void> {
+    const generation = this.captureGeneration + 1;
+    this.captureGeneration = generation;
     this.listener = listener;
+    this.routeListener = routeListener;
     if (this.capturer) {
       return;
     }
-    const source = this.selectCaptureSource();
+    this.activeInputLabel = '';
+    const capturerInfo: audio.AudioCapturerInfo = {
+      source: audio.SourceType.SOURCE_TYPE_VOICE_COMMUNICATION,
+      capturerFlags: 0
+    };
+    this.logPreferredInputDevices(capturerInfo);
     const options: audio.AudioCapturerOptions = {
       streamInfo: {
         samplingRate: audio.AudioSamplingRate.SAMPLE_RATE_16000,
@@ -46,13 +317,19 @@ export class PcmCapture {
         sampleFormat: audio.AudioSampleFormat.SAMPLE_FORMAT_S16LE,
         encodingType: audio.AudioEncodingType.ENCODING_TYPE_RAW
       },
-      capturerInfo: {
-        source: source,
-        capturerFlags: 0
-      }
+      capturerInfo: capturerInfo
     };
-    const capturer = await audio.createAudioCapturer(options);
+    await this.session.acquire();
+    let capturer: audio.AudioCapturer | undefined = undefined;
     try {
+      if (generation !== this.captureGeneration) {
+        throw new Error('录音启动已取消');
+      }
+      capturer = await audio.createAudioCapturer(options);
+      if (generation !== this.captureGeneration) {
+        throw new Error('录音启动已取消');
+      }
+      this.capturer = capturer;
       capturer.on('readData', (buffer: ArrayBuffer) => {
         const now = Date.now();
         const gap = this.lastReadAt > 0 ? now - this.lastReadAt : 0;
@@ -70,86 +347,181 @@ export class PcmCapture {
         }
         this.listener?.(buffer);
       });
+      capturer.on('inputDeviceChange', (devices: audio.AudioDeviceDescriptors) => {
+        if (generation !== this.captureGeneration || this.capturer !== capturer) {
+          return;
+        }
+        this.updateInputRoute('changed', devices);
+      });
       await capturer.start();
-      this.capturer = capturer;
-      hilog.info(AUDIO_LOG_DOMAIN, AUDIO_LOG_TAG, 'capture started');
+      if (generation !== this.captureGeneration) {
+        throw new Error('录音启动已取消');
+      }
+      this.updateInputRoute('started', this.getActiveInputDevices(capturer));
+      hilog.info(
+        AUDIO_LOG_DOMAIN,
+        AUDIO_LOG_TAG,
+        'capture started source=voice_communication'
+      );
     } catch (error) {
-      await capturer.release().catch(() => undefined);
+      if (capturer && this.capturer === capturer) {
+        this.capturer = undefined;
+      }
+      if (capturer) {
+        try {
+          capturer.off('readData');
+          capturer.off('inputDeviceChange');
+        } catch (offError) {
+        }
+        await capturer.stop().catch(() => undefined);
+        await capturer.release().catch(() => undefined);
+      }
+      await this.session.release();
+      this.activeInputLabel = '';
       const businessError = error as BusinessError;
       throw new Error(businessError.message);
     }
   }
 
   async stop(): Promise<void> {
+    this.captureGeneration += 1;
     const capturer = this.capturer;
     this.capturer = undefined;
     this.lastReadAt = 0;
     this.lastHealthLogAt = 0;
     this.readCount = 0;
     this.listener = undefined;
+    this.routeListener = undefined;
+    this.activeInputLabel = '';
     if (!capturer) {
       return;
     }
     try {
       capturer.off('readData');
+      capturer.off('inputDeviceChange');
     } catch (error) {
       // A stopped capturer may already have removed the callback.
     }
-    await capturer.stop();
-    await capturer.release();
+    await capturer.stop().catch(() => undefined);
+    await capturer.release().catch(() => undefined);
+    await this.session.release();
     hilog.info(AUDIO_LOG_DOMAIN, AUDIO_LOG_TAG, 'capture stopped');
   }
 
-  private selectCaptureSource(): audio.SourceType {
-    const recognition = audio.SourceType.SOURCE_TYPE_VOICE_RECOGNITION;
-    const communication = audio.SourceType.SOURCE_TYPE_VOICE_COMMUNICATION;
-    try {
-      const manager = audio.getAudioManager();
-      const rendererInfo: audio.AudioRendererInfo = {
-        content: audio.ContentType.CONTENT_TYPE_SPEECH,
-        usage: audio.StreamUsage.STREAM_USAGE_VOICE_ASSISTANT,
-        rendererFlags: 0
-      };
-      const devices = manager.getRoutingManager()
-        .getPreferredOutputDeviceForRendererInfoSync(rendererInfo);
-      for (const device of devices) {
-        if (this.isPrivateOutput(device.deviceType)) {
-          hilog.info(
-            AUDIO_LOG_DOMAIN,
-            AUDIO_LOG_TAG,
-            'capture route=headset deviceType=%{public}d source=recognition',
-            device.deviceType
-          );
-          return recognition;
-        }
+  getInputRouteLabel(): string {
+    const capturer = this.capturer;
+    if (capturer) {
+      const devices = this.getActiveInputDevices(capturer);
+      const label = this.inputRouteLabel(devices);
+      if (label.length > 0) {
+        this.activeInputLabel = label;
       }
-      hilog.info(
-        AUDIO_LOG_DOMAIN,
-        AUDIO_LOG_TAG,
-        'capture route=speaker source=communication'
-      );
-      return communication;
+    }
+    return this.activeInputLabel;
+  }
+
+  private logPreferredInputDevices(capturerInfo: audio.AudioCapturerInfo): void {
+    try {
+      const devices = audio.getAudioManager().getRoutingManager()
+        .getPreferredInputDeviceForCapturerInfoSync(capturerInfo);
+      this.logInputDevices('preferred', devices);
     } catch (error) {
+      const businessError = error as BusinessError;
       hilog.warn(
         AUDIO_LOG_DOMAIN,
         AUDIO_LOG_TAG,
-        'capture route query failed; source=recognition'
+        'capture preferred input query failed: %{public}s',
+        businessError.message
       );
-      return recognition;
     }
   }
 
-  private isPrivateOutput(deviceType: audio.DeviceType): boolean {
-    return deviceType === audio.DeviceType.EARPIECE ||
-      deviceType === audio.DeviceType.WIRED_HEADSET ||
-      deviceType === audio.DeviceType.WIRED_HEADPHONES ||
+  private getActiveInputDevices(
+    capturer: audio.AudioCapturer
+  ): audio.AudioDeviceDescriptors | undefined {
+    try {
+      return capturer.getCurrentInputDevices();
+    } catch (error) {
+      const businessError = error as BusinessError;
+      hilog.warn(
+        AUDIO_LOG_DOMAIN,
+        AUDIO_LOG_TAG,
+        'capture active input query failed: %{public}s',
+        businessError.message
+      );
+      return undefined;
+    }
+  }
+
+  private updateInputRoute(
+    stage: string,
+    devices: audio.AudioDeviceDescriptors | undefined
+  ): void {
+    if (!devices) {
+      return;
+    }
+    this.logInputDevices(stage, devices);
+    const label = this.inputRouteLabel(devices);
+    if (label.length === 0 || label === this.activeInputLabel) {
+      return;
+    }
+    this.activeInputLabel = label;
+    this.routeListener?.(label);
+  }
+
+  private logInputDevices(stage: string, devices: audio.AudioDeviceDescriptors): void {
+    if (devices.length === 0) {
+      hilog.warn(
+        AUDIO_LOG_DOMAIN,
+        AUDIO_LOG_TAG,
+        'capture input stage=%{public}s devices=none',
+        stage
+      );
+      return;
+    }
+    for (const device of devices) {
+      hilog.info(
+        AUDIO_LOG_DOMAIN,
+        AUDIO_LOG_TAG,
+        'capture input stage=%{public}s deviceType=%{public}d headsetMic=%{public}s',
+        stage,
+        device.deviceType,
+        this.isHeadsetInput(device.deviceType) ? 'true' : 'false'
+      );
+    }
+  }
+
+  private isHeadsetInput(deviceType: audio.DeviceType): boolean {
+    return deviceType === audio.DeviceType.WIRED_HEADSET ||
       deviceType === audio.DeviceType.BLUETOOTH_SCO ||
-      deviceType === audio.DeviceType.BLUETOOTH_A2DP ||
       deviceType === audio.DeviceType.USB_HEADSET ||
       deviceType === audio.DeviceType.USB_DEVICE ||
       deviceType === audio.DeviceType.HEARING_AID ||
       deviceType === audio.DeviceType.NEARLINK;
   }
+
+  private findHeadsetInput(
+    devices: audio.AudioDeviceDescriptors
+  ): audio.AudioDeviceDescriptor | undefined {
+    for (const device of devices) {
+      if (this.isHeadsetInput(device.deviceType)) {
+        return device;
+      }
+    }
+    return undefined;
+  }
+
+  private hasHeadsetInput(devices: audio.AudioDeviceDescriptors): boolean {
+    return this.findHeadsetInput(devices) !== undefined;
+  }
+
+  private inputRouteLabel(devices: audio.AudioDeviceDescriptors | undefined): string {
+    if (!devices || devices.length === 0) {
+      return '';
+    }
+    return this.hasHeadsetInput(devices) ? '耳机麦克风' : '手机麦克风';
+  }
+
 }
 
 export class PcmPlayer {
@@ -163,6 +535,12 @@ export class PcmPlayer {
   private drainTimer: number | undefined = undefined;
   private lastBufferDurationMs: number = 0;
   private sampleRate: number = 24000;
+  private session: CommunicationAudioSessionLease = new CommunicationAudioSessionLease();
+  private communication: boolean;
+
+  constructor(communication: boolean = true) {
+    this.communication = communication;
+  }
 
   private async ensureRenderer(): Promise<audio.AudioRenderer> {
     if (this.renderer) {
@@ -192,11 +570,23 @@ export class PcmPlayer {
         encodingType: audio.AudioEncodingType.ENCODING_TYPE_RAW
       },
       rendererInfo: {
-        usage: audio.StreamUsage.STREAM_USAGE_VOICE_ASSISTANT,
+        usage: this.communication
+          ? audio.StreamUsage.STREAM_USAGE_VOICE_COMMUNICATION
+          : audio.StreamUsage.STREAM_USAGE_VOICE_ASSISTANT,
         rendererFlags: 0
       }
     };
-    const renderer = await audio.createAudioRenderer(options);
+    if (this.communication) {
+      await this.session.acquire();
+    }
+    let renderer: audio.AudioRenderer;
+    try {
+      renderer = await audio.createAudioRenderer(options);
+    } catch (error) {
+      await this.session.release();
+      const businessError = error as BusinessError;
+      throw new Error(businessError.message);
+    }
     try {
       renderer.on('writeData', (buffer: ArrayBuffer) => {
         this.fillPlaybackBuffer(buffer);
@@ -204,6 +594,7 @@ export class PcmPlayer {
       await renderer.start();
     } catch (error) {
       await renderer.release().catch(() => undefined);
+      await this.session.release();
       const businessError = error as BusinessError;
       throw new Error(businessError.message);
     }
@@ -214,6 +605,7 @@ export class PcmPlayer {
       }
       await renderer.stop();
       await renderer.release();
+      await this.session.release();
       throw new Error('Playback was interrupted');
     }
     this.renderer = renderer;
@@ -298,6 +690,7 @@ export class PcmPlayer {
     }
     await renderer.stop();
     await renderer.release();
+    await this.session.release();
   }
 
   private fillPlaybackBuffer(buffer: ArrayBuffer): void {

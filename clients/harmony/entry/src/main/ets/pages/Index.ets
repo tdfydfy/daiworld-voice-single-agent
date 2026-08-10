@@ -55,6 +55,8 @@ struct Index {
   @State nowMs: number = Date.now();
   private clockTimer?: number;
   private lastMessageCount: number = 0;
+  private lastMessageVersion: number = 0;
+  private lastMessageListAtEnd: boolean = true;
   private lastAsrUtteranceActive: boolean = false;
 
   aboutToAppear(): void {
@@ -70,16 +72,26 @@ struct Index {
     this.speechRate = config.speechRate;
     this.controller.setListener(new SnapshotListener(
       (snapshot: SingleAgentSnapshot): void => {
+        const wasNearBottom = this.lastMessageCount === 0 || this.isMessageListNearBottom();
         const messageAdded = snapshot.messages.length > this.lastMessageCount;
         const messagesCleared = snapshot.messages.length === 0 && this.lastMessageCount > 0;
         const speechStarted = snapshot.asrUtteranceActive && !this.lastAsrUtteranceActive;
+        const messageVersion = this.messageVersion(snapshot);
+        const messagesChanged = messageVersion !== this.lastMessageVersion;
         this.lastMessageCount = snapshot.messages.length;
+        this.lastMessageVersion = messageVersion;
+        this.lastMessageListAtEnd = wasNearBottom;
         this.lastAsrUtteranceActive = snapshot.asrUtteranceActive;
         this.snapshot = snapshot;
-        if (!this.showSettings && !this.showHistory && (messageAdded || messagesCleared || speechStarted)) {
+        if (!this.showSettings && !this.showHistory &&
+          (messageAdded || messagesCleared || messagesChanged || speechStarted)) {
           setTimeout((): void => {
             try {
-              this.scroller.scrollEdge(messagesCleared ? Edge.Top : Edge.Bottom);
+              if (messagesCleared) {
+                this.scroller.scrollEdge(Edge.Top);
+              } else if (wasNearBottom) {
+                this.scroller.scrollEdge(Edge.Bottom);
+              }
             } catch (error) {
               // The list may not be mounted during a settings transition.
             }
@@ -138,13 +150,15 @@ struct Index {
 
   private saveSettings(): void {
     const enteredToken = this.accessToken.trim();
-    const savedToken = this.controller.getConfig().accessToken;
+    const currentConfig = this.controller.getConfig();
+    const savedToken = currentConfig.accessToken;
     const token = enteredToken.length > 0 ? enteredToken : savedToken;
     const reconnect = this.controller.setConfig({
       gatewayUrl: this.gatewayUrl.trim(),
       accessToken: token,
       profile: this.selectedProfile,
       muted: false,
+      speakerphoneEnabled: currentConfig.speakerphoneEnabled,
       speechBackend: this.speechBackend,
       voicePerson: this.voicePerson,
       speechRate: this.speechRate
@@ -212,6 +226,10 @@ struct Index {
 
   private toggleVoice(): void {
     this.controller.toggleVoice();
+  }
+
+  private toggleSpeakerphone(): void {
+    this.controller.toggleSpeakerphone();
   }
 
   private canStopTask(): boolean {
@@ -290,7 +308,11 @@ struct Index {
 
   private asrStatusText(): string {
     if (this.snapshot.asrState === 'connecting') {
-      return '连接中';
+      if (this.snapshot.asrBackend === 'harmony_offline' &&
+        this.snapshot.statusDetail.startsWith('本地 ASR：')) {
+        return this.snapshot.statusDetail.substring('本地 ASR：'.length);
+      }
+      return this.snapshot.asrBackend === 'harmony_offline' ? '启动中' : '连接中';
     }
     if (this.snapshot.asrState === 'listening') {
       return '监听中';
@@ -299,6 +321,14 @@ struct Index {
       return '提交中';
     }
     return '未启动';
+  }
+
+  private microphoneButtonText(): string {
+    const label = this.snapshot.voiceEnabled ? '麦克风已开' : '开启麦克风';
+    if (this.snapshot.voiceEnabled && this.snapshot.microphoneRoute.length > 0) {
+      return label + '（' + this.snapshot.microphoneRoute + '）';
+    }
+    return label;
   }
 
   private ttsStatusText(): string {
@@ -428,7 +458,7 @@ struct Index {
     if (message.pending) {
       return this.messageTime(message.timestamp) + ' · 已用时 ' + this.durationText(this.elapsedSeconds(message));
     }
-    const parts: string[] = [];
+    const parts: string[] = [this.messageTime(message.completedAt > 0 ? message.completedAt : message.timestamp)];
     if (message.thinking_s !== undefined) {
       parts.push('思考 ' + this.durationText(message.thinking_s));
     }
@@ -438,8 +468,41 @@ struct Index {
     if (message.duration_s !== undefined) {
       parts.push('总计 ' + this.durationText(message.duration_s));
     }
-    parts.push(this.messageTime(message.completedAt > 0 ? message.completedAt : message.timestamp));
     return parts.join(' · ');
+  }
+
+  private userMessageText(message: ChatMessage): string {
+    if (message.status === 'listening') {
+      return '…';
+    }
+    return message.status.length > 0 ? message.status : '…';
+  }
+
+  private messageMetadata(message: ChatMessage): string {
+    const parts: string[] = [];
+    if (message.model.length > 0) {
+      parts.push(message.model);
+    }
+    if (message.provider.length > 0) {
+      parts.push(message.provider);
+    }
+    return parts.join(' · ');
+  }
+
+  private messageVersion(snapshot: SingleAgentSnapshot): number {
+    let version = snapshot.messages.length;
+    for (const message of snapshot.messages) {
+      version = (version * 31 + message.revision + message.text.length) % 2147483647;
+    }
+    return version;
+  }
+
+  private isMessageListNearBottom(): boolean {
+    try {
+      return this.scroller.isAtEnd();
+    } catch (error) {
+      return this.lastMessageListAtEnd;
+    }
   }
 
   private activityColor(activity: MessageActivity): string {
@@ -1051,12 +1114,11 @@ struct Index {
         }
       }
     }
-    .width('100%')
-    .padding({ bottom: message.text.length > 0 ? 9 : 0 })
-    .border({
-      width: { bottom: message.text.length > 0 ? 1 : 0 },
-      color: COLOR_LINE
-    })
+    .width('92%')
+    .padding(10)
+    .backgroundColor('#0C0D0F')
+    .border({ width: 1, color: COLOR_LINE })
+    .borderRadius(8)
   }
 
   @Builder
@@ -1066,8 +1128,8 @@ struct Index {
         Text(message.label)
           .fontSize(10)
           .fontColor(COLOR_MUTED)
-        if (message.role === 'assistant' && message.model.length > 0) {
-          Text('· ' + message.model)
+        if (message.role === 'assistant' && this.messageMetadata(message).length > 0) {
+          Text('· ' + this.messageMetadata(message))
             .fontSize(10)
             .fontColor(COLOR_MUTED)
             .maxLines(1)
@@ -1077,9 +1139,13 @@ struct Index {
       .width('100%')
       .justifyContent(message.role === 'user' ? FlexAlign.End : FlexAlign.Start)
 
-      if (message.role === 'user' && message.text.length > 0) {
-        Text(message.text)
-          .constraintSize({ minWidth: 48, maxWidth: '84%' })
+      if (message.role === 'assistant' && this.hasMessageProcess(message)) {
+        this.MessageProcess(message)
+      }
+
+      if (message.role === 'user' && (message.text.length > 0 || message.transient)) {
+        Text(message.text.length > 0 ? message.text : this.userMessageText(message))
+          .constraintSize({ minWidth: 48, maxWidth: '92%' })
           .padding(12)
           .fontSize(14)
           .lineHeight(22)
@@ -1087,33 +1153,29 @@ struct Index {
           .backgroundColor('#23253C')
           .border({ width: 1, color: '#363A67' })
           .borderRadius(8)
-      } else if (message.text.length > 0 || message.pending || this.hasMessageProcess(message)) {
+      } else if (message.text.length > 0 || message.pending || message.artifacts.length > 0) {
         Column({ space: 10 }) {
-          if (this.hasMessageProcess(message)) {
-            this.MessageProcess(message)
-          }
           if (message.text.length > 0) {
             Text(message.text)
               .fontSize(14)
               .lineHeight(22)
               .fontColor(COLOR_TEXT)
           }
+          if (message.artifacts.length > 0) {
+            Column({ space: 8 }) {
+              ForEach(message.artifacts, (artifact: MessageArtifact) => {
+                this.ArtifactItem(artifact)
+              }, (artifact: MessageArtifact) => artifact.token)
+            }
+            .width('100%')
+          }
         }
-        .width('94%')
+        .width('92%')
         .padding(12)
         .alignItems(HorizontalAlign.Start)
         .backgroundColor(COLOR_PANEL)
         .border({ width: 1, color: COLOR_LINE })
         .borderRadius(8)
-      }
-
-      if (message.artifacts.length > 0) {
-        Column({ space: 8 }) {
-          ForEach(message.artifacts, (artifact: MessageArtifact) => {
-            this.ArtifactItem(artifact)
-          }, (artifact: MessageArtifact) => artifact.token)
-        }
-        .width('100%')
       }
 
       Text(this.messageTiming(message))
@@ -1134,9 +1196,6 @@ struct Index {
         ForEach(this.snapshot.messages, (message: ChatMessage) => {
           this.MessageItem(message)
         }, (message: ChatMessage) => message.id + '-' + String(message.revision))
-        if (this.snapshot.asrUtteranceActive || this.snapshot.asrTranscript.length > 0) {
-          this.LiveAsrBubble()
-        }
       }
       .width('100%')
       .constraintSize({ minHeight: '100%' })
@@ -1144,27 +1203,9 @@ struct Index {
     }
     .layoutWeight(1)
     .scrollBar(BarState.Off)
-  }
-
-  @Builder
-  private LiveAsrBubble() {
-    Column({ space: 5 }) {
-      Text('你 · 正在说')
-        .fontSize(10)
-        .fontColor(COLOR_MUTED)
-      Text(this.snapshot.asrTranscript.length > 0 ? this.snapshot.asrTranscript : '…')
-      .constraintSize({ minWidth: 48, maxWidth: '84%' })
-      .padding({ left: 12, right: 12, top: 9, bottom: 9 })
-      .fontSize(14)
-      .lineHeight(21)
-      .fontColor(COLOR_TEXT)
-      .backgroundColor('#23253C')
-      .border({ width: 1, color: '#363A67' })
-      .borderRadius(7)
-    }
-    .width('100%')
-    .alignItems(HorizontalAlign.End)
-    .margin({ bottom: 12 })
+    .onScroll(() => {
+      this.lastMessageListAtEnd = this.isMessageListNearBottom();
+    })
   }
 
   @Builder
@@ -1323,8 +1364,8 @@ struct Index {
             SymbolGlyph($r('sys.symbol.ohos_mic'))
               .fontSize(21)
               .fontColor([this.snapshot.voiceEnabled ? COLOR_SUCCESS : COLOR_MUTED])
-            Text(this.snapshot.voiceEnabled ? '实时对话已开' : '开启实时对话')
-              .fontSize(12)
+            Text(this.microphoneButtonText())
+              .fontSize(11)
               .fontWeight(FontWeight.Medium)
               .fontColor(this.snapshot.voiceEnabled ? COLOR_SUCCESS : COLOR_TEXT)
               .maxLines(1)
@@ -1353,6 +1394,31 @@ struct Index {
           .opacity(this.canStopTask() ? 1 : 0.5)
           .onClick(() => {
             this.controller.stopCurrentTask();
+          })
+
+        Button({ type: ButtonType.Normal }) {
+          Row({ space: 4 }) {
+            SymbolGlyph($r('sys.symbol.speaker_wave_2'))
+              .fontSize(18)
+              .fontColor([this.snapshot.speakerphoneEnabled ? COLOR_ACCENT : COLOR_MUTED])
+            Text(this.snapshot.speakerphoneEnabled ? '扬声器' : '听筒')
+              .fontSize(11)
+              .fontColor(this.snapshot.speakerphoneEnabled ? COLOR_ACCENT : COLOR_TEXT)
+              .maxLines(1)
+          }
+        }
+          .width(78)
+          .height(42)
+          .padding({ left: 6, right: 6 })
+          .backgroundColor(this.snapshot.speakerphoneEnabled ? '#1C2033' : COLOR_PANEL)
+          .border({
+            width: 1,
+            color: this.snapshot.speakerphoneEnabled ? COLOR_ACCENT : COLOR_LINE
+          })
+          .borderRadius(8)
+          .accessibilityText(this.snapshot.speakerphoneEnabled ? '切换到听筒' : '切换到扬声器')
+          .onClick(() => {
+            this.toggleSpeakerphone();
           })
 
         Button('文字', { type: ButtonType.Normal })

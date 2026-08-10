@@ -45,7 +45,11 @@ python -m uvicorn app.native_main:app --host 0.0.0.0 --port 8844
 
 CoreSpeechKit 当前使用离线短句识别。真机上单个识别 session 最长约 20 秒，持续静音约 10 秒也会结束。客户端会复用同一个 `SpeechRecognitionEngine`，只轮换 session ID，并在约 150 ms 后继续监听，因此长时间开启语音不会在每轮重建引擎时留下数秒空档。不过，一次连续发言超过单 session 上限时仍会被拆成多段提交，而不是合并成一个无限长的听写结果。
 
-录音链路会根据当前输出设备选择采集源：耳机、蓝牙耳机和听筒使用面向语音识别的采集源，与已验证的 CoreSpeechKit 真机示例一致；扬声器外放使用面向语音通信的采集源。STT 和 TTS 保持并行；用户开口后只停止旧播报，不停止或重建识别 session。客户端不叠加 RMS 声音阈值，以免截断轻声发言。外放回声消除和双讲识别的实际效果仍取决于设备系统实现。
+语音后端选择是显式配置。选择鸿蒙离线语音后，CoreSpeech 启动或运行失败只会停止对应的本地语音路径并报告错误，不会自动连接远端 ASR/TTS；只有用户在设置页明确选择远端语音时才会建立远端语音连接。
+
+全双工音频统一声明为鸿蒙语音通信场景。PCM 采集固定使用 `SOURCE_TYPE_VOICE_COMMUNICATION`，应用自管的 PCM 播放使用 `STREAM_USAGE_VOICE_COMMUNICATION`，并共享 `AUDIO_SESSION_SCENE_VOICE_COMMUNICATION`。客户端把无配件时的通信输出默认值设为 `EARPIECE`，用户可以通过扬声器按钮切换为 `SPEAKER`；耳机等配件存在时该默认值不生效，蓝牙 SCO、NearLink、有线和 USB 设备的实际选择及无输入设备时的手机麦克风回退仍由 HarmonyOS 管理。客户端不调用 `selectMediaInputDevice()`，不再根据输出设备推断输入设备，也不因正常插拔重建 `AudioCapturer`。`inputDeviceChange` 仅用于刷新手机或耳机麦克风标签和记录诊断日志。短提示音不持有通信 Session，避免麦克风关闭后反复切换 A2DP/SCO。STT 和 TTS 保持并行；用户开口后只停止旧播报，不停止或重建识别 session。客户端不叠加 RMS 声音阈值，以免截断轻声发言。外放回声消除和双讲识别的实际效果仍取决于设备系统实现。
+
+当前开发版本存在一个已定位的系统 TTS 回归：CoreSpeech TTS 已完成文字合成，但其内部 `VOICE_ASSISTANT` 播放器会与客户端持有的 `VOICE_COMMUNICATION` AudioSession 发生音频焦点冲突，真机日志为 `ActivateAudioInterrupt Failed` / `6800301`，因此生成文字暂时没有声音。改动前由系统 TTS 自行管理音频焦点时可以正常播放；后续应先隔离系统 TTS 与通话会话的所有权，再恢复真机自动播放验收。
 
 ## 发布前检查
 
@@ -55,3 +59,7 @@ CoreSpeechKit 当前使用离线短句识别。真机上单个识别 session 最
 4. 在 DevEco Studio 中使用发行签名构建 HAP，再通过 AppGallery Connect 创建版本、上传 HAP、填写隐私与权限说明并提交审核。
 
 真机和 AppGallery Connect 的签名、上传、审核需要开发者账号授权，不能由本地源码或 CI 自动替代。
+
+## Voice control semantics
+
+The microphone button controls input only: it stops `AudioCapturer`, PCM delivery, and ASR sessions. It does not interrupt an Agent turn or stop an active TTS job. The `停止` button is the explicit current-turn interrupt: it cancels the Agent task and clears TTS playback while leaving microphone state unchanged. Re-enabling the microphone resumes ASR without needlessly reconnecting an active TTS stream.

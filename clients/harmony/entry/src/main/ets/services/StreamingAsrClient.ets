@@ -24,6 +24,10 @@ export class StreamingAsrClient {
     this.listener = listener;
   }
 
+  isConnected(): boolean {
+    return this.connected;
+  }
+
   isReady(): boolean {
     return this.ready;
   }

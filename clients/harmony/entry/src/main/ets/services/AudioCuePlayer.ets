@@ -145,7 +145,7 @@ export class AudioCuePlayer {
   private startCue(buffer: ArrayBuffer, kind: CueKind): void {
     const generation = this.playbackGeneration + 1;
     this.playbackGeneration = generation;
-    const player = new PcmPlayer();
+    const player = new PcmPlayer(false);
     player.setSampleRate(CUE_SAMPLE_RATE);
     this.player = player;
     this.activeCue = kind;

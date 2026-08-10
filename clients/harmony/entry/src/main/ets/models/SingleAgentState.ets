@@ -41,6 +41,9 @@ export class ChatMessage {
   label: string = '';
   text: string = '';
   model: string = '';
+  provider: string = '';
+  status: string = '';
+  transient: boolean = false;
   thinking: string = '';
   activities: MessageActivity[] = [];
   artifacts: MessageArtifact[] = [];
@@ -85,6 +88,8 @@ export class SingleAgentSnapshot {
   asrState: AsrState = 'stopped';
   asrTranscript: string = '';
   asrUtteranceActive: boolean = false;
+  microphoneRoute: string = '';
+  speakerphoneEnabled: boolean = false;
   ttsState: TtsState = 'stopped';
   ttsSampleRate: number = 24000;
   asrBackend: SpeechBackend = 'harmony_offline';
