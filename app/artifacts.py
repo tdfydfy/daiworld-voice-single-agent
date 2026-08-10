@@ -148,7 +148,42 @@ def _decorate_text_container(container: dict, registry: ArtifactRegistry) -> Non
         container["artifacts"] = artifacts
 
 
-def transform_hermes_message(message: str, registry: ArtifactRegistry) -> str:
+def _add_provider_label(frame: dict, provider_label: str) -> bool:
+    label = str(provider_label or "").strip()
+    if not label:
+        return False
+    changed = False
+
+    def decorate(container: object) -> None:
+        nonlocal changed
+        if not isinstance(container, dict):
+            return
+        if container.get("provider_label") or container.get("provider_name"):
+            return
+        container["provider_label"] = label
+        changed = True
+
+    result = frame.get("result")
+    if isinstance(result, dict):
+        decorate(result.get("info"))
+        messages = result.get("messages")
+        if isinstance(messages, list):
+            for stored_message in messages:
+                if isinstance(stored_message, dict) and stored_message.get("role") == "assistant":
+                    decorate(stored_message)
+
+    if frame.get("method") == "event":
+        params = frame.get("params")
+        if isinstance(params, dict) and params.get("type") == "session.info":
+            decorate(params.get("payload"))
+    return changed
+
+
+def transform_hermes_message(
+    message: str,
+    registry: ArtifactRegistry,
+    provider_label: str = "",
+) -> str:
     """Attach artifact metadata to Hermes live and resumed assistant messages."""
 
     try:
@@ -158,9 +193,10 @@ def transform_hermes_message(message: str, registry: ArtifactRegistry) -> str:
     if not isinstance(frame, dict):
         return message
 
+    changed = _add_provider_label(frame, provider_label)
+
     result = frame.get("result")
     if isinstance(result, dict) and isinstance(result.get("messages"), list):
-        changed = False
         for stored_message in result["messages"]:
             if not isinstance(stored_message, dict) or stored_message.get("role") != "assistant":
                 continue
@@ -172,15 +208,15 @@ def transform_hermes_message(message: str, registry: ArtifactRegistry) -> str:
         return message
 
     if frame.get("method") != "event":
-        return message
+        return json.dumps(frame, ensure_ascii=False, separators=(",", ":")) if changed else message
     params = frame.get("params")
     if not isinstance(params, dict) or params.get("type") != "message.complete":
-        return message
+        return json.dumps(frame, ensure_ascii=False, separators=(",", ":")) if changed else message
     payload = params.get("payload")
     if not isinstance(payload, dict):
         return message
     before = payload.get("text")
     _decorate_text_container(payload, registry)
-    if payload.get("text") == before and not payload.get("artifacts"):
+    if payload.get("text") == before and not payload.get("artifacts") and not changed:
         return message
     return json.dumps(frame, ensure_ascii=False, separators=(",", ":"))

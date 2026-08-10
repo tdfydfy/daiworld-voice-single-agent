@@ -9,6 +9,7 @@ import { preferences } from '@kit.ArkData';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import {
+  AudioOutputRoute,
   ChatMessage,
   HistorySession,
   MessageArtifact,
@@ -23,7 +24,12 @@ import { AuthSessionClient } from './AuthSessionClient';
 import { GatewayListener, HermesGatewayClient } from './HermesGatewayClient';
 import { HermesSessionDetailClient } from './HermesSessionDetailClient';
 import { AudioCuePlayer } from './AudioCuePlayer';
-import { PcmCapture, PcmPlayer, setCommunicationSpeakerphoneEnabled } from './PcmAudio';
+import {
+  PcmCapture,
+  PcmPlayer,
+  setCommunicationOutputRouteListener,
+  setCommunicationSpeakerphoneEnabled
+} from './PcmAudio';
 import { AsrListener, StreamingAsrClient } from './StreamingAsrClient';
 import { StreamingTtsClient, TtsJobListener } from './StreamingTtsClient';
 import {
@@ -67,6 +73,7 @@ export interface ClientConfig {
   profile: ProfileKey;
   muted: boolean;
   speakerphoneEnabled: boolean;
+  debugMode: boolean;
   speechBackend: SpeechBackend;
   voicePerson: number;
   speechRate: number;
@@ -184,6 +191,7 @@ export class SingleAgentController {
     profile: 'default',
     muted: false,
     speakerphoneEnabled: false,
+    debugMode: false,
     speechBackend: 'harmony_offline',
     voicePerson: 0,
     speechRate: 1
@@ -218,6 +226,7 @@ export class SingleAgentController {
   private backgroundTaskStopping: boolean = false;
   private stopBackgroundTaskAfterStart: boolean = false;
   private lastCueError: string = '';
+  private outputRouteInitialized: boolean = false;
 
   setListener(listener: SnapshotListener): void {
     this.listener = listener;
@@ -257,6 +266,7 @@ export class SingleAgentController {
       const profile = this.settings.getSync('profile', 'default');
       const muted = this.settings.getSync('muted', false);
       const speakerphoneEnabled = this.settings.getSync('speakerphoneEnabled', false);
+      const debugMode = this.settings.getSync('debugMode', false);
       const speechBackend = this.settings.getSync('speechBackend', 'harmony_offline');
       const voicePerson = this.settings.getSync('voicePerson', 0);
       const speechRate = this.settings.getSync('speechRate', 1);
@@ -266,6 +276,7 @@ export class SingleAgentController {
         profile: this.profileFromValue(profile),
         muted: muted === true,
         speakerphoneEnabled: speakerphoneEnabled === true,
+        debugMode: debugMode === true,
         speechBackend: this.speechBackendFromValue(speechBackend),
         voicePerson: typeof voicePerson === 'number' ? voicePerson : 0,
         speechRate: this.normalizeSpeechRate(typeof speechRate === 'number' ? speechRate : 1)
@@ -277,6 +288,10 @@ export class SingleAgentController {
     this.snapshot.asrBackend = this.config.speechBackend;
     this.snapshot.ttsBackend = this.config.speechBackend;
     this.snapshot.speakerphoneEnabled = this.config.speakerphoneEnabled;
+    this.snapshot.debugMode = this.config.debugMode;
+    setCommunicationOutputRouteListener((route: AudioOutputRoute, headsetAvailable: boolean): void => {
+      this.onOutputRouteChanged(route, headsetAvailable);
+    });
     setCommunicationSpeakerphoneEnabled(this.config.speakerphoneEnabled).catch(() => undefined);
   }
 
@@ -287,6 +302,7 @@ export class SingleAgentController {
       profile: this.config.profile,
       muted: this.config.muted,
       speakerphoneEnabled: this.config.speakerphoneEnabled,
+      debugMode: this.config.debugMode,
       speechBackend: this.config.speechBackend,
       voicePerson: this.config.voicePerson,
       speechRate: this.config.speechRate
@@ -352,12 +368,14 @@ export class SingleAgentController {
       profile: config.profile,
       muted: config.muted,
       speakerphoneEnabled: config.speakerphoneEnabled,
+      debugMode: config.debugMode,
       speechBackend: config.speechBackend,
       voicePerson: config.voicePerson,
       speechRate: this.normalizeSpeechRate(config.speechRate)
     };
     this.snapshot.selectedProfile = this.config.profile;
     this.snapshot.speakerphoneEnabled = this.config.speakerphoneEnabled;
+    this.snapshot.debugMode = this.config.debugMode;
     this.persistConfig();
     this.notify();
     if (speakerphoneChanged) {
@@ -381,6 +399,7 @@ export class SingleAgentController {
       profile: profile,
       muted: this.config.muted,
       speakerphoneEnabled: this.config.speakerphoneEnabled,
+      debugMode: this.config.debugMode,
       speechBackend: this.config.speechBackend,
       voicePerson: this.config.voicePerson,
       speechRate: this.config.speechRate
@@ -466,7 +485,7 @@ export class SingleAgentController {
   }
 
   toggleSpeakerphone(): void {
-    this.config.speakerphoneEnabled = !this.config.speakerphoneEnabled;
+    this.config.speakerphoneEnabled = this.snapshot.audioOutputRoute !== 'speaker';
     this.snapshot.speakerphoneEnabled = this.config.speakerphoneEnabled;
     this.persistConfig();
     this.notify();
@@ -478,6 +497,21 @@ export class SingleAgentController {
       this.snapshot.error = this.errorMessage(error, '音频输出切换失败');
       this.notify();
     });
+  }
+
+  private onOutputRouteChanged(route: AudioOutputRoute, headsetAvailable: boolean): void {
+    const headsetConnected = headsetAvailable &&
+      (!this.outputRouteInitialized || !this.snapshot.headsetOutputAvailable);
+    this.outputRouteInitialized = true;
+    this.snapshot.audioOutputRoute = route;
+    this.snapshot.headsetOutputAvailable = headsetAvailable;
+    if (headsetConnected && this.config.speakerphoneEnabled) {
+      this.config.speakerphoneEnabled = false;
+      this.snapshot.speakerphoneEnabled = false;
+      this.persistConfig();
+      this.applySpeakerphonePreference();
+    }
+    this.notify();
   }
 
   toggleMute(): void {
@@ -506,6 +540,7 @@ export class SingleAgentController {
     this.activeAsrMessageId = '';
     this.snapshot.storedSessionId = '';
     this.snapshot.runtimeSessionId = '';
+    this.snapshot.conversationLoading = false;
     this.snapshot.approvalPending = false;
     this.snapshot.clarifyPending = false;
     if (this.snapshot.connection === 'online') {
@@ -552,6 +587,7 @@ export class SingleAgentController {
     this.tts.close();
     this.snapshot.connection = 'offline';
     this.snapshot.runtimeSessionId = '';
+    this.snapshot.conversationLoading = false;
     this.notify();
   }
 
@@ -807,7 +843,7 @@ export class SingleAgentController {
     this.snapshot.connection = 'online';
     this.snapshot.error = '';
     if (this.snapshot.storedSessionId.length > 0) {
-      this.resumeSession(this.snapshot.storedSessionId);
+      this.resumeSession(this.snapshot.storedSessionId, true);
       return;
     }
     this.gateway.createSession(100).then((result: Object) => {
@@ -827,6 +863,7 @@ export class SingleAgentController {
     this.snapshot.connection = 'offline';
     this.snapshot.agentBusy = false;
     this.snapshot.playback = 'none';
+    this.snapshot.conversationLoading = false;
     this.snapshot.error = errorText;
     this.failAssistantMessage(errorText);
     this.notify();
@@ -843,6 +880,7 @@ export class SingleAgentController {
     this.snapshot.connection = 'offline';
     this.snapshot.agentBusy = false;
     this.snapshot.playback = 'none';
+    this.snapshot.conversationLoading = false;
     if (wasOnline) {
       this.snapshot.error = '网关连接已断开';
       this.failAssistantMessage(this.snapshot.error);
@@ -867,10 +905,9 @@ export class SingleAgentController {
       if (info['model'] !== undefined) {
         this.snapshot.runtimeModel = String(info['model']);
       }
-      if (info['provider'] !== undefined) {
-        this.snapshot.runtimeProvider = String(info['provider']);
-      }
+      this.snapshot.runtimeProvider = this.providerDisplay(info);
     }
+    this.snapshot.conversationLoading = false;
     this.snapshot.statusTitle = '已连接';
     this.snapshot.statusDetail = this.snapshot.selectedProfile;
     this.snapshot.error = '';
@@ -1786,8 +1823,7 @@ export class SingleAgentController {
     if (type === 'session.info') {
       this.snapshot.runtimeModel = data !== undefined && data['model'] !== undefined
         ? String(data['model']) : '';
-      this.snapshot.runtimeProvider = data !== undefined && data['provider'] !== undefined
-        ? String(data['provider']) : '';
+      this.snapshot.runtimeProvider = this.providerDisplay(data);
       const message = this.currentAssistantMessage();
       if (message && message.pending &&
         (this.snapshot.runtimeModel.length > 0 || this.snapshot.runtimeProvider.length > 0)) {
@@ -2202,8 +2238,8 @@ export class SingleAgentController {
     this.listHistory(this.snapshot.historyLimit + 20);
   }
 
-  resumeSession(storedId: string): void {
-    if (storedId.length === 0 || this.snapshot.agentBusy) {
+  resumeSession(storedId: string, automatic: boolean = false): void {
+    if (storedId.length === 0 || this.snapshot.agentBusy || this.snapshot.conversationLoading) {
       return;
     }
     this.resetInterruptedTurnGuard();
@@ -2212,6 +2248,9 @@ export class SingleAgentController {
     this.activeAssistantMessageId = '';
     this.snapshot.runtimeSessionId = '';
     this.snapshot.storedSessionId = storedId;
+    this.snapshot.conversationLoading = true;
+    this.snapshot.error = '';
+    this.notify();
     this.gateway.resumeSession(storedId, 100).then((result: Object) => {
       this.sessionDetail.fetch(
         this.config.gatewayUrl,
@@ -2228,6 +2267,25 @@ export class SingleAgentController {
         }
       });
     }).catch((error: BusinessError) => {
+      if (this.snapshot.storedSessionId !== storedId) {
+        return;
+      }
+      if (automatic && this.isSessionNotFound(error)) {
+        this.snapshot.storedSessionId = '';
+        this.snapshot.runtimeSessionId = '';
+        this.snapshot.messages = [];
+        this.snapshot.error = '';
+        this.gateway.createSession(100).then((result: Object) => {
+          this.onSessionCreated(result);
+        }).catch((createError: BusinessError) => {
+          this.snapshot.conversationLoading = false;
+          this.snapshot.error = this.errorMessage(createError, '新会话创建失败');
+          this.notify();
+        });
+        this.notify();
+        return;
+      }
+      this.snapshot.conversationLoading = false;
       this.snapshot.error = this.errorMessage(error, '历史会话恢复失败');
       this.notify();
     });
@@ -2244,11 +2302,11 @@ export class SingleAgentController {
     if (Array.isArray(messages)) {
       this.restoreSessionMessages(messages as Object[]);
     }
+    this.snapshot.conversationLoading = false;
     this.onSessionCreated(result);
   }
 
   private restoreSessionMessages(messageItems: Object[]): void {
-    let lastUserAt: number = 0;
     let currentModel: string = this.snapshot.runtimeModel;
     let pendingThinking: string = '';
     let pendingActivities: MessageActivity[] = [];
@@ -2284,18 +2342,12 @@ export class SingleAgentController {
       message.artifacts = artifacts;
       message.model = row['model'] !== undefined
         ? String(row['model']) : message.role === 'assistant' ? currentModel : '';
-      message.provider = row['provider'] !== undefined
-        ? String(row['provider']) : row['runtime_provider'] !== undefined ? String(row['runtime_provider']) : '';
+      message.provider = this.providerDisplay(row);
       message.timestamp = this.parseTimestamp(row['timestamp']);
       if (message.role === 'user') {
         pendingThinking = '';
         pendingActivities = [];
-        lastUserAt = message.timestamp;
       } else {
-        if (lastUserAt > 0 && message.timestamp >= lastUserAt) {
-          const differenceMs = this.timestampMillis(message.timestamp) - this.timestampMillis(lastUserAt);
-          message.duration_s = Math.max(0, differenceMs) / 1000;
-        }
         message.thinking = pendingThinking;
         message.activities = pendingActivities;
         message.processExpanded = false;
@@ -2304,6 +2356,29 @@ export class SingleAgentController {
       }
       this.snapshot.messages.push(message);
     }
+  }
+
+  private providerDisplay(data: Record<string, Object> | undefined): string {
+    if (data === undefined) {
+      return '';
+    }
+    for (const key of ['provider_label', 'provider_name', 'runtime_provider_label', 'runtime_provider']) {
+      if (data[key] !== undefined) {
+        const value = String(data[key]).trim();
+        if (value.length > 0) {
+          return value;
+        }
+      }
+    }
+    return data['provider'] !== undefined ? String(data['provider']).trim() : '';
+  }
+
+  private isSessionNotFound(error: BusinessError): boolean {
+    const message = this.errorMessage(error, '').toLowerCase();
+    return message.includes('session not found') ||
+      message.includes('session does not exist') ||
+      message.includes('会话不存在') ||
+      message.includes('找不到会话');
   }
 
   private historyModelSwitch(rawMetadata: Object | undefined, fallback: string): string {
@@ -2445,10 +2520,6 @@ export class SingleAgentController {
     return 0;
   }
 
-  private timestampMillis(value: number): number {
-    return value < 100000000000 ? value * 1000 : value;
-  }
-
   deleteSession(storedId: string): void {
     if (storedId.length === 0 || storedId === this.snapshot.storedSessionId) {
       return;
@@ -2496,6 +2567,7 @@ export class SingleAgentController {
       store.putSync('profile', this.config.profile);
       store.putSync('muted', this.config.muted);
       store.putSync('speakerphoneEnabled', this.config.speakerphoneEnabled);
+      store.putSync('debugMode', this.config.debugMode);
       store.putSync('speechBackend', this.config.speechBackend);
       store.putSync('voicePerson', this.config.voicePerson);
       store.putSync('speechRate', this.config.speechRate);
@@ -2531,6 +2603,8 @@ export class SingleAgentController {
     copy.asrUtteranceActive = source.asrUtteranceActive;
     copy.microphoneRoute = source.microphoneRoute;
     copy.speakerphoneEnabled = source.speakerphoneEnabled;
+    copy.audioOutputRoute = source.audioOutputRoute;
+    copy.headsetOutputAvailable = source.headsetOutputAvailable;
     copy.ttsState = source.ttsState;
     copy.ttsSampleRate = source.ttsSampleRate;
     copy.asrBackend = source.asrBackend;
@@ -2544,6 +2618,8 @@ export class SingleAgentController {
     copy.historyLimit = source.historyLimit;
     copy.historyLoading = source.historyLoading;
     copy.historyHasMore = source.historyHasMore;
+    copy.conversationLoading = source.conversationLoading;
+    copy.debugMode = source.debugMode;
     copy.statusTitle = source.statusTitle;
     copy.statusDetail = source.statusDetail;
     copy.runtimeModel = source.runtimeModel;

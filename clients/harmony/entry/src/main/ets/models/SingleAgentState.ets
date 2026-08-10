@@ -14,6 +14,8 @@ export type PlaybackState = 'none' | 'queued' | 'playing' | 'paused_for_user';
 
 export type SpeechBackend = 'harmony_offline' | 'remote';
 
+export type AudioOutputRoute = 'earpiece' | 'speaker' | 'headset';
+
 export type MessageRole = 'user' | 'assistant' | 'system';
 
 export type ActivityState = 'running' | 'completed' | 'error';
@@ -90,6 +92,8 @@ export class SingleAgentSnapshot {
   asrUtteranceActive: boolean = false;
   microphoneRoute: string = '';
   speakerphoneEnabled: boolean = false;
+  audioOutputRoute: AudioOutputRoute = 'earpiece';
+  headsetOutputAvailable: boolean = false;
   ttsState: TtsState = 'stopped';
   ttsSampleRate: number = 24000;
   asrBackend: SpeechBackend = 'harmony_offline';
@@ -103,6 +107,8 @@ export class SingleAgentSnapshot {
   historyLimit: number = 20;
   historyLoading: boolean = false;
   historyHasMore: boolean = true;
+  conversationLoading: boolean = false;
+  debugMode: boolean = false;
   statusTitle: string = '';
   statusDetail: string = '';
   runtimeModel: string = '';

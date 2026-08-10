@@ -56,6 +56,11 @@ class NativeSettings:
             "hexiaoma": os.getenv("HERMES_HEXIAOMA_URL", "http://127.0.0.1:9121"),
             "hexiaoxin": os.getenv("HERMES_HEXIAOXIN_URL", "http://127.0.0.1:9122"),
         }
+        self.provider_labels = {
+            "default": os.getenv("HERMES_DEFAULT_PROVIDER_LABEL", ""),
+            "hexiaoma": os.getenv("HERMES_HEXIAOMA_PROVIDER_LABEL", ""),
+            "hexiaoxin": os.getenv("HERMES_HEXIAOXIN_PROVIDER_LABEL", ""),
+        }
 
 
 def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
@@ -204,7 +209,7 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
             raise HTTPException(status_code=status, detail="Hermes历史详情读取失败") from exc
         frame = json.dumps({"result": {"messages": detail["messages"]}}, ensure_ascii=False)
         detail["messages"] = json.loads(
-            transform_hermes_message(frame, artifact_registry)
+            transform_hermes_message(frame, artifact_registry, settings.provider_labels[profile])
         )["result"]["messages"]
         return detail
 
@@ -268,7 +273,11 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
         await relay_ws(
             ws,
             f"{base}/api/ws?{query}",
-            transform_text=lambda message: transform_hermes_message(message, artifact_registry),
+            transform_text=lambda message: transform_hermes_message(
+                message,
+                artifact_registry,
+                settings.provider_labels[profile],
+            ),
         )
 
     @app.websocket("/api/audio/speak-stream")

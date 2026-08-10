@@ -36,6 +36,8 @@ export interface HermesEventParams {
 export interface SessionInfo {
   model?: string;
   provider?: string;
+  provider_label?: string;
+  provider_name?: string;
   profile_name?: string;
 }
 

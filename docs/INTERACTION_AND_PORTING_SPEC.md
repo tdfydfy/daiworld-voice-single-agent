@@ -125,7 +125,7 @@ WSS /api/hermes/ws?profile=<profile>
 | 事件 | 关键字段 | 行为 |
 |---|---|---|
 | `gateway.ready` | — | create/resume Session |
-| `session.info` | `model, provider, profile_name` | 更新运行时身份 |
+| `session.info` | `model, provider, provider_label/provider_name, profile_name` | 更新运行时身份；具体 Provider 名优先于类型字段 |
 | `message.start` | — | 创建 Agent 气泡和 SpeechJob |
 | `message.delta` | `text/rendered` | 追加正文和TTS文本 |
 | `message.complete` | `text/rendered, artifacts?` | 完成正文、耗时和播放队列 |

@@ -97,7 +97,6 @@ const HISTORY_TIMESTAMP_CHECKS = [
   ['entry/src/main/ets/services/HermesSessionDetailClient.ets', /\/api\/hermes\/sessions\//, 'timestamped history detail route'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /completeSessionResume\(result, detail\)/, 'history detail resume integration'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /message\.timestamp = this\.parseTimestamp/, 'stored message timestamp restoration'],
-  ['entry/src/main/ets/services/SingleAgentController.ets', /this\.timestampMillis\(message\.timestamp\)/, 'history duration timestamp normalization'],
   ['entry/src/main/ets/pages/Index.ets', /date\.getFullYear\(\) === now\.getFullYear\(\)/, 'today-aware message timestamp formatting'],
   ['entry/src/main/ets/pages/Index.ets', /year \+ '-' \+ month \+ '-' \+ day/, 'full date for older messages']
 ];
@@ -120,6 +119,7 @@ const AUDIO_INPUT_ROUTE_CHECKS = [
   ['entry/src/main/ets/services/PcmAudio.ets', /source: audio\.SourceType\.SOURCE_TYPE_VOICE_COMMUNICATION/, 'communication capture source'],
   ['entry/src/main/ets/services/PcmAudio.ets', /audio\.StreamUsage\.STREAM_USAGE_VOICE_COMMUNICATION/, 'communication playback usage'],
   ['entry/src/main/ets/services/PcmAudio.ets', /AUDIO_SESSION_SCENE_VOICE_COMMUNICATION/, 'communication audio session scene'],
+  ['entry/src/main/ets/services/PcmAudio.ets', /CONCURRENCY_MIX_WITH_OTHERS/, 'system TTS-compatible communication session'],
   ['entry/src/main/ets/services/PcmAudio.ets', /activateAudioSession\(strategy\)/, 'communication audio session activation'],
   ['entry/src/main/ets/services/PcmAudio.ets', /audio\.DeviceType\.SPEAKER : audio\.DeviceType\.EARPIECE/, 'earpiece and speakerphone fallback selection'],
   ['entry/src/main/ets/services/PcmAudio.ets', /setDefaultOutputDevice\(device\)/, 'communication fallback application'],
@@ -290,7 +290,6 @@ if (pcmAudioSource.includes('selectMediaInputDevice(')) {
 for (const forbiddenRouteOverride of [
   'clearSelectedMediaInputDevice(',
   'setBluetoothAndNearlinkPreferredRecordCategory(',
-  'getPreferredOutputDeviceForRendererInfoSync',
   'SOURCE_TYPE_VOICE_RECOGNITION'
 ]) {
   if (pcmAudioSource.includes(forbiddenRouteOverride)) {

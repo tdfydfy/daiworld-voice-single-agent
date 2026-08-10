@@ -2,7 +2,7 @@ import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { speechRecognizer, textToSpeech } from '@kit.CoreSpeechKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { CommunicationAudioSessionLease, PcmCapture } from './PcmAudio';
+import { PcmCapture } from './PcmAudio';
 
 const SPEECH_FRAME_BYTES = 640;
 const SPEECH_PRE_ROLL_BYTES = 6400;
@@ -116,8 +116,6 @@ export class SystemSpeechService {
   private captureStarting?: Promise<void>;
   private captureStopping?: Promise<void>;
   private ttsPerson: number = -1;
-  private ttsSession: CommunicationAudioSessionLease = new CommunicationAudioSessionLease();
-
   constructor(context: common.UIAbilityContext, callbacks: SystemSpeechCallbacks) {
     this.context = context;
     this.callbacks = callbacks;
@@ -231,7 +229,6 @@ export class SystemSpeechService {
       person,
       String(normalizedRate)
     );
-    await this.ttsSession.acquire();
     try {
       const engine = await this.ensureTts(person);
       const extraParams: Record<string, Object> = {
@@ -242,7 +239,6 @@ export class SystemSpeechService {
         extraParams: extraParams
       });
     } catch (error) {
-      await this.ttsSession.release().catch(() => undefined);
       hilog.error(
         SPEECH_LOG_DOMAIN,
         SPEECH_LOG_TAG,
@@ -256,14 +252,12 @@ export class SystemSpeechService {
 
   stopSpeaking(): void {
     if (!this.tts) {
-      this.ttsSession.release().catch(() => undefined);
       return;
     }
     try {
       hilog.info(SPEECH_LOG_DOMAIN, SPEECH_LOG_TAG, 'TTS stop requested');
       this.tts.stop();
     } catch (error) {
-      this.ttsSession.release().catch(() => undefined);
       this.callbacks.onError('TTS', this.errorText(error as BusinessError));
     }
   }
@@ -276,7 +270,6 @@ export class SystemSpeechService {
       this.tts = undefined;
       this.ttsPerson = -1;
     }
-    await this.ttsSession.release().catch(() => undefined);
     this.callbacks.onSpeechState(false);
   }
 
@@ -518,7 +511,6 @@ export class SystemSpeechService {
           response.type
         );
         if (response.type === 1) {
-          this.ttsSession.release().catch(() => undefined);
           this.callbacks.onSpeechState(false);
         }
       },
@@ -530,7 +522,6 @@ export class SystemSpeechService {
           requestId,
           response.type
         );
-        this.ttsSession.release().catch(() => undefined);
         this.callbacks.onSpeechState(false);
       },
       onError: (requestId: string, errorCode: number, errorMessage: string): void => {
@@ -542,7 +533,6 @@ export class SystemSpeechService {
           errorCode,
           errorMessage
         );
-        this.ttsSession.release().catch(() => undefined);
         this.callbacks.onSpeechState(false);
         this.callbacks.onError('TTS', `code=${errorCode} message=${errorMessage}`);
       }

@@ -50,6 +50,7 @@ struct Index {
   @State speechBackend: SpeechBackend = 'harmony_offline';
   @State voicePerson: number = 0;
   @State speechRate: number = 1;
+  @State debugMode: boolean = false;
   @State voiceOptions: VoiceOption[] = [];
   @State voiceOptionsLoading: boolean = false;
   @State nowMs: number = Date.now();
@@ -70,6 +71,7 @@ struct Index {
     this.speechBackend = config.speechBackend;
     this.voicePerson = config.voicePerson;
     this.speechRate = config.speechRate;
+    this.debugMode = config.debugMode;
     this.controller.setListener(new SnapshotListener(
       (snapshot: SingleAgentSnapshot): void => {
         const wasNearBottom = this.lastMessageCount === 0 || this.isMessageListNearBottom();
@@ -137,6 +139,7 @@ struct Index {
     this.speechBackend = config.speechBackend;
     this.voicePerson = config.voicePerson;
     this.speechRate = config.speechRate;
+    this.debugMode = config.debugMode;
     this.showHistory = false;
     this.showTextComposer = false;
     this.showSettings = true;
@@ -159,6 +162,7 @@ struct Index {
       profile: this.selectedProfile,
       muted: false,
       speakerphoneEnabled: currentConfig.speakerphoneEnabled,
+      debugMode: this.debugMode,
       speechBackend: this.speechBackend,
       voicePerson: this.voicePerson,
       speechRate: this.speechRate
@@ -241,6 +245,7 @@ struct Index {
   private canSendText(): boolean {
     return this.snapshot.connection === 'online' &&
       this.snapshot.runtimeSessionId.length > 0 &&
+      !this.snapshot.conversationLoading &&
       this.inputText.trim().length > 0;
   }
 
@@ -326,9 +331,17 @@ struct Index {
   private microphoneButtonText(): string {
     const label = this.snapshot.voiceEnabled ? '麦克风已开' : '开启麦克风';
     if (this.snapshot.voiceEnabled && this.snapshot.microphoneRoute.length > 0) {
-      return label + '（' + this.snapshot.microphoneRoute + '）';
+      const route = this.snapshot.microphoneRoute.includes('耳机') ? '耳机' : '手机';
+      return label + '（' + route + '）';
     }
     return label;
+  }
+
+  private outputRouteText(): string {
+    if (this.snapshot.audioOutputRoute === 'headset') {
+      return '耳机';
+    }
+    return this.snapshot.audioOutputRoute === 'speaker' ? '扬声器' : '听筒';
   }
 
   private ttsStatusText(): string {
@@ -432,43 +445,33 @@ struct Index {
 
   private hasMessageProcess(message: ChatMessage): boolean {
     return message.role === 'assistant' &&
-      (message.pending || message.thinking.length > 0 || message.activities.length > 0);
+      (message.pending || message.thinking.length > 0 || message.activities.length > 0 ||
+        message.model.length > 0 || message.provider.length > 0 || message.duration_s !== undefined);
   }
 
   private processSummary(message: ChatMessage): string {
+    const parts: string[] = [];
     if (message.pending) {
-      return '处理中 · ' + this.durationText(this.elapsedSeconds(message));
+      parts.push('处理中');
     }
-    const count = message.activities.length;
-    const thinking = message.thinking_s !== undefined
-      ? '思考 ' + this.durationText(message.thinking_s) : '';
-    if (thinking.length > 0 && count > 0) {
-      return '过程 · ' + thinking + ' · ' + String(count) + ' 个步骤';
+    if (message.model.length > 0) {
+      parts.push(message.model);
     }
-    if (thinking.length > 0) {
-      return '过程 · ' + thinking;
+    if (message.provider.length > 0) {
+      parts.push(message.provider);
     }
-    return '过程 · ' + String(count) + ' 个步骤';
+    const duration = message.pending
+      ? this.durationText(this.elapsedSeconds(message)) : this.durationText(message.duration_s);
+    if (duration.length > 0) {
+      parts.push(duration);
+    }
+    return parts.length > 0 ? parts.join(' · ') : '过程';
   }
 
   private messageTiming(message: ChatMessage): string {
-    if (message.role === 'user') {
-      return this.messageTime(message.timestamp);
-    }
-    if (message.pending) {
-      return this.messageTime(message.timestamp) + ' · 已用时 ' + this.durationText(this.elapsedSeconds(message));
-    }
-    const parts: string[] = [this.messageTime(message.completedAt > 0 ? message.completedAt : message.timestamp)];
-    if (message.thinking_s !== undefined) {
-      parts.push('思考 ' + this.durationText(message.thinking_s));
-    }
-    if (message.generation_s !== undefined) {
-      parts.push('生成 ' + this.durationText(message.generation_s));
-    }
-    if (message.duration_s !== undefined) {
-      parts.push('总计 ' + this.durationText(message.duration_s));
-    }
-    return parts.join(' · ');
+    const timestamp = message.role === 'assistant' && message.completedAt > 0
+      ? message.completedAt : message.timestamp;
+    return this.messageTime(timestamp);
   }
 
   private userMessageText(message: ChatMessage): string {
@@ -476,17 +479,6 @@ struct Index {
       return '…';
     }
     return message.status.length > 0 ? message.status : '…';
-  }
-
-  private messageMetadata(message: ChatMessage): string {
-    const parts: string[] = [];
-    if (message.model.length > 0) {
-      parts.push(message.model);
-    }
-    if (message.provider.length > 0) {
-      parts.push(message.provider);
-    }
-    return parts.join(' · ');
   }
 
   private messageVersion(snapshot: SingleAgentSnapshot): number {
@@ -518,43 +510,6 @@ struct Index {
   @Builder
   private Header() {
     Row({ space: 8 }) {
-      Column({ space: 9 }) {
-        Text('Daiworld Voice')
-          .fontSize(18)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(COLOR_TEXT)
-
-        Row({ space: 6 }) {
-          Button('历史', { type: ButtonType.Normal })
-            .width(54)
-            .height(30)
-            .padding(0)
-            .fontSize(10)
-            .fontColor(this.showHistory ? COLOR_ACCENT : COLOR_TEXT)
-            .backgroundColor(this.showHistory ? '#1C2033' : COLOR_PANEL)
-            .border({ width: 1, color: this.showHistory ? COLOR_ACCENT : COLOR_LINE })
-            .borderRadius(6)
-            .onClick(() => {
-              this.showHistoryPanel();
-            })
-
-          Button('设置', { type: ButtonType.Normal })
-            .width(54)
-            .height(30)
-            .padding(0)
-            .fontSize(10)
-            .fontColor(this.showSettings ? COLOR_ACCENT : COLOR_TEXT)
-            .backgroundColor(this.showSettings ? '#1C2033' : COLOR_PANEL)
-            .border({ width: 1, color: this.showSettings ? COLOR_ACCENT : COLOR_LINE })
-            .borderRadius(6)
-            .onClick(() => {
-              this.openSettings();
-            })
-        }
-      }
-      .alignItems(HorizontalAlign.Start)
-      .layoutWeight(1)
-
       Column({ space: 5 }) {
         Row({ space: 6 }) {
           Text('Agent:')
@@ -587,17 +542,48 @@ struct Index {
           Text(this.statusText())
             .fontSize(10)
             .fontColor(this.statusColor())
-          Text(this.runtimeText())
-            .fontSize(9)
-            .fontColor(COLOR_MUTED)
-            .layoutWeight(1)
-            .maxLines(1)
-            .textAlign(TextAlign.End)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
         }
         .width('100%')
       }
-      .width(170)
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+
+      Column({ space: 9 }) {
+        Text('Daiworld Voice')
+          .fontSize(16)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(COLOR_TEXT)
+
+        Row({ space: 6 }) {
+          Button('历史', { type: ButtonType.Normal })
+            .width(54)
+            .height(30)
+            .padding(0)
+            .fontSize(10)
+            .fontColor(this.showHistory ? COLOR_ACCENT : COLOR_TEXT)
+            .backgroundColor(this.showHistory ? '#1C2033' : COLOR_PANEL)
+            .border({ width: 1, color: this.showHistory ? COLOR_ACCENT : COLOR_LINE })
+            .borderRadius(6)
+            .onClick(() => {
+              this.showHistoryPanel();
+            })
+
+          Button('设置', { type: ButtonType.Normal })
+            .width(54)
+            .height(30)
+            .padding(0)
+            .fontSize(10)
+            .fontColor(this.showSettings ? COLOR_ACCENT : COLOR_TEXT)
+            .backgroundColor(this.showSettings ? '#1C2033' : COLOR_PANEL)
+            .border({ width: 1, color: this.showSettings ? COLOR_ACCENT : COLOR_LINE })
+            .borderRadius(6)
+            .onClick(() => {
+              this.openSettings();
+            })
+        }
+      }
+      .width(114)
+      .alignItems(HorizontalAlign.End)
     }
     .width('100%')
     .height(112)
@@ -788,6 +774,21 @@ struct Index {
         }
         .width('100%')
 
+        Row() {
+          Text('调试模式')
+            .fontSize(13)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(COLOR_TEXT)
+          Blank()
+          Toggle({ type: ToggleType.Switch, isOn: this.debugMode })
+            .selectedColor(COLOR_ACCENT)
+            .onChange((isOn: boolean): void => {
+              this.debugMode = isOn;
+            })
+        }
+        .width('100%')
+        .height(42)
+
         Button(this.snapshot.connection === 'online' ? '保存设置' : '保存并连接', { type: ButtonType.Normal })
           .width('100%')
           .height(44)
@@ -960,6 +961,22 @@ struct Index {
   }
 
   @Builder
+  private ConversationLoadingState() {
+    Column({ space: 10 }) {
+      LoadingProgress()
+        .width(30)
+        .height(30)
+        .color(COLOR_ACCENT)
+      Text('正在加载对话')
+        .fontSize(13)
+        .fontColor(COLOR_MUTED)
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .justifyContent(FlexAlign.Center)
+  }
+
+  @Builder
   private ArtifactItem(artifact: MessageArtifact) {
     if (artifact.isImage) {
       Column({ space: 6 }) {
@@ -1124,20 +1141,12 @@ struct Index {
   @Builder
   private MessageItem(message: ChatMessage) {
     Column({ space: 5 }) {
-      Row({ space: 6 }) {
-        Text(message.label)
-          .fontSize(10)
-          .fontColor(COLOR_MUTED)
-        if (message.role === 'assistant' && this.messageMetadata(message).length > 0) {
-          Text('· ' + this.messageMetadata(message))
-            .fontSize(10)
-            .fontColor(COLOR_MUTED)
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-        }
-      }
-      .width('100%')
-      .justifyContent(message.role === 'user' ? FlexAlign.End : FlexAlign.Start)
+      Text(this.messageTiming(message))
+        .width('100%')
+        .fontSize(9)
+        .fontColor(COLOR_MUTED)
+        .maxLines(1)
+        .textAlign(TextAlign.Center)
 
       if (message.role === 'assistant' && this.hasMessageProcess(message)) {
         this.MessageProcess(message)
@@ -1178,11 +1187,6 @@ struct Index {
         .borderRadius(8)
       }
 
-      Text(this.messageTiming(message))
-        .fontSize(9)
-        .fontColor(COLOR_MUTED)
-        .maxLines(2)
-        .textAlign(message.role === 'user' ? TextAlign.End : TextAlign.Start)
     }
     .width('100%')
     .alignItems(message.role === 'user' ? HorizontalAlign.End : HorizontalAlign.Start)
@@ -1300,7 +1304,8 @@ struct Index {
 
   @Builder
   private VoiceStatus() {
-    if (this.snapshot.voiceEnabled || this.snapshot.asrState !== 'stopped' || this.snapshot.ttsState !== 'stopped') {
+    if (this.snapshot.debugMode &&
+      (this.snapshot.voiceEnabled || this.snapshot.asrState !== 'stopped' || this.snapshot.ttsState !== 'stopped')) {
       Row({ space: 8 }) {
         Text(this.voiceBackendText())
           .fontSize(10)
@@ -1398,25 +1403,35 @@ struct Index {
 
         Button({ type: ButtonType.Normal }) {
           Row({ space: 4 }) {
-            SymbolGlyph($r('sys.symbol.speaker_wave_2'))
-              .fontSize(18)
-              .fontColor([this.snapshot.speakerphoneEnabled ? COLOR_ACCENT : COLOR_MUTED])
-            Text(this.snapshot.speakerphoneEnabled ? '扬声器' : '听筒')
+            if (this.snapshot.audioOutputRoute === 'headset') {
+              SymbolGlyph($r('sys.symbol.headphones'))
+                .fontSize(18)
+                .fontColor([COLOR_ACCENT])
+            } else if (this.snapshot.audioOutputRoute === 'speaker') {
+              SymbolGlyph($r('sys.symbol.speaker_wave_2'))
+                .fontSize(18)
+                .fontColor([COLOR_ACCENT])
+            } else {
+              SymbolGlyph($r('sys.symbol.ear'))
+                .fontSize(18)
+                .fontColor([COLOR_ACCENT])
+            }
+            Text(this.outputRouteText())
               .fontSize(11)
-              .fontColor(this.snapshot.speakerphoneEnabled ? COLOR_ACCENT : COLOR_TEXT)
+              .fontColor(COLOR_ACCENT)
               .maxLines(1)
           }
         }
           .width(78)
           .height(42)
           .padding({ left: 6, right: 6 })
-          .backgroundColor(this.snapshot.speakerphoneEnabled ? '#1C2033' : COLOR_PANEL)
+          .backgroundColor('#1C2033')
           .border({
             width: 1,
-            color: this.snapshot.speakerphoneEnabled ? COLOR_ACCENT : COLOR_LINE
+            color: COLOR_ACCENT
           })
           .borderRadius(8)
-          .accessibilityText(this.snapshot.speakerphoneEnabled ? '切换到听筒' : '切换到扬声器')
+          .accessibilityText('当前使用' + this.outputRouteText() + '，点击切换输出')
           .onClick(() => {
             this.toggleSpeakerphone();
           })
@@ -1438,6 +1453,8 @@ struct Index {
     .width('100%')
     .padding({ left: 16, right: 16, top: 10, bottom: 16 })
     .border({ width: { top: 1 }, color: COLOR_LINE })
+    .enabled(!this.snapshot.conversationLoading)
+    .opacity(this.snapshot.conversationLoading ? 0.55 : 1)
   }
 
   build() {
@@ -1448,7 +1465,9 @@ struct Index {
       } else if (this.showHistory) {
         this.HistoryPanel()
       } else {
-        if (this.snapshot.messages.length === 0 && !this.snapshot.asrUtteranceActive &&
+        if (this.snapshot.conversationLoading) {
+          this.ConversationLoadingState()
+        } else if (this.snapshot.messages.length === 0 && !this.snapshot.asrUtteranceActive &&
           this.snapshot.asrTranscript.length === 0) {
           this.EmptyState()
         } else {

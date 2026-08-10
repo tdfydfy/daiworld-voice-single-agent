@@ -7,6 +7,7 @@ import { abilityAccessCtrl, common, Permissions } from '@kit.AbilityKit';
 import { audio } from '@kit.AudioKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
+import { AudioOutputRoute } from '../models/SingleAgentState';
 
 const AUDIO_LOG_DOMAIN = 0xD002;
 const AUDIO_LOG_TAG = 'SingleAgentAudio';
@@ -15,6 +16,7 @@ const AUDIO_SESSION_RECOVERY_DELAYS_MS: number[] = [100, 500, 1500];
 export type AudioChunkListener = (buffer: ArrayBuffer) => void;
 export type DrainedListener = () => void;
 export type InputRouteListener = (label: string) => void;
+export type OutputRouteListener = (route: AudioOutputRoute, headsetAvailable: boolean) => void;
 
 class CommunicationAudioSession {
   private users: number = 0;
@@ -24,6 +26,14 @@ class CommunicationAudioSession {
   private recoveryAttempt: number = 0;
   private recoveryTimer?: number;
   private listenerInstalled: boolean = false;
+  private routingListenersInstalled: boolean = false;
+  private outputRouteListener?: OutputRouteListener;
+  private preferredOutputListener = (devices: audio.AudioDeviceDescriptors): void => {
+    this.publishOutputRoute(devices);
+  };
+  private availableOutputListener = (_action: audio.DeviceChangeAction): void => {
+    this.publishOutputRoute();
+  };
   private sessionDeactivatedListener = (event: audio.AudioSessionDeactivatedEvent): void => {
     hilog.warn(
       AUDIO_LOG_DOMAIN,
@@ -109,11 +119,16 @@ class CommunicationAudioSession {
 
   async setSpeakerphoneEnabled(enabled: boolean): Promise<void> {
     this.speakerphoneEnabled = enabled;
-    if (this.users <= 0) {
-      return;
+    if (this.users > 0) {
+      await this.ensureActivated();
     }
-    await this.ensureActivated();
     await this.applyOutputPreference();
+  }
+
+  setOutputRouteListener(listener: OutputRouteListener): void {
+    this.outputRouteListener = listener;
+    this.installRoutingListeners();
+    this.publishOutputRoute();
   }
 
   private installListener(): void {
@@ -132,6 +147,34 @@ class CommunicationAudioSession {
         AUDIO_LOG_DOMAIN,
         AUDIO_LOG_TAG,
         'communication audio session listener setup failed: %{public}s',
+        businessError.message
+      );
+    }
+  }
+
+  private installRoutingListeners(): void {
+    if (this.routingListenersInstalled) {
+      return;
+    }
+    const routingManager = audio.getAudioManager().getRoutingManager();
+    try {
+      routingManager.on(
+        'preferOutputDeviceChangeForRendererInfo',
+        this.communicationRendererInfo(),
+        this.preferredOutputListener
+      );
+      routingManager.on(
+        'availableDeviceChange',
+        audio.DeviceUsage.CALL_OUTPUT_DEVICES,
+        this.availableOutputListener
+      );
+      this.routingListenersInstalled = true;
+    } catch (error) {
+      const businessError = error as BusinessError;
+      hilog.warn(
+        AUDIO_LOG_DOMAIN,
+        AUDIO_LOG_TAG,
+        'communication output listener setup failed: %{public}s',
         businessError.message
       );
     }
@@ -163,7 +206,7 @@ class CommunicationAudioSession {
     try {
       sessionManager.setAudioSessionScene(audio.AudioSessionScene.AUDIO_SESSION_SCENE_VOICE_COMMUNICATION);
       const strategy: audio.AudioSessionStrategy = {
-        concurrencyMode: audio.AudioConcurrencyMode.CONCURRENCY_DEFAULT
+        concurrencyMode: audio.AudioConcurrencyMode.CONCURRENCY_MIX_WITH_OTHERS
       };
       await sessionManager.activateAudioSession(strategy);
       hilog.info(AUDIO_LOG_DOMAIN, AUDIO_LOG_TAG, 'communication audio session activated');
@@ -175,6 +218,25 @@ class CommunicationAudioSession {
   }
 
   private async applyOutputPreference(): Promise<void> {
+    const routingManager = audio.getAudioManager().getRoutingManager();
+    try {
+      await routingManager.setCommunicationDevice(
+        audio.CommunicationDeviceType.SPEAKER,
+        this.speakerphoneEnabled
+      );
+    } catch (error) {
+      const businessError = error as BusinessError;
+      hilog.warn(
+        AUDIO_LOG_DOMAIN,
+        AUDIO_LOG_TAG,
+        'communication speaker selection failed: %{public}s',
+        businessError.message
+      );
+    }
+    if (this.users <= 0) {
+      this.publishOutputRoute();
+      return;
+    }
     const sessionManager = audio.getAudioManager().getSessionManager();
     const device = this.speakerphoneEnabled ? audio.DeviceType.SPEAKER : audio.DeviceType.EARPIECE;
     try {
@@ -194,6 +256,70 @@ class CommunicationAudioSession {
         businessError.message
       );
     }
+    this.publishOutputRoute();
+  }
+
+  private communicationRendererInfo(): audio.AudioRendererInfo {
+    return {
+      usage: audio.StreamUsage.STREAM_USAGE_VOICE_COMMUNICATION,
+      rendererFlags: 0
+    };
+  }
+
+  private publishOutputRoute(devices?: audio.AudioDeviceDescriptors): void {
+    const listener = this.outputRouteListener;
+    if (!listener) {
+      return;
+    }
+    const routingManager = audio.getAudioManager().getRoutingManager();
+    let preferred = devices;
+    if (!preferred) {
+      try {
+        preferred = routingManager.getPreferredOutputDeviceForRendererInfoSync(
+          this.communicationRendererInfo()
+        );
+      } catch (error) {
+        preferred = [];
+      }
+    }
+    let available: audio.AudioDeviceDescriptors = [];
+    try {
+      available = routingManager.getDevicesSync(audio.DeviceFlag.OUTPUT_DEVICES_FLAG);
+    } catch (error) {
+    }
+    listener(this.outputRoute(preferred), this.hasHeadsetOutput(available));
+  }
+
+  private outputRoute(devices: audio.AudioDeviceDescriptors): AudioOutputRoute {
+    for (const device of devices) {
+      if (this.isHeadsetOutput(device.deviceType)) {
+        return 'headset';
+      }
+      if (device.deviceType === audio.DeviceType.SPEAKER) {
+        return 'speaker';
+      }
+    }
+    return this.speakerphoneEnabled ? 'speaker' : 'earpiece';
+  }
+
+  private hasHeadsetOutput(devices: audio.AudioDeviceDescriptors): boolean {
+    for (const device of devices) {
+      if (this.isHeadsetOutput(device.deviceType)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private isHeadsetOutput(deviceType: audio.DeviceType): boolean {
+    return deviceType === audio.DeviceType.WIRED_HEADSET ||
+      deviceType === audio.DeviceType.WIRED_HEADPHONES ||
+      deviceType === audio.DeviceType.BLUETOOTH_SCO ||
+      deviceType === audio.DeviceType.BLUETOOTH_A2DP ||
+      deviceType === audio.DeviceType.USB_HEADSET ||
+      deviceType === audio.DeviceType.USB_DEVICE ||
+      deviceType === audio.DeviceType.HEARING_AID ||
+      deviceType === audio.DeviceType.NEARLINK;
   }
 
   private scheduleRecovery(): void {
@@ -251,6 +377,10 @@ const COMMUNICATION_AUDIO_SESSION = new CommunicationAudioSession();
 
 export function setCommunicationSpeakerphoneEnabled(enabled: boolean): Promise<void> {
   return COMMUNICATION_AUDIO_SESSION.setSpeakerphoneEnabled(enabled);
+}
+
+export function setCommunicationOutputRouteListener(listener: OutputRouteListener): void {
+  COMMUNICATION_AUDIO_SESSION.setOutputRouteListener(listener);
 }
 
 export class CommunicationAudioSessionLease {

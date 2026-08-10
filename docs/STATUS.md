@@ -97,3 +97,17 @@
 - Impact: Input/output routing now follows the intended phone-call model, but generated text is not yet audible in the current development build. Device logs show the system TTS internal `VOICE_ASSISTANT` player is denied audio focus while the app owns a `VOICE_COMMUNICATION` AudioSession (`ActivateAudioInterrupt Failed`, error `6800301`). This is a regression from adding communication-session ownership around capture/TTS, not a synthesis or Agent-text failure.
 - Blockers: Automatic system TTS playback is blocked until system-owned TTS playback is isolated from the app's communication session. Communication-session recovery after forced system deactivation is implemented but still needs a true-device recovery event for acceptance.
 - Next: Make the smallest audio-session ownership correction, then verify audible TTS with the microphone both enabled and disabled, confirm the interrupt error is gone, and complete the remaining no-accessory/headset hot-plug route matrix.
+
+## 2026-08-10
+
+- Progress: Applied the smallest CoreSpeech TTS focus correction: system TTS no longer acquires the app-owned communication session, while microphone-owned communication sessions allow mixing with the system `VOICE_ASSISTANT` player.
+- Impact: The existing ASR/call-routing path remains intact, and TTS no longer creates or strengthens the `VOICE_COMMUNICATION` focus conflict that produced `6800301`.
+- Blockers: Static verification, ArkTS type checking, and HAP assembly pass. No HDC target is connected, so audible playback and device logs remain unverified.
+- Next: Install the new HAP on the phone, test automatic TTS with the microphone both enabled and disabled, and confirm `ActivateAudioInterrupt Failed` / `6800301` no longer appears.
+
+## 2026-08-10
+
+- Progress: Finished the Harmony interaction polish: persisted debug-only voice status, actual three-state output display, compact microphone text, centered message times and left/right bubbles, compact process metadata, stale-session recreation, conversation loading UI, reversed header groups, and concrete Provider labels supplied by the Adapter.
+- Impact: Normal chat no longer exposes ASR/TTS diagnostics or duplicate timing metadata; history transitions visibly load; missing automatic sessions recover silently; audio output reflects HarmonyOS routing; configured Provider names such as `open1` can replace the generic `custom` label without changing provider semantics.
+- Blockers: None in static checks, ArkTS compilation, signed HAP assembly, install, launch, or no-headset UI verification. Connected-headset route switching still needs user-operated hardware acceptance.
+- Next: Connect a headset, confirm the icon changes to headset, switch once to speaker and back, then configure the deployed Adapter's `HERMES_*_PROVIDER_LABEL` values.

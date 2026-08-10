@@ -47,9 +47,9 @@ CoreSpeechKit 当前使用离线短句识别。真机上单个识别 session 最
 
 语音后端选择是显式配置。选择鸿蒙离线语音后，CoreSpeech 启动或运行失败只会停止对应的本地语音路径并报告错误，不会自动连接远端 ASR/TTS；只有用户在设置页明确选择远端语音时才会建立远端语音连接。
 
-全双工音频统一声明为鸿蒙语音通信场景。PCM 采集固定使用 `SOURCE_TYPE_VOICE_COMMUNICATION`，应用自管的 PCM 播放使用 `STREAM_USAGE_VOICE_COMMUNICATION`，并共享 `AUDIO_SESSION_SCENE_VOICE_COMMUNICATION`。客户端把无配件时的通信输出默认值设为 `EARPIECE`，用户可以通过扬声器按钮切换为 `SPEAKER`；耳机等配件存在时该默认值不生效，蓝牙 SCO、NearLink、有线和 USB 设备的实际选择及无输入设备时的手机麦克风回退仍由 HarmonyOS 管理。客户端不调用 `selectMediaInputDevice()`，不再根据输出设备推断输入设备，也不因正常插拔重建 `AudioCapturer`。`inputDeviceChange` 仅用于刷新手机或耳机麦克风标签和记录诊断日志。短提示音不持有通信 Session，避免麦克风关闭后反复切换 A2DP/SCO。STT 和 TTS 保持并行；用户开口后只停止旧播报，不停止或重建识别 session。客户端不叠加 RMS 声音阈值，以免截断轻声发言。外放回声消除和双讲识别的实际效果仍取决于设备系统实现。
+全双工音频统一声明为鸿蒙语音通信场景。PCM 采集固定使用 `SOURCE_TYPE_VOICE_COMMUNICATION`，应用自管的 PCM 播放使用 `STREAM_USAGE_VOICE_COMMUNICATION`，并共享 `AUDIO_SESSION_SCENE_VOICE_COMMUNICATION`。客户端无配件时默认 `EARPIECE`，耳机接入时回到系统默认的耳机路由；输出按钮可以显式切到 `SPEAKER`，再次点击则回到当前系统私密路由。界面监听系统首选输出，按实际路由显示听筒、扬声器或耳机。蓝牙 SCO、NearLink、有线和 USB 设备的实际选择及无输入设备时的手机麦克风回退仍由 HarmonyOS 管理。客户端不调用 `selectMediaInputDevice()`，不再根据输出设备推断输入设备，也不因正常插拔重建 `AudioCapturer`。`inputDeviceChange` 仅用于刷新手机或耳机麦克风标签和记录诊断日志。短提示音不持有通信 Session，避免麦克风关闭后反复切换 A2DP/SCO。STT 和 TTS 保持并行；用户开口后只停止旧播报，不停止或重建识别 session。客户端不叠加 RMS 声音阈值，以免截断轻声发言。外放回声消除和双讲识别的实际效果仍取决于设备系统实现。
 
-当前开发版本存在一个已定位的系统 TTS 回归：CoreSpeech TTS 已完成文字合成，但其内部 `VOICE_ASSISTANT` 播放器会与客户端持有的 `VOICE_COMMUNICATION` AudioSession 发生音频焦点冲突，真机日志为 `ActivateAudioInterrupt Failed` / `6800301`，因此生成文字暂时没有声音。改动前由系统 TTS 自行管理音频焦点时可以正常播放；后续应先隔离系统 TTS 与通话会话的所有权，再恢复真机自动播放验收。
+系统 TTS 的音频焦点冲突已做最小修正：CoreSpeech TTS 不再额外持有客户端通信 AudioSession，麦克风仍在使用的通信会话改为允许与系统 `VOICE_ASSISTANT` 播放器并发。静态校验、ArkTS 类型检查和 HAP 构建已通过；仍需真机确认自动播报恢复，并确认日志中不再出现 `ActivateAudioInterrupt Failed` / `6800301`。
 
 ## 发布前检查
 

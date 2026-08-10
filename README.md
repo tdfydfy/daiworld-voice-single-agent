@@ -290,4 +290,5 @@ Native版的配置示例见 [`.env.example`](./.env.example)，凭据说明见 [
 - `VOICE_ACCESS_TOKEN`：客户端访问Adapter的口令；
 - `HERMES_DASHBOARD_SESSION_TOKEN`：Adapter访问Hermes Profile服务的内部口令；
 - `HERMES_DEFAULT_URL` / `HERMES_HEXIAOMA_URL` / `HERMES_HEXIAOXIN_URL`：Profile服务地址；
+- `HERMES_*_PROVIDER_LABEL`：可选的具体 Provider 显示名，例如 `open1`、`wawapi`；
 - 模型供应商凭据由Hermes自身管理，不进入本项目。

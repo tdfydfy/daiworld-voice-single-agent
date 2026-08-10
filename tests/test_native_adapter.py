@@ -40,10 +40,11 @@ class FakeConnect:
         return False
 
 
-def make_app():
+def make_app(provider_label=""):
     settings = NativeSettings()
     settings.access_token = "voice-token"
     settings.hermes_token = "hermes-token"
+    settings.provider_labels["hexiaoma"] = provider_label
     return create_native_app(settings)
 
 
@@ -70,6 +71,28 @@ def test_websocket_cookie_auth_and_transparent_relay(monkeypatch):
     assert "voice-token" not in seen["url"]
     assert seen["kwargs"]["max_size"] == native_main.MAX_WS_MESSAGE
     assert upstream.sent == [json.dumps({"jsonrpc": "2.0", "method": "ping"})]
+
+
+def test_websocket_adds_configured_provider_label(monkeypatch):
+    upstream = FakeUpstream([
+        json.dumps({
+            "method": "event",
+            "params": {
+                "type": "session.info",
+                "payload": {"model": "model-a", "provider": "custom"},
+            },
+        })
+    ])
+
+    monkeypatch.setattr(native_main.websockets, "connect", lambda *args, **kwargs: FakeConnect(upstream))
+    client = TestClient(make_app("open1"))
+    client.post("/api/auth/session", headers={"X-Voice-Token": "voice-token"})
+
+    with client.websocket_connect("/api/hermes/ws?profile=hexiaoma") as websocket:
+        payload = json.loads(websocket.receive_text())["params"]["payload"]
+
+    assert payload["provider"] == "custom"
+    assert payload["provider_label"] == "open1"
 
 
 def test_websocket_without_cookie_is_rejected():
