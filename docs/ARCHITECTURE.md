@@ -1,4 +1,4 @@
-# 单 Agent v21 系统架构
+# 单 Agent v22 系统架构
 
 > 适用范围：`native-open-source` 分支和待迁移的单 Agent HarmonyOS 形态。
 > 不适用：主持人多 Agent 版。两种形态的边界见 [`PRODUCT_FORMS.md`](./PRODUCT_FORMS.md)。
@@ -28,9 +28,7 @@ flowchart LR
     U[用户]
     C[Web / HarmonyOS 单Agent客户端]
     A[Same-Origin Native Adapter]
-    H1[Hermes default serve :9120]
-    H2[Hermes hexiaoma serve :9121]
-    H3[Hermes hexiaoxin serve :9122]
+    H[Hermes Agent backends from catalog]
     DB[(各Profile state.db)]
     FS[(Agent默认文件权限)]
     ASR[Doubao SeedASR-2.0 Streaming Provider]
@@ -38,24 +36,14 @@ flowchart LR
 
     U <-->|文字 / 语音 / 文件查看| C
     C <-->|HTTPS / WSS| A
-    A <-->|JSON-RPC / Audio WS / REST| H1
-    A <-->|JSON-RPC / Audio WS / REST| H2
-    A <-->|JSON-RPC / Audio WS / REST| H3
-    H1 --- DB
-    H2 --- DB
-    H3 --- DB
-    H1 --- FS
-    H2 --- FS
-    H3 --- FS
-    H1 --- ASR
-    H2 --- ASR
-    H3 --- ASR
-    H1 --- TTS
-    H2 --- TTS
-    H3 --- TTS
+    A <-->|JSON-RPC / Audio WS / REST| H
+    H --- DB
+    H --- FS
+    H --- ASR
+    H --- TTS
 ```
 
-一次客户端连接只选择一个 Profile。切换 Profile 等于切换到另一套隔离的 Hermes 后端和历史，不是主持人调度 Agent。
+一次客户端连接只选择一个不透明 Agent ID。切换 Agent 等于切换到另一套隔离的 Hermes 后端和历史，不是主持人调度 Agent。目录由 Adapter 的 `/api/agents` 返回，客户端不写死 Profile。
 
 ## 3. 分层与状态所有权
 
@@ -66,6 +54,7 @@ flowchart LR
 - `session.create / list / resume / delete`；
 - `prompt.submit(queued=true)`；
 - `session.interrupt`；
+- `config.set(... --session)` 与 `session.info` 运行配置确认；
 - `message.start / delta / complete`；
 - `thinking.* / tool.*`；
 - `approval.request / clarify.request`；
@@ -99,11 +88,12 @@ Provider Key 只在 Hermes 服务端，不进入 Adapter 静态文件、浏览�
 职责：
 
 1. 校验内部访问口令；
-2. 把 `default / hexiaoma / hexiaoxin` 映射到独立 Hermes `serve --isolated`；
+2. 把 Agent Catalog 中的不透明 ID 映射到独立 Hermes `serve --isolated`；
 3. 透明转发 JSON-RPC、ASR WS 和 TTS WS；
 4. 聚合 Hermes Session REST 详情和消息时间；
 5. 把 Agent 显式选择的 `MEDIA:<path>` 换成 15 分钟随机令牌；
-6. 提供同源静态页面。
+6. 受控代理 Provider / 模型公开选项，不向客户端暴露密钥；
+7. 提供同源静态页面。
 
 Adapter 不理解用户意图，不决定补充/纠正/切换，不保存第二套会话。
 
@@ -119,7 +109,8 @@ Web 当前实现：`web_native/`。HarmonyOS 后续使用 ArkTS 原生模块。
 - TTS 暂停/恢复；
 - 页面或原生 UI；
 - 历史列表、附件展示；
-- 用户手动选择 Profile。
+- 用户从动态目录选择 Agent；
+- 用户为当前 Session 选择 Provider / 模型，并等待 `session.info` 确认实际身份。
 
 客户端可以决定“是否听、是否播、显示什么”，不能决定“Agent 实际做了什么”。
 
@@ -129,7 +120,9 @@ Web 当前实现：`web_native/`。HarmonyOS 后续使用 ArkTS 原生模块。
 
 | 路径 | 鉴权 | 用途 |
 |---|---|---|
-| `GET /api/health` | `X-Voice-Token` | 三个 Profile 后端状态 |
+| `GET /api/agents` | `X-Voice-Token` | 动态 Agent 公开目录（不含 URL、凭据或 Provider 内部配置） |
+| `GET /api/health` | `X-Voice-Token` | Agent Catalog 后端状态 |
+| `GET /api/hermes/model/options?profile=...` | `X-Voice-Token` | 当前 Agent 可用的 Provider / 模型公开标识及可确认的 `active_provider_label` |
 | `POST /api/audio/transcribe` | `X-Voice-Token` | 文件式 ASR fallback |
 | `POST /api/audio/speak` | `X-Voice-Token` | 一次性 TTS / 审批提示 |
 | `GET /api/hermes/sessions/{id}?profile=...` | `X-Voice-Token` | Session 模型、历史 timestamp 和附件重签 |
@@ -150,7 +143,7 @@ Web 当前实现：`web_native/`。HarmonyOS 后续使用 ArkTS 原生模块。
 
 | 名称 | 含义 | 生命周期 |
 |---|---|---|
-| `profile` | Agent 身份和隔离环境 | 用户手动选择 |
+| `profile` | Agent 身份和隔离环境 | 目录返回的用户选择 |
 | `sessionId` | 当前 Gateway 运行时 ID | 每次 create/resume 生成，可失效 |
 | `storedSessionId / session_key` | Hermes 持久会话 ID | 用于历史、恢复、删除 |
 | `speechJob` | 客户端一次回答的 TTS 播放任务 | 一轮回答 |
@@ -276,12 +269,12 @@ WebRTC echoCancellation
 stateDiagram-v2
     [*] --> Running
     Running --> ApprovalPending: approval.request
-    ApprovalPending --> Running: 允许执行 / 语音同意
-    ApprovalPending --> Denied: 阻止执行 / 语音拒绝
+    ApprovalPending --> Running: 对话内同意
+    ApprovalPending --> Denied: 对话内取消
     ApprovalPending --> Stopped: 精确停止
 ```
 
-审批是 Hermes 协议状态，不是自然语言主持人意图。
+审批是 Hermes 协议状态，不是自然语言主持人意图。HarmonyOS 将请求显示为普通 Agent 对话气泡，但精确回复仍直接调用 `approval.respond`，不进入 `prompt.submit`；`clarify.request` 使用同一对话式展示原则并调用 `clarify.respond`。
 
 ## 12. 附件安全模型
 

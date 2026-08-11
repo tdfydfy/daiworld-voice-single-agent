@@ -7,7 +7,12 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from app import native_main
-from app.native_main import NativeSettings, create_native_app
+from app.native_main import (
+    NativeSettings,
+    create_native_app,
+    has_semantic_content,
+    normalize_asr_transcript_frame,
+)
 
 
 class FakeUpstream:
@@ -48,6 +53,106 @@ def make_app(provider_label=""):
     return create_native_app(settings)
 
 
+def test_asr_semantic_boundary_rewrites_punctuation_only_final_without_dropping_frame():
+    assert has_semantic_content("。 ,……！？---_") is False
+    assert has_semantic_content("🙂©™") is False
+    assert has_semantic_content("版本 2.0") is True
+    assert has_semantic_content("Ⅷ") is True
+
+    punctuation = json.dumps({
+        "type": "transcript",
+        "text": " ，……！？ ",
+        "interim": False,
+        "final": True,
+    }, ensure_ascii=False)
+    filtered = json.loads(normalize_asr_transcript_frame(punctuation))
+    assert filtered == {
+        "type": "transcript",
+        "text": "",
+        "interim": False,
+        "final": True,
+    }
+
+    ordinary = json.dumps({
+        "type": "transcript",
+        "text": "好的。",
+        "interim": False,
+        "final": True,
+    }, ensure_ascii=False)
+    assert normalize_asr_transcript_frame(ordinary) == ordinary
+
+    interim = json.dumps({
+        "type": "transcript",
+        "text": "……",
+        "interim": True,
+        "final": False,
+    }, ensure_ascii=False)
+    assert normalize_asr_transcript_frame(interim) == interim
+
+
+def test_agent_catalog_uses_structured_config_and_hides_private_fields(monkeypatch):
+    monkeypatch.setenv("HERMES_AGENTS_JSON", json.dumps({
+        "agents": [
+            {
+                "id": "writer",
+                "name": "写作助手",
+                "url": "http://127.0.0.1:9200",
+                "avatar_url": "https://cdn.example.com/writer.png",
+                "provider_label": "private-provider",
+                "instructions": "private voice policy",
+            },
+            {
+                "id": "coder",
+                "name": "代码助手",
+                "url": "http://127.0.0.1:9201",
+            },
+        ],
+    }, ensure_ascii=False))
+    settings = NativeSettings()
+    settings.access_token = "voice-token"
+    client = TestClient(create_native_app(settings))
+
+    unauthorized = client.get("/api/agents")
+    assert unauthorized.status_code == 401
+
+    response = client.get("/api/agents", headers={"X-Voice-Token": "voice-token"})
+    assert response.status_code == 200
+    assert response.json() == {
+        "agents": [
+            {
+                "id": "writer",
+                "name": "写作助手",
+                "is_default": True,
+                "avatar_url": "https://cdn.example.com/writer.png",
+            },
+            {"id": "coder", "name": "代码助手", "is_default": False},
+        ],
+    }
+    serialized = response.text
+    assert "9200" not in serialized
+    assert "private-provider" not in serialized
+    assert "private voice policy" not in serialized
+
+
+def test_agent_catalog_allows_explicit_empty_state(monkeypatch):
+    monkeypatch.setenv("HERMES_AGENTS_JSON", "[]")
+    settings = NativeSettings()
+    settings.access_token = "voice-token"
+    client = TestClient(create_native_app(settings))
+
+    response = client.get("/api/agents", headers={"X-Voice-Token": "voice-token"})
+    assert response.json() == {"agents": []}
+
+
+def test_agent_config_rejects_duplicate_ids_and_defaults(monkeypatch):
+    monkeypatch.setenv("HERMES_AGENTS_JSON", json.dumps([
+        {"id": "same", "name": "A", "url": "http://a", "is_default": True},
+        {"id": "same", "name": "B", "url": "http://b", "is_default": True},
+    ]))
+    with pytest.raises(ValueError, match="duplicate agent id"):
+        NativeSettings()
+
+
 def test_websocket_cookie_auth_and_transparent_relay(monkeypatch):
     upstream = FakeUpstream([json.dumps({"method": "event", "params": {"type": "gateway.ready"}})])
     seen = {}
@@ -71,6 +176,43 @@ def test_websocket_cookie_auth_and_transparent_relay(monkeypatch):
     assert "voice-token" not in seen["url"]
     assert seen["kwargs"]["max_size"] == native_main.MAX_WS_MESSAGE
     assert upstream.sent == [json.dumps({"jsonrpc": "2.0", "method": "ping"})]
+
+
+def test_websocket_injects_voice_instructions_only_into_session_create(monkeypatch):
+    monkeypatch.setenv("HERMES_AGENTS_JSON", json.dumps([
+        {
+            "id": "writer",
+            "name": "写作助手",
+            "url": "http://127.0.0.1:9200",
+            "is_default": True,
+            "instructions": "Keep the spoken answer short.",
+        },
+    ]))
+    settings = NativeSettings()
+    settings.access_token = "voice-token"
+    settings.hermes_token = "hermes-token"
+    upstream = FakeUpstream([
+        json.dumps({"method": "event", "params": {"type": "gateway.ready"}}),
+    ])
+    monkeypatch.setattr(native_main.websockets, "connect", lambda *args, **kwargs: FakeConnect(upstream))
+    client = TestClient(create_native_app(settings))
+    client.post("/api/auth/session", headers={"X-Voice-Token": "voice-token"})
+
+    with client.websocket_connect("/api/hermes/ws?profile=writer") as websocket:
+        websocket.receive_text()
+        websocket.send_text(json.dumps({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "session.create",
+            "params": {"cols": 100},
+        }))
+        time.sleep(0.05)
+
+    sent = json.loads(upstream.sent[0])
+    assert sent["params"] == {
+        "cols": 100,
+        "instructions": "Keep the spoken answer short.",
+    }
 
 
 def test_websocket_adds_configured_provider_label(monkeypatch):
@@ -180,10 +322,95 @@ def test_model_options_proxy_requires_voice_token_and_forwards_hermes_token(monk
     )
     assert response.status_code == 200
     assert response.json()["providers"][0]["slug"] == "deepseek"
+    assert response.json()["active_provider_label"] == "deepseek"
     method, url, kwargs = fake.requests[-1]
     assert method == "GET"
     assert url == "http://127.0.0.1:9121/api/model/options"
     assert kwargs["headers"] == {"X-Hermes-Session-Token": "hermes-token"}
+
+
+def test_model_options_use_concrete_provider_ids_instead_of_generic_names(monkeypatch):
+    fake = FakeHttpClient([
+        FakeResponse(200, {
+            "current_provider": "waw",
+            "providers": [
+                {"slug": "open1", "name": "OPENAIAPI", "models": ["model-a"]},
+                {"slug": "waw", "name": "OPENAIAPI", "models": ["model-b"]},
+            ],
+        }),
+    ])
+    monkeypatch.setattr(native_main.httpx, "AsyncClient", lambda **kwargs: fake)
+    client = TestClient(make_app())
+
+    response = client.get(
+        "/api/hermes/model/options?profile=hexiaoma",
+        headers={"X-Voice-Token": "voice-token"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["active_provider_label"] == "waw"
+    assert [provider["name"] for provider in response.json()["providers"]] == ["open1", "waw"]
+
+
+def test_model_options_recognize_hermes_current_provider_shape(monkeypatch):
+    fake = FakeHttpClient([
+        FakeResponse(200, {
+            "provider": "open1",
+            "model": "gpt-5.6-sol",
+            "providers": [
+                {
+                    "slug": "openai-api",
+                    "name": "openai-api",
+                    "is_current": False,
+                    "models": ["gpt-5.6-sol"],
+                },
+                {
+                    "slug": "open1",
+                    "name": "open1",
+                    "is_current": True,
+                    "models": ["gpt-5.6-sol"],
+                },
+                {
+                    "slug": "wawapi",
+                    "name": "wawapi",
+                    "is_current": False,
+                    "models": ["gpt-5.6-sol"],
+                },
+            ],
+        }),
+    ])
+    monkeypatch.setattr(native_main.httpx, "AsyncClient", lambda **kwargs: fake)
+    client = TestClient(make_app())
+
+    response = client.get(
+        "/api/hermes/model/options?profile=hexiaoma",
+        headers={"X-Voice-Token": "voice-token"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["active_provider_label"] == "open1"
+    assert response.json()["providers"][1]["is_current"] is True
+
+
+def test_model_options_configured_label_names_single_generic_provider(monkeypatch):
+    fake = FakeHttpClient([
+        FakeResponse(200, {
+            "providers": [
+                {"slug": "custom", "name": "OPENAIAPI", "models": ["model-a"]},
+            ],
+        }),
+    ])
+    monkeypatch.setattr(native_main.httpx, "AsyncClient", lambda **kwargs: fake)
+    client = TestClient(make_app("open1"))
+
+    response = client.get(
+        "/api/hermes/model/options?profile=hexiaoma",
+        headers={"X-Voice-Token": "voice-token"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["active_provider_label"] == "open1"
+    assert response.json()["providers"][0]["name"] == "open1"
 
 
 def test_model_set_proxy_posts_body_and_rejects_unknown_profile(monkeypatch):

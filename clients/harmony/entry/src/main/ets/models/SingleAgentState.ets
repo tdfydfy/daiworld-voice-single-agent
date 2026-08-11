@@ -4,7 +4,8 @@
 
 export type ConnectionState = 'offline' | 'connecting' | 'online';
 
-export type ProfileKey = 'default' | 'hexiaoma' | 'hexiaoxin';
+// Agent IDs are opaque values supplied by the Adapter catalog.
+export type ProfileKey = string;
 
 export type AsrState = 'stopped' | 'connecting' | 'listening' | 'finalizing';
 
@@ -85,6 +86,9 @@ export class ClarifyView {
 export class SingleAgentSnapshot {
   connection: ConnectionState = 'offline';
   selectedProfile: ProfileKey = 'default';
+  agents: AgentInfo[] = [];
+  agentsLoading: boolean = false;
+  agentsError: string = '';
   runtimeSessionId: string = '';
   storedSessionId: string = '';
   voiceEnabled: boolean = false;
@@ -114,6 +118,12 @@ export class SingleAgentSnapshot {
   statusDetail: string = '';
   runtimeModel: string = '';
   runtimeProvider: string = '';
+  modelProviders: ModelProviderInfo[] = [];
+  modelOptionsLoading: boolean = false;
+  modelOptionsError: string = '';
+  modelSwitching: boolean = false;
+  modelSwitchStatus: string = '';
+  modelSwitchError: string = '';
   error: string = '';
   approvalDescription: string = '';
   approvalCommand: string = '';
@@ -122,16 +132,111 @@ export class SingleAgentSnapshot {
   clarifyChoices: string[] = [];
 }
 
-export class ProfileInfo {
-  static readonly PROFILES: ProfileKey[] = ['default', 'hexiaoma', 'hexiaoxin'];
+export class AgentInfo {
+  id: string = '';
+  name: string = '';
+  isDefault: boolean = false;
+  avatarUrl: string = '';
 
-  static displayName(key: ProfileKey): string {
-    if (key === 'default') {
-      return '赫准行';
+  static fromObject(value: Object): AgentInfo | undefined {
+    const row = value as Record<string, Object>;
+    const id = row['id'];
+    const name = row['name'];
+    if (typeof id !== 'string' || id.length === 0 || typeof name !== 'string' || name.length === 0) {
+      return undefined;
     }
-    if (key === 'hexiaoma') {
-      return '赫小码';
+    const info = new AgentInfo();
+    info.id = id;
+    info.name = name;
+    info.isDefault = row['is_default'] === true;
+    info.avatarUrl = typeof row['avatar_url'] === 'string' ? row['avatar_url'] : '';
+    return info;
+  }
+}
+
+export class AgentCatalog {
+  agents: AgentInfo[] = [];
+
+  find(id: string): AgentInfo | undefined {
+    return this.agents.find((agent: AgentInfo): boolean => agent.id === id);
+  }
+
+  displayName(id: string): string {
+    const agent = this.find(id);
+    return agent !== undefined ? agent.name : (id.length > 0 ? id : 'Agent');
+  }
+
+  fallback(): AgentInfo | undefined {
+    return this.agents.find((agent: AgentInfo): boolean => agent.isDefault) || this.agents[0];
+  }
+}
+
+export class ModelOptionInfo {
+  id: string = '';
+  label: string = '';
+
+  static fromValue(value: Object): ModelOptionInfo | undefined {
+    const option = new ModelOptionInfo();
+    if (typeof value === 'string') {
+      option.id = value.trim();
+      option.label = option.id;
+      return option.id.length > 0 ? option : undefined;
     }
-    return '赫小新';
+    if (value === null || typeof value !== 'object') {
+      return undefined;
+    }
+    const row = value as Record<string, Object>;
+    const rawId = row['id'] !== undefined ? row['id'] :
+      row['model'] !== undefined ? row['model'] : row['name'];
+    if (typeof rawId !== 'string' || rawId.trim().length === 0) {
+      return undefined;
+    }
+    option.id = rawId.trim();
+    const rawLabel = row['label'] !== undefined ? row['label'] : row['name'];
+    option.label = typeof rawLabel === 'string' && rawLabel.trim().length > 0
+      ? rawLabel.trim() : option.id;
+    return option;
+  }
+}
+
+export class ModelProviderInfo {
+  id: string = '';
+  name: string = '';
+  models: ModelOptionInfo[] = [];
+
+  static fromObject(value: Object): ModelProviderInfo | undefined {
+    if (value === null || typeof value !== 'object') {
+      return undefined;
+    }
+    const row = value as Record<string, Object>;
+    const rawId = row['slug'] !== undefined ? row['slug'] :
+      row['id'] !== undefined ? row['id'] : row['name'];
+    if (typeof rawId !== 'string' || rawId.trim().length === 0) {
+      return undefined;
+    }
+    const rawModels = Array.isArray(row['models']) ? row['models'] : row['model_ids'];
+    if (!Array.isArray(rawModels)) {
+      return undefined;
+    }
+    const provider = new ModelProviderInfo();
+    provider.id = rawId.trim();
+    const suppliedName = typeof row['name'] === 'string' ? String(row['name']).trim() : '';
+    provider.name = ModelProviderInfo.isGenericName(suppliedName) &&
+      !ModelProviderInfo.isGenericName(provider.id) ? provider.id : (suppliedName || provider.id);
+    for (const rawModel of rawModels as Object[]) {
+      const model = ModelOptionInfo.fromValue(rawModel);
+      if (model !== undefined && provider.models.find(
+        (item: ModelOptionInfo): boolean => item.id === model.id
+      ) === undefined) {
+        provider.models.push(model);
+      }
+    }
+    return provider.models.length > 0 ? provider : undefined;
+  }
+
+  private static isGenericName(value: string): boolean {
+    const normalized = value.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+    return normalized === 'custom' || normalized === 'openaiapi' ||
+      normalized === 'openaicompatible' || normalized === 'openaicompatibleapi';
   }
 }

@@ -1,6 +1,6 @@
 # 单 Agent 跨端交互与协议规范
 
-> 版本：Single Agent v21  
+> 版本：Single Agent v22
 > Web 参考实现：`web_native/app.js`  
 > 服务边界：`app/native_main.py`  
 > 迁移目标：单 Agent HarmonyOS 形态  
@@ -22,13 +22,7 @@ Web 和 HarmonyOS 可以使用不同 UI、录音和播放 API，但必须保持�
 
 ### 2.1 选择 Agent
 
-客户端显示：
-
-| Profile | 显示名称 | 说明 |
-|---|---|---|
-| `default` | 赫准行 | 独立 Hermes Profile |
-| `hexiaoma` | 赫小码 | 独立 Hermes Profile |
-| `hexiaoxin` | 赫小新 | 独立 Hermes Profile |
+客户端从 Adapter `GET /api/agents` 读取 Agent 目录，只把 `id` 当作不透明标识，并显示服务端返回的名称和可选头像。客户端不得写死 Profile 数量、名称或后端地址。
 
 切换 Profile：
 
@@ -40,14 +34,24 @@ Web 和 HarmonyOS 可以使用不同 UI、录音和播放 API，但必须保持�
 
 这不是主持人调度，也不桥接不同 Profile 的上下文。
 
-### 2.2 新对话
+### 2.2 切换当前会话模型
+
+- 设置页通过 `GET /api/hermes/model/options?profile=<agent-id>` 读取公开的 Provider / 模型标识；密钥和内部配置不下发客户端；
+- 客户端发送 `config.set(session_id, key=model, value="<model> --provider <provider> --session")`；
+- `--session` 表示只影响当前运行 Session，不写回 Agent / Profile 默认配置；
+- 切换期间不重建对话、ASR 或 TTS 连接，当前 Agent 忙碌时禁止切换；
+- RPC 失败或 10 秒内没有匹配的 `session.info` 时，顶部继续显示上一次已确认身份；
+- 只有 `session.info` 返回目标模型后，客户端才把切换标为已确认，并以该事件中的 Provider 更新顶部身份。
+- Adapter 将 `slug=open1, name=OPENAIAPI` 这类通用名称规范化为具体公开标识，并可返回 `active_provider_label`；HarmonyOS 不把 `custom` / `OPENAIAPI` 当成具体服务名。
+
+### 2.3 新对话
 
 - 创建新的 Hermes Session；
 - 页面消息清空；
 - 不删除旧持久会话；
 - 历史栏仍可恢复旧会话。
 
-### 2.3 恢复历史
+### 2.4 恢复历史
 
 - 列表首次显示最新 20 个持久会话；
 - 到底后再显示 20；
@@ -67,6 +71,10 @@ POST /api/auth/session
 
 WSS /api/hermes/ws?profile=<profile>
 ```
+
+连接前客户端请求 `GET /api/agents`（`X-Voice-Token`），目录返回 `id`、`name`、`is_default` 和可选 `avatar_url`。URL、凭据、Provider 标签和语音策略只留在 Adapter；保存的 Agent 不存在时回退到 `is_default`，空目录显示离线空状态。
+
+模型设置面板按需请求 `GET /api/hermes/model/options?profile=<agent-id>`（`X-Voice-Token`）。返回值只包含可选择的 Provider / 模型公开标识，不包含任何 Provider Key。
 
 服务端连接成功后发送 `gateway.ready` 事件。客户端再调用 `session.create` 或 `session.resume`。
 
@@ -100,7 +108,7 @@ WSS /api/hermes/ws?profile=<profile>
   "params": {
     "type": "message.delta",
     "session_id": "runtime-id",
-    "payload": {"text": "..."}
+    "payload": {"text": "...", "speech_text": "可选的简短播报正文"}
   }
 }
 ```
@@ -119,22 +127,23 @@ WSS /api/hermes/ws?profile=<profile>
 | `session.interrupt` | `session_id` | 精确停止 / 停止按钮 |
 | `approval.respond` | `session_id, choice` | `session` 或 `deny` |
 | `clarify.respond` | `session_id, request_id, answer` | 回答澄清 |
+| `config.set` | `session_id, key=model, value="<model> --provider <provider> --session"` | 只切换当前 Session 的模型 / Provider |
 
 ## 5. 客户端处理的 Hermes 事件
 
 | 事件 | 关键字段 | 行为 |
 |---|---|---|
 | `gateway.ready` | — | create/resume Session |
-| `session.info` | `model, provider, provider_label/provider_name, profile_name` | 更新运行时身份；具体 Provider 名优先于类型字段 |
+| `session.info` | `model, provider, provider_label/provider_name, profile_name` | 更新运行时身份并确认待处理的模型切换；具体 Provider 名优先于类型字段 |
 | `message.start` | — | 创建 Agent 气泡和 SpeechJob |
-| `message.delta` | `text/rendered` | 追加正文和TTS文本 |
-| `message.complete` | `text/rendered, artifacts?` | 完成正文、耗时和播放队列 |
+| `message.delta` | `text/rendered, speech_text?` | 屏幕追加完整正文；TTS 优先追加 `speech_text` |
+| `message.complete` | `text/rendered, speech_text?, artifacts?` | 屏幕保留完整正文，TTS 使用 `speech_text` 或最小清理后的兼容正文 |
 | `thinking.delta` / `reasoning.delta` | `text` | 更新思考区，不作为正式回答 |
 | `tool.start` | `tool_id, name, args_text/context` | 创建工具步骤 |
 | `tool.progress` | `name, preview` | 更新工具详情 |
 | `tool.complete` | `tool_id, name, duration_s, summary, error` | 完成工具步骤，耗时同行 |
-| `approval.request` | `description, command` | 进入审批模态 |
-| `clarify.request` | `request_id, question, choices` | 进入澄清模态 |
+| `approval.request` | `description, command` | HarmonyOS 追加对话气泡并进入审批 pending；Web 技术预览保留既有协议回归 |
+| `clarify.request` | `request_id, question, choices` | HarmonyOS 追加含编号选项的对话气泡并进入澄清 pending |
 | `status.update` | `text/kind` | 更新运行状态 |
 | `error` | `message` | 结束相关忙碌并显示错误 |
 
@@ -158,6 +167,7 @@ WSS /api/audio/transcribe-stream?profile=<profile>
 - 单声道；
 - Web 当前每次发送 6400 bytes；
 - `ready` 前允许本地短缓冲；
+- HarmonyOS 在未连接、重连或等待 `ready` 时保留最近 4 个 PCM 块（约 0.8 秒），只在显式“暂停收音”或关闭麦克风时清空；
 - 结束时发送：
 
 ```json
@@ -200,15 +210,20 @@ Final：
 {"type":"error","message":"..."}
 ```
 
+共同语义边界：`final=true` 且 `text` 不含 Unicode 字母或数字（Unicode General Category `L` / `N`）时，Adapter 不丢弃转写帧，而是把 `text` 改为空字符串并保留 `final=true`，让客户端清理当前临时气泡和暂停状态。HarmonyOS 保留同一规则作为防御性过滤；Web 只保留协议回归实现，不定义另一套判定。
+
 ### 6.4 ASR 客户端规则
 
 1. `ready` 前不处理 transcript；
 2. partial 更新同一个临时用户气泡；
-3. final 不删除重建，直接把同一气泡升级为正式消息；
-4. `idle timeout` 是继续等待，不是重连理由；
-5. 断线且用户仍开启语音时自动重连；
-6. exact STOP 先中断，不提交普通 Prompt；
-7. approval pending 时只接受固定同意/拒绝词。
+3. 普通 final 进入约 1.1 秒收句窗口；窗口内连续 final 合并到同一气泡，明确的停止、暂停收音、审批和澄清回复仍立即处理；
+4. final 不删除重建，直接把同一气泡升级为正式消息；
+5. `idle timeout` 是继续等待，不是重连理由；
+6. 断线且用户仍开启语音时按 `250 / 750 / 1500 / 3000 ms` 封顶退避自动重连，短暂断线不立即拆分已有有效转写；
+7. HarmonyOS 的连接看门覆盖 WebSocket 建连到 Provider `ready` 的完整阶段，10 秒未就绪即进入下一轮恢复；
+8. 重连必须隔离旧 socket 的迟到回调，显式暂停收音、切换本地语音或主动断开必须取消恢复；
+9. exact STOP 先中断，不提交普通 Prompt；
+10. approval pending 时只接受固定同意/拒绝词。
 
 ## 7. TTS 协议
 
@@ -253,6 +268,8 @@ remaining = speechNext - AudioClock.currentTime
 
 客户端必须等待 remaining 排空，再释放当前 SpeechJob。HarmonyOS 应用 `AudioRenderer` 的真实队列/回调实现等价语义。
 
+远端 TTS 断线时，HarmonyOS 先排空已经收到的 PCM，再把播放状态归零；重连只恢复后续待发送任务，不伪造已经丢失的服务端 PCM。
+
 ### 7.3 TTS 队列
 
 ```text
@@ -263,7 +280,9 @@ speechQueue[]
 - 一次只播放一个 Job；
 - 后续 Agent 回答按顺序排队；
 - `message.complete` 不等于前一条播完；
-- STOP 才清空队列。
+- HarmonyOS 的文本和 `done` 帧使用单通道有序发送；发送失败时失败帧留在队首，重连后继续，不能按 Promise 回调顺序重排；
+- 远端连接按 `250 / 750 / 1500 / 3000 ms` 封顶退避恢复，单次建连超过 10 秒视为失败，旧 socket 回调不得改变新连接；
+- STOP 和显式关闭才清空待发送队列。
 
 ### 7.4 MEDIA 文本过滤
 
@@ -357,15 +376,17 @@ ASR 误判为回音时才删除预览；普通补充必须保留。
 
 ## 11. 审批
 
-### 11.1 屏幕
+### 11.1 对话展示
 
-展示：
+HarmonyOS 追加普通 Agent 对话气泡，展示：
 
 - 高风险；
 - 简短说明；
 - 完整命令；
 - “执行已暂停”；
-- “允许执行 / 阻止执行”。
+- “请回复同意或取消”。
+
+不显示独立审批卡或操作按钮。`clarify.request` 同样把问题和编号选项写入对话气泡，不显示独立选项卡。
 
 ### 11.2 语音
 
@@ -378,15 +399,15 @@ ASR 误判为回音时才删除预览；普通补充必须保留。
 拒绝词：
 
 ```text
-拒绝 / 阻止 / 取消 / 不要
+取消 / 拒绝 / 阻止 / 不要
 ```
 
 映射：
 
 - 同意 → `approval.respond(choice="session")`；
-- 拒绝 → `approval.respond(choice="deny")`。
+- 取消 → `approval.respond(choice="deny")`。
 
-普通语音不入 Agent 队列；未知词保持 pending。
+文字和语音共用同一映射。普通回复不入 Agent 队列；未知审批词保持 pending。澄清状态下的下一条有效回复映射到 `clarify.respond`，也不调用 `prompt.submit`。
 
 ## 12. 附件
 
@@ -527,7 +548,7 @@ GET /api/hermes/sessions/{storedId}?profile=...
 | 精确停止 | Agent + TTS 队列停止 |
 | 非精确“停止”文本 | 普通下一轮 |
 | 工具调用 | 名称、摘要、耗时可见 |
-| 高风险审批 | 屏幕和语音均可处理，未知词不批准 |
+| 高风险审批 | 对话和语音均可处理，无独立卡片，未知词不批准 |
 | 图片 | 内联可见，路径不泄漏 |
 | 文件 | 可下载/保存，token 过期后失败 |
 | 历史首屏 | 20条 |
@@ -535,7 +556,7 @@ GET /api/hermes/sessions/{storedId}?profile=...
 | 历史继续 | 同一持久上下文 |
 | 历史模型/时间 | 与实时同一视觉结构 |
 | Profile切换 | 历史和Session隔离 |
-| 网络恢复 | 不显示旧连接迟到事件 |
+| 网络恢复 | 不显示旧连接迟到事件；远端 ASR 保留短 PCM，TTS 待发帧保持顺序并自动恢复 |
 | 后台/锁屏 | 按平台真实能力显示，不虚假在线 |
 
 ## 17. 变更规则

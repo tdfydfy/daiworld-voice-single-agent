@@ -1,10 +1,12 @@
-import { common } from '@kit.AbilityKit';
+import { bundleManager, common } from '@kit.AbilityKit';
 import {
   ChatMessage,
+  AgentInfo,
   HistorySession,
   MessageActivity,
   MessageArtifact,
-  ProfileInfo,
+  ModelOptionInfo,
+  ModelProviderInfo,
   ProfileKey,
   SingleAgentSnapshot,
   SpeechBackend
@@ -44,6 +46,8 @@ struct Index {
   @State gatewayUrl: string = DEFAULT_GATEWAY_URL;
   @State accessToken: string = '';
   @State hasSavedToken: boolean = false;
+  @State controllerReady: boolean = false;
+  @State settingsSaving: boolean = false;
   @State selectedProfile: ProfileKey = 'default';
   @State inputText: string = '';
   @State showTextComposer: boolean = false;
@@ -51,8 +55,12 @@ struct Index {
   @State voicePerson: number = 0;
   @State speechRate: number = 1;
   @State debugMode: boolean = false;
+  @State appVersion: string = '版本信息读取中';
   @State voiceOptions: VoiceOption[] = [];
   @State voiceOptionsLoading: boolean = false;
+  @State selectedModelProvider: string = '';
+  @State selectedRuntimeModel: string = '';
+  @State modelSelectionInitialized: boolean = false;
   @State nowMs: number = Date.now();
   private clockTimer?: number;
   private lastMessageCount: number = 0;
@@ -61,17 +69,8 @@ struct Index {
   private lastAsrUtteranceActive: boolean = false;
 
   aboutToAppear(): void {
+    this.loadAppVersion();
     const context = getContext(this) as common.UIAbilityContext;
-    this.controller.setContext(context);
-    const config = this.controller.getConfig();
-    this.gatewayUrl = config.gatewayUrl;
-    this.accessToken = '';
-    this.hasSavedToken = config.accessToken.length > 0;
-    this.selectedProfile = config.profile;
-    this.speechBackend = config.speechBackend;
-    this.voicePerson = config.voicePerson;
-    this.speechRate = config.speechRate;
-    this.debugMode = config.debugMode;
     this.controller.setListener(new SnapshotListener(
       (snapshot: SingleAgentSnapshot): void => {
         const wasNearBottom = this.lastMessageCount === 0 || this.isMessageListNearBottom();
@@ -85,6 +84,7 @@ struct Index {
         this.lastMessageListAtEnd = wasNearBottom;
         this.lastAsrUtteranceActive = snapshot.asrUtteranceActive;
         this.snapshot = snapshot;
+        this.syncModelSelection(snapshot);
         if (!this.showSettings && !this.showHistory &&
           (messageAdded || messagesCleared || messagesChanged || speechStarted)) {
           setTimeout((): void => {
@@ -101,14 +101,13 @@ struct Index {
         }
       }
     ));
-    this.showSettings = !this.hasSavedToken;
-    if (!this.showSettings) {
-      setTimeout((): void => {
-        this.controller.connect();
-      }, 0);
-    } else {
+    this.controller.setContext(context).then((): void => {
+      this.finishControllerInitialization();
+    }).catch((): void => {
+      this.controllerReady = true;
+      this.showSettings = true;
       this.loadVoiceOptions();
-    }
+    });
     this.clockTimer = setInterval((): void => {
       this.nowMs = Date.now();
     }, 500);
@@ -122,6 +121,9 @@ struct Index {
   }
 
   onPageShow(): void {
+    if (!this.controllerReady) {
+      return;
+    }
     const config = this.controller.getConfig();
     if (!this.showSettings && config.accessToken.length > 0 && this.snapshot.connection === 'offline') {
       setTimeout((): void => {
@@ -140,10 +142,14 @@ struct Index {
     this.voicePerson = config.voicePerson;
     this.speechRate = config.speechRate;
     this.debugMode = config.debugMode;
+    this.selectedModelProvider = '';
+    this.selectedRuntimeModel = '';
+    this.modelSelectionInitialized = false;
     this.showHistory = false;
     this.showTextComposer = false;
     this.showSettings = true;
     this.loadVoiceOptions();
+    this.reloadModelOptions();
   }
 
   private closeSettings(): void {
@@ -152,6 +158,9 @@ struct Index {
   }
 
   private saveSettings(): void {
+    if (this.settingsSaving) {
+      return;
+    }
     const enteredToken = this.accessToken.trim();
     const currentConfig = this.controller.getConfig();
     const savedToken = currentConfig.accessToken;
@@ -167,15 +176,45 @@ struct Index {
       voicePerson: this.voicePerson,
       speechRate: this.speechRate
     });
+    this.settingsSaving = true;
+    this.controller.waitForConfigPersistence().then((): void => {
+      this.settingsSaving = false;
+      this.accessToken = '';
+      this.hasSavedToken = token.length > 0;
+      this.showSettings = false;
+      if (reconnect) {
+        this.controller.disconnect();
+      }
+      if (reconnect || this.snapshot.connection === 'offline') {
+        this.controller.connect();
+      }
+    }).catch((): void => {
+      this.settingsSaving = false;
+      this.accessToken = '';
+      this.hasSavedToken = currentConfig.accessToken.length > 0;
+      this.controller.setConfig(currentConfig);
+    });
+  }
+
+  private finishControllerInitialization(): void {
+    const config = this.controller.getConfig();
+    this.gatewayUrl = config.gatewayUrl;
     this.accessToken = '';
-    this.hasSavedToken = token.length > 0;
-    this.showSettings = false;
-    if (reconnect) {
-      this.controller.disconnect();
+    this.hasSavedToken = config.accessToken.length > 0;
+    this.selectedProfile = config.profile;
+    this.speechBackend = config.speechBackend;
+    this.voicePerson = config.voicePerson;
+    this.speechRate = config.speechRate;
+    this.debugMode = config.debugMode;
+    this.controllerReady = true;
+    this.showSettings = !this.hasSavedToken;
+    if (this.showSettings) {
+      this.loadVoiceOptions();
+      return;
     }
-    if (reconnect || this.snapshot.connection === 'offline') {
+    setTimeout((): void => {
       this.controller.connect();
-    }
+    }, 0);
   }
 
   private loadVoiceOptions(): void {
@@ -196,12 +235,144 @@ struct Index {
   }
 
   private profileSelectItems(): TextSelectItem[] {
-    return ProfileInfo.PROFILES.map((profile: ProfileKey): TextSelectItem =>
-      new TextSelectItem(ProfileInfo.displayName(profile)));
+    return this.snapshot.agents.map((agent: AgentInfo): TextSelectItem =>
+      new TextSelectItem(agent.name));
+  }
+
+  private loadAppVersion(): void {
+    try {
+      const bundleInfo = bundleManager.getBundleInfoForSelfSync(
+        bundleManager.BundleFlag.GET_BUNDLE_INFO_DEFAULT
+      );
+      this.appVersion = '版本 ' + bundleInfo.versionName + ' (' + String(bundleInfo.versionCode) + ')';
+    } catch (_error) {
+      this.appVersion = '版本信息不可用';
+    }
+  }
+
+  private reloadModelOptions(): void {
+    this.selectedModelProvider = '';
+    this.selectedRuntimeModel = '';
+    this.modelSelectionInitialized = false;
+    this.controller.loadModelOptions();
+  }
+
+  private syncModelSelection(snapshot: SingleAgentSnapshot): void {
+    if (!this.showSettings || this.modelSelectionInitialized ||
+      snapshot.modelOptionsLoading || snapshot.modelProviders.length === 0) {
+      return;
+    }
+    let provider = snapshot.modelProviders.find((item: ModelProviderInfo): boolean =>
+      item.id === snapshot.runtimeProvider || item.name === snapshot.runtimeProvider);
+    if (provider === undefined && snapshot.runtimeModel.length > 0) {
+      provider = snapshot.modelProviders.find((item: ModelProviderInfo): boolean =>
+        item.models.find((model: ModelOptionInfo): boolean =>
+          model.id === snapshot.runtimeModel) !== undefined);
+    }
+    if (provider === undefined) {
+      provider = snapshot.modelProviders[0];
+    }
+    this.selectedModelProvider = provider.id;
+    const model = provider.models.find((item: ModelOptionInfo): boolean =>
+      item.id === snapshot.runtimeModel) || provider.models[0];
+    this.selectedRuntimeModel = model !== undefined ? model.id : '';
+    this.modelSelectionInitialized = true;
+  }
+
+  private modelProviderItems(): TextSelectItem[] {
+    return this.snapshot.modelProviders.map((provider: ModelProviderInfo): TextSelectItem =>
+      new TextSelectItem(provider.name));
+  }
+
+  private modelProviderIndex(): number {
+    const index = this.snapshot.modelProviders.findIndex((provider: ModelProviderInfo): boolean =>
+      provider.id === this.selectedModelProvider);
+    return Math.max(0, index);
+  }
+
+  private selectedModelProviderOption(): ModelProviderInfo | undefined {
+    return this.snapshot.modelProviders.find((provider: ModelProviderInfo): boolean =>
+      provider.id === this.selectedModelProvider);
+  }
+
+  private runtimeModelItems(): TextSelectItem[] {
+    const provider = this.selectedModelProviderOption();
+    return provider !== undefined
+      ? provider.models.map((model: ModelOptionInfo): TextSelectItem => new TextSelectItem(model.label))
+      : [];
+  }
+
+  private runtimeModelIndex(): number {
+    const provider = this.selectedModelProviderOption();
+    if (provider === undefined) {
+      return 0;
+    }
+    const index = provider.models.findIndex((model: ModelOptionInfo): boolean =>
+      model.id === this.selectedRuntimeModel);
+    return Math.max(0, index);
+  }
+
+  private selectedModelProviderName(): string {
+    return this.selectedModelProviderOption()?.name || '选择 Provider';
+  }
+
+  private selectedRuntimeModelLabel(): string {
+    const provider = this.selectedModelProviderOption();
+    const model = provider?.models.find((item: ModelOptionInfo): boolean =>
+      item.id === this.selectedRuntimeModel);
+    return model !== undefined ? model.label : '选择模型';
+  }
+
+  private selectModelProvider(index: number): void {
+    if (index < 0 || index >= this.snapshot.modelProviders.length) {
+      return;
+    }
+    const provider = this.snapshot.modelProviders[index];
+    this.selectedModelProvider = provider.id;
+    this.selectedRuntimeModel = provider.models.length > 0 ? provider.models[0].id : '';
+    this.modelSelectionInitialized = true;
+  }
+
+  private canSwitchRuntimeModel(): boolean {
+    return this.snapshot.connection === 'online' &&
+      this.snapshot.runtimeSessionId.length > 0 &&
+      !this.snapshot.agentBusy &&
+      !this.snapshot.modelSwitching &&
+      this.selectedModelProvider.length > 0 &&
+      this.selectedRuntimeModel.length > 0;
+  }
+
+  private applyRuntimeModelSwitch(): void {
+    this.controller.switchRuntimeModel(this.selectedModelProvider, this.selectedRuntimeModel);
   }
 
   private profileIndex(profile: ProfileKey): number {
-    return Math.max(0, ProfileInfo.PROFILES.indexOf(profile));
+    for (let index = 0; index < this.snapshot.agents.length; index += 1) {
+      if (this.snapshot.agents[index].id === profile) {
+        return index;
+      }
+    }
+    return 0;
+  }
+
+  private selectedAgent(): AgentInfo | undefined {
+    return this.snapshot.agents.find((agent: AgentInfo): boolean =>
+      agent.id === this.snapshot.selectedProfile);
+  }
+
+  private selectedAgentName(): string {
+    const agent = this.selectedAgent();
+    return agent !== undefined ? agent.name : (this.snapshot.selectedProfile.length > 0
+      ? this.snapshot.selectedProfile : 'Agent');
+  }
+
+  private selectedAgentInitial(): string {
+    const name = this.selectedAgentName();
+    return Array.from(name)[0] || 'A';
+  }
+
+  private selectedAgentAvatar(): string {
+    return this.selectedAgent()?.avatarUrl || '';
   }
 
   private voiceSelectItems(): TextSelectItem[] {
@@ -507,18 +678,57 @@ struct Index {
     return COLOR_ACCENT;
   }
 
+  private thinkingLines(text: string): string[] {
+    const lines: string[] = [];
+    const sourceLines = text.replace(/\r\n?/g, '\n').split('\n');
+    const boundaries = '。！？!?；;';
+    for (const source of sourceLines) {
+      let pending = '';
+      for (const char of source) {
+        pending += char;
+        if (boundaries.includes(char)) {
+          const value = pending.trim();
+          if (value.length > 0) {
+            lines.push(value);
+          }
+          pending = '';
+        }
+      }
+      const tail = pending.trim();
+      if (tail.length > 0) {
+        lines.push(tail);
+      }
+    }
+    return lines;
+  }
+
   @Builder
   private Header() {
     Row({ space: 8 }) {
+      Stack({ alignContent: Alignment.Center }) {
+        Circle({ width: 42, height: 42 })
+          .fill('#25284A')
+        if (this.selectedAgentAvatar().length > 0) {
+          Image(this.selectedAgentAvatar())
+            .width(42)
+            .height(42)
+            .objectFit(ImageFit.Cover)
+            .borderRadius(21)
+        } else {
+          Text(this.selectedAgentInitial())
+            .fontSize(16)
+            .fontWeight(FontWeight.Bold)
+            .fontColor('#C9C9FF')
+        }
+      }
+      .width(42)
+      .height(42)
+
       Column({ space: 5 }) {
         Row({ space: 6 }) {
-          Text('Agent:')
-            .fontSize(11)
-            .fontColor(COLOR_MUTED)
-
           Select(this.profileSelectItems())
             .selected(this.profileIndex(this.snapshot.selectedProfile))
-            .value(ProfileInfo.displayName(this.snapshot.selectedProfile))
+            .value(this.selectedAgentName())
             .font({ size: 12 })
             .fontColor(COLOR_TEXT)
             .backgroundColor(COLOR_BG)
@@ -526,11 +736,11 @@ struct Index {
             .borderRadius(7)
             .layoutWeight(1)
             .height(40)
-            .enabled(!this.snapshot.agentBusy && this.snapshot.connection === 'online')
-            .opacity(!this.snapshot.agentBusy && this.snapshot.connection === 'online' ? 1 : 0.55)
+            .enabled(!this.snapshot.agentBusy && this.snapshot.connection === 'online' && this.snapshot.agents.length > 1)
+            .opacity(!this.snapshot.agentBusy && this.snapshot.connection === 'online' && this.snapshot.agents.length > 1 ? 1 : 0.55)
             .onSelect((index: number, _value: string): void => {
-              if (index >= 0 && index < ProfileInfo.PROFILES.length) {
-                this.switchAgent(ProfileInfo.PROFILES[index]);
+              if (index >= 0 && index < this.snapshot.agents.length) {
+                this.switchAgent(this.snapshot.agents[index].id);
               }
             })
         }
@@ -653,6 +863,137 @@ struct Index {
               this.accessToken = value;
             })
 
+        }
+        .width('100%')
+
+        Column({ space: 10 }) {
+          Row() {
+            Text('当前会话模型')
+              .fontSize(13)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(COLOR_TEXT)
+            Blank()
+            Text(this.runtimeText())
+              .constraintSize({ maxWidth: 190 })
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .fontSize(11)
+              .fontColor(COLOR_SUCCESS)
+          }
+          .width('100%')
+
+          Text('只切换当前 Session，不修改 Agent 的默认配置，也不会重建对话或语音连接。')
+            .width('100%')
+            .fontSize(11)
+            .lineHeight(17)
+            .fontColor(COLOR_MUTED)
+
+          if (this.snapshot.modelOptionsLoading) {
+            Row({ space: 8 }) {
+              LoadingProgress()
+                .width(18)
+                .height(18)
+                .color(COLOR_ACCENT)
+              Text('正在读取 Provider 和模型')
+                .fontSize(12)
+                .fontColor(COLOR_MUTED)
+            }
+            .width('100%')
+            .height(42)
+          } else if (this.snapshot.modelOptionsError.length > 0) {
+            Row({ space: 8 }) {
+              Text(this.snapshot.modelOptionsError)
+                .layoutWeight(1)
+                .fontSize(11)
+                .fontColor(COLOR_DANGER)
+              Button('重新加载', { type: ButtonType.Normal })
+                .height(32)
+                .fontSize(10)
+                .fontColor(COLOR_TEXT)
+                .backgroundColor(COLOR_BG)
+                .border({ width: 1, color: COLOR_LINE })
+                .borderRadius(6)
+                .onClick(() => {
+                  this.reloadModelOptions();
+                })
+            }
+            .width('100%')
+          } else if (this.snapshot.modelProviders.length > 0) {
+            Text('Provider')
+              .width('100%')
+              .fontSize(11)
+              .fontColor(COLOR_MUTED)
+            Select(this.modelProviderItems())
+              .selected(this.modelProviderIndex())
+              .value(this.selectedModelProviderName())
+              .font({ size: 13 })
+              .fontColor(COLOR_TEXT)
+              .backgroundColor(COLOR_BG)
+              .border({ width: 1, color: COLOR_LINE })
+              .borderRadius(7)
+              .width('100%')
+              .height(44)
+              .enabled(!this.snapshot.modelSwitching)
+              .onSelect((index: number, _value: string): void => {
+                this.selectModelProvider(index);
+              })
+
+            Text('模型')
+              .width('100%')
+              .fontSize(11)
+              .fontColor(COLOR_MUTED)
+            Select(this.runtimeModelItems())
+              .selected(this.runtimeModelIndex())
+              .value(this.selectedRuntimeModelLabel())
+              .font({ size: 13 })
+              .fontColor(COLOR_TEXT)
+              .backgroundColor(COLOR_BG)
+              .border({ width: 1, color: COLOR_LINE })
+              .borderRadius(7)
+              .width('100%')
+              .height(44)
+              .enabled(!this.snapshot.modelSwitching)
+              .onSelect((index: number, _value: string): void => {
+                const provider = this.selectedModelProviderOption();
+                if (provider !== undefined && index >= 0 && index < provider.models.length) {
+                  this.selectedRuntimeModel = provider.models[index].id;
+                }
+              })
+
+            if (this.snapshot.modelSwitchStatus.length > 0) {
+              Text(this.snapshot.modelSwitchStatus)
+                .width('100%')
+                .fontSize(11)
+                .fontColor(COLOR_SUCCESS)
+            }
+            if (this.snapshot.modelSwitchError.length > 0) {
+              Text(this.snapshot.modelSwitchError)
+                .width('100%')
+                .fontSize(11)
+                .lineHeight(17)
+                .fontColor(COLOR_DANGER)
+            }
+
+            Button(this.snapshot.modelSwitching ? '切换并确认中…' : '切换当前会话', {
+              type: ButtonType.Normal
+            })
+              .width('100%')
+              .height(40)
+              .fontSize(12)
+              .fontColor(COLOR_BG)
+              .backgroundColor(COLOR_SUCCESS)
+              .borderRadius(7)
+              .enabled(this.canSwitchRuntimeModel())
+              .opacity(this.canSwitchRuntimeModel() ? 1 : 0.5)
+              .onClick(() => {
+                this.applyRuntimeModelSwitch();
+              })
+          } else {
+            Text('暂无可用的 Provider / 模型选项')
+              .width('100%')
+              .fontSize(12)
+              .fontColor(COLOR_MUTED)
+          }
         }
         .width('100%')
 
@@ -789,16 +1130,24 @@ struct Index {
         .width('100%')
         .height(42)
 
-        Button(this.snapshot.connection === 'online' ? '保存设置' : '保存并连接', { type: ButtonType.Normal })
+        Button(this.settingsSaving ? '正在安全保存' :
+          (this.snapshot.connection === 'online' ? '保存设置' : '保存并连接'), { type: ButtonType.Normal })
           .width('100%')
           .height(44)
           .fontSize(13)
           .fontColor(COLOR_BG)
           .backgroundColor(COLOR_ACCENT)
           .borderRadius(8)
+          .enabled(!this.settingsSaving)
           .onClick(() => {
             this.saveSettings();
           })
+
+        Text(this.appVersion)
+          .width('100%')
+          .textAlign(TextAlign.Center)
+          .fontSize(10)
+          .fontColor(COLOR_MUTED)
       }
       .width('100%')
       .padding({ left: 16, right: 16, top: 16, bottom: 28 })
@@ -961,6 +1310,22 @@ struct Index {
   }
 
   @Builder
+  private ControllerLoadingState() {
+    Column({ space: 10 }) {
+      LoadingProgress()
+        .width(30)
+        .height(30)
+        .color(COLOR_ACCENT)
+      Text('正在读取安全设置')
+        .fontSize(13)
+        .fontColor(COLOR_MUTED)
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .justifyContent(FlexAlign.Center)
+  }
+
+  @Builder
   private ConversationLoadingState() {
     Column({ space: 10 }) {
       LoadingProgress()
@@ -1107,11 +1472,19 @@ struct Index {
               .fontSize(10)
               .fontWeight(FontWeight.Medium)
               .fontColor(COLOR_MUTED)
-            Text(message.thinking)
+            ForEach(this.thinkingLines(message.thinking), (line: string) => {
+              Row({ space: 7 }) {
+                Circle({ width: 4, height: 4 })
+                  .fill(COLOR_ACCENT)
+                Text(line)
+                  .fontSize(11)
+                  .lineHeight(17)
+                  .fontColor(COLOR_TEXT)
+                  .layoutWeight(1)
+              }
               .width('100%')
-              .fontSize(11)
-              .lineHeight(17)
-              .fontColor(COLOR_TEXT)
+              .alignItems(VerticalAlign.Top)
+            }, (line: string, index: number) => String(index) + '-' + line)
           }
           .width('100%')
         } else if (message.pending && message.activities.length === 0) {
@@ -1178,6 +1551,33 @@ struct Index {
             }
             .width('100%')
           }
+          if (message.role === 'assistant' && message.text.length > 0 && !message.pending) {
+            Row() {
+              Blank()
+              Button({ type: ButtonType.Circle }) {
+                if (message.replaying) {
+                  SymbolGlyph($r('sys.symbol.square_fill'))
+                    .fontSize(17)
+                    .fontColor([COLOR_DANGER])
+                } else {
+                  SymbolGlyph($r('sys.symbol.speaker_wave_2'))
+                    .fontSize(17)
+                    .fontColor([COLOR_ACCENT])
+                }
+              }
+              .width(30)
+              .height(30)
+              .backgroundColor(message.replaying ? '#311A20' : '#1C2033')
+              .enabled(this.controller.canReplayMessage(message))
+              .opacity(this.controller.canReplayMessage(message) ? 1 : 0.45)
+              .accessibilityText(message.replaying ? '停止重读这条消息' : '重新朗读这条消息')
+              .onClick(() => {
+                this.controller.replayMessage(message);
+              })
+            }
+            .width('100%')
+            .height(30)
+          }
         }
         .width('92%')
         .padding(12)
@@ -1210,85 +1610,6 @@ struct Index {
     .onScroll(() => {
       this.lastMessageListAtEnd = this.isMessageListNearBottom();
     })
-  }
-
-  @Builder
-  private ApprovalPanel() {
-    if (this.snapshot.approvalPending) {
-      Column({ space: 8 }) {
-        Text('需要确认')
-          .fontSize(14)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(COLOR_TEXT)
-        Text(this.snapshot.approvalDescription)
-          .fontSize(12)
-          .fontColor(COLOR_TEXT)
-        if (this.snapshot.approvalCommand.length > 0) {
-          Text(this.snapshot.approvalCommand)
-            .fontSize(11)
-            .fontColor(COLOR_MUTED)
-            .padding(8)
-            .backgroundColor(COLOR_BG)
-            .borderRadius(6)
-        }
-        Row({ space: 8 }) {
-          Button('阻止执行', { type: ButtonType.Normal })
-            .layoutWeight(1)
-            .height(38)
-            .fontSize(12)
-            .fontColor(COLOR_TEXT)
-            .backgroundColor(COLOR_BG)
-            .border({ width: 1, color: COLOR_LINE })
-            .onClick(() => {
-              this.controller.respondApproval(false);
-            })
-          Button('允许执行', { type: ButtonType.Normal })
-            .layoutWeight(1)
-            .height(38)
-            .fontSize(12)
-            .fontColor(COLOR_BG)
-            .backgroundColor(COLOR_SUCCESS)
-            .onClick(() => {
-              this.controller.respondApproval(true);
-            })
-        }
-      }
-      .width('100%')
-      .padding(12)
-      .backgroundColor('#2A2023')
-      .border({ width: 1, color: COLOR_DANGER })
-      .borderRadius(10)
-      .margin({ left: 16, right: 16, bottom: 10 })
-    }
-  }
-
-  @Builder
-  private ClarifyPanel() {
-    if (this.snapshot.clarifyPending) {
-      Column({ space: 8 }) {
-        Text(this.snapshot.clarifyQuestion)
-          .fontSize(13)
-          .fontColor(COLOR_TEXT)
-        ForEach(this.snapshot.clarifyChoices, (choice: string) => {
-          Button(choice, { type: ButtonType.Normal })
-            .width('100%')
-            .height(38)
-            .fontSize(12)
-            .fontColor(COLOR_TEXT)
-            .backgroundColor(COLOR_BG)
-            .border({ width: 1, color: COLOR_LINE })
-            .onClick(() => {
-              this.controller.respondClarify(choice);
-            })
-        }, (choice: string) => choice)
-      }
-      .width('100%')
-      .padding(12)
-      .backgroundColor(COLOR_PANEL)
-      .border({ width: 1, color: COLOR_LINE })
-      .borderRadius(10)
-      .margin({ left: 16, right: 16, bottom: 10 })
-    }
   }
 
   @Builder
@@ -1460,7 +1781,9 @@ struct Index {
   build() {
     Column() {
       this.Header()
-      if (this.showSettings) {
+      if (!this.controllerReady) {
+        this.ControllerLoadingState()
+      } else if (this.showSettings) {
         this.SettingsPanel()
       } else if (this.showHistory) {
         this.HistoryPanel()
@@ -1473,8 +1796,6 @@ struct Index {
         } else {
           this.MessageList()
         }
-        this.ApprovalPanel()
-        this.ClarifyPanel()
         this.ErrorBanner()
         this.Composer()
       }

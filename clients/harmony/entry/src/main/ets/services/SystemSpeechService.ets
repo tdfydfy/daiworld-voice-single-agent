@@ -106,6 +106,8 @@ export class SystemSpeechService {
   private capture: PcmCapture = new PcmCapture();
   private recognizer?: speechRecognizer.SpeechRecognitionEngine;
   private tts?: textToSpeech.TextToSpeechEngine;
+  private activeTtsRequestId: string = '';
+  private ttsRequestGeneration: number = 0;
   private recognitionSessionId: string = '';
   private recognitionSessionReady: boolean = false;
   private recognitionSessionAudioBytes: number = 0;
@@ -220,6 +222,7 @@ export class SystemSpeechService {
     }
     const normalizedRate = Math.max(0.5, Math.min(2, speechRate));
     const requestId = this.makeId('tts');
+    const requestGeneration = this.ttsRequestGeneration;
     hilog.info(
       SPEECH_LOG_DOMAIN,
       SPEECH_LOG_TAG,
@@ -231,9 +234,13 @@ export class SystemSpeechService {
     );
     try {
       const engine = await this.ensureTts(person);
+      if (requestGeneration !== this.ttsRequestGeneration) {
+        return;
+      }
       const extraParams: Record<string, Object> = {
         'speed': normalizedRate
       };
+      this.activeTtsRequestId = requestId;
       engine.speak(normalized, {
         requestId: requestId,
         extraParams: extraParams
@@ -251,6 +258,7 @@ export class SystemSpeechService {
   }
 
   stopSpeaking(): void {
+    this.ttsRequestGeneration += 1;
     if (!this.tts) {
       return;
     }
@@ -263,6 +271,7 @@ export class SystemSpeechService {
   }
 
   async release(): Promise<void> {
+    this.ttsRequestGeneration += 1;
     await this.stopRecognition(false);
     this.releaseRecognizer();
     if (this.tts) {
@@ -270,6 +279,7 @@ export class SystemSpeechService {
       this.tts = undefined;
       this.ttsPerson = -1;
     }
+    this.activeTtsRequestId = '';
     this.callbacks.onSpeechState(false);
   }
 
@@ -492,6 +502,9 @@ export class SystemSpeechService {
     hilog.info(SPEECH_LOG_DOMAIN, SPEECH_LOG_TAG, 'TTS engine created person=%{public}d', person);
     engine.setListener({
       onStart: (requestId: string, response: textToSpeech.StartResponse): void => {
+        if (this.activeTtsRequestId !== requestId) {
+          return;
+        }
         hilog.info(
           SPEECH_LOG_DOMAIN,
           SPEECH_LOG_TAG,
@@ -503,6 +516,9 @@ export class SystemSpeechService {
         this.callbacks.onSpeechState(true);
       },
       onComplete: (requestId: string, response: textToSpeech.CompleteResponse): void => {
+        if (this.activeTtsRequestId !== requestId) {
+          return;
+        }
         hilog.info(
           SPEECH_LOG_DOMAIN,
           SPEECH_LOG_TAG,
@@ -515,6 +531,9 @@ export class SystemSpeechService {
         }
       },
       onStop: (requestId: string, response: textToSpeech.StopResponse): void => {
+        if (this.activeTtsRequestId !== requestId) {
+          return;
+        }
         hilog.info(
           SPEECH_LOG_DOMAIN,
           SPEECH_LOG_TAG,
@@ -525,6 +544,9 @@ export class SystemSpeechService {
         this.callbacks.onSpeechState(false);
       },
       onError: (requestId: string, errorCode: number, errorMessage: string): void => {
+        if (this.activeTtsRequestId !== requestId) {
+          return;
+        }
         hilog.error(
           SPEECH_LOG_DOMAIN,
           SPEECH_LOG_TAG,

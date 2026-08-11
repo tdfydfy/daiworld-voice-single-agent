@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import tempfile
 import threading
 import time
 from typing import Callable, Iterable
@@ -43,7 +44,7 @@ class ArtifactRegistry:
     ) -> None:
         self.ttl_seconds = float(ttl_seconds)
         self.clock = clock
-        configured_roots = allowed_roots if allowed_roots is not None else ("/tmp",)
+        configured_roots = allowed_roots if allowed_roots is not None else (tempfile.gettempdir(),)
         self.allowed_roots = tuple(Path(root).expanduser().resolve() for root in configured_roots)
         self.max_bytes = int(max_bytes)
         self._items: dict[str, _Artifact] = {}

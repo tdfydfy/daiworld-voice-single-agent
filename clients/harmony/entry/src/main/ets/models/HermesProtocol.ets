@@ -41,6 +41,14 @@ export interface SessionInfo {
   profile_name?: string;
 }
 
+export interface AssistantMessagePayload {
+  text?: string;
+  rendered?: string;
+  speech_text?: string;
+  artifacts?: Object[];
+  model?: string;
+}
+
 export interface ToolStep {
   tool_id?: string;
   name?: string;

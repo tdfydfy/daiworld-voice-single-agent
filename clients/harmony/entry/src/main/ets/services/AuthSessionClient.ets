@@ -8,6 +8,9 @@ import { http } from '@kit.NetworkKit';
 export class AuthSessionResult {
   cookie: string = '';
   error: string = '';
+  statusCode: number = 0;
+  unauthorized: boolean = false;
+  retryable: boolean = false;
 }
 
 export class AuthSessionClient {
@@ -32,8 +35,11 @@ export class AuthSessionClient {
           readTimeout: 15000
         }
       );
+      result.statusCode = response.responseCode;
       if (response.responseCode !== 200) {
-        result.error = response.responseCode === 401
+        result.unauthorized = response.responseCode === 401 || response.responseCode === 403;
+        result.retryable = response.responseCode >= 500;
+        result.error = result.unauthorized
           ? '访问口令错误，请填写服务器的 VOICE_ACCESS_TOKEN'
           : '网关返回 HTTP ' + String(response.responseCode);
         return result;
@@ -45,6 +51,7 @@ export class AuthSessionClient {
       return result;
     } catch (error) {
       result.error = '无法连接网关';
+      result.retryable = true;
       return result;
     } finally {
       request.destroy();

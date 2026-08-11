@@ -1,6 +1,6 @@
 # Daiworld Voice Single-Agent HarmonyOS 客户端
 
-这是单 Agent Hermes 协议的原生 HarmonyOS 客户端，和仓库中的主持人多 Agent 客户端分开维护。客户端只连接一个 Profile，使用同一套 Adapter 的 JSON-RPC、连续 ASR 和流式 TTS 接口。
+这是单 Agent Hermes 协议的原生 HarmonyOS 客户端，和仓库中的主持人多 Agent 客户端分开维护。客户端每次连接一个由 Adapter Catalog 返回的 Agent ID，使用同一套 JSON-RPC、连续 ASR 和流式 TTS 接口。HarmonyOS 是最终移动交付面，Web Native 仅用于技术预览和协议验证。
 
 ## 环境
 
@@ -37,15 +37,21 @@ $env:HERMES_DASHBOARD_SESSION_TOKEN = 'Hermes 内部口令'
 python -m uvicorn app.native_main:app --host 0.0.0.0 --port 8844
 ```
 
-在应用设置中填写 Adapter 的基地址，例如 `https://example.com/voice-native`，再填写对应的访问口令和 Profile。长期访问口令只用于前置 HTTP 会话换取，WebSocket 只发送短期 `voice_session` Cookie。
+在应用设置中填写 Adapter 的基地址，例如 `https://example.com/voice-native`，再填写对应的访问口令；Agent 选择器会从 `/api/agents` 动态加载目录。长期访问口令只用于前置 HTTP 请求换取，WebSocket 只发送短期 `voice_session` Cookie。
 
-设置页还可以选择鸿蒙离线语音或远端语音。鸿蒙离线模式支持选择系统返回的音色，并将音色和 `0.5x` 到 `2.0x` 的朗读语速长期保存在设备 Preferences 中；远端模式的音色由服务器 TTS 配置决定。关闭设置页不会写入草稿或重连，只有网关地址、访问口令或 Profile 发生变化时才会重建网关连接。
+设置页还可以切换当前 Hermes Session 的 Provider / 模型，并选择鸿蒙离线语音或远端语音。模型列表由 Adapter 的 `/api/hermes/model/options` 受控返回，切换使用 `config.set(... --session)`，不会写回 Agent 默认配置、重建对话或重连语音；界面等待 `session.info` 后才显示已确认。鸿蒙离线模式支持选择系统返回的音色，并将音色和 `0.5x` 到 `2.0x` 的朗读语速长期保存在设备 Preferences 中；远端模式的音色由服务器 TTS 配置决定。关闭设置页不会写入草稿或重连，只有网关地址、访问口令或 Agent 发生变化时才会重建网关连接。
+
+Hermes 的审批和澄清请求直接进入消息流，不显示独立卡片。审批气泡保留完整风险命令，只接受精确的“同意 / 取消”等固定回复；澄清气泡列出编号选项并接受下一条实际回答。两类回复都走 Hermes 专用响应方法，不会再次触发 Agent Prompt。模型设置优先显示 Adapter 返回的具体 Provider 标识，例如 `open1` 或 `waw`，不把通用的 `custom` / `OPENAIAPI` 当成部署名称。
 
 ## 鸿蒙离线 ASR 边界
 
 CoreSpeechKit 当前使用离线短句识别。真机上单个识别 session 最长约 20 秒，持续静音约 10 秒也会结束。客户端会复用同一个 `SpeechRecognitionEngine`，只轮换 session ID，并在约 150 ms 后继续监听，因此长时间开启语音不会在每轮重建引擎时留下数秒空档。不过，一次连续发言超过单 session 上限时仍会被拆成多段提交，而不是合并成一个无限长的听写结果。
 
 语音后端选择是显式配置。选择鸿蒙离线语音后，CoreSpeech 启动或运行失败只会停止对应的本地语音路径并报告错误，不会自动连接远端 ASR/TTS；只有用户在设置页明确选择远端语音时才会建立远端语音连接。
+
+## 远端 ASR/TTS 恢复
+
+远端语音 WebSocket 意外断开后，客户端按 `250 / 750 / 1500 / 3000 ms` 封顶退避重连，连接成功后重置退避。ASR 在断线和等待 Provider `ready` 期间保留最近 4 个 PCM 块（约 0.8 秒），普通 final 在约 1.1 秒窗口内合并；连接从开始到 `ready` 超过 10 秒会主动进入下一轮恢复。TTS 的文本和 `done` 帧严格按队列顺序发送，失败帧保留到重连后继续；已收到的 PCM 会先排空。暂停收音、静音、切换到鸿蒙离线语音或主动断开会取消对应重连，`停止` 和显式关闭仍会清空待播任务。
 
 全双工音频统一声明为鸿蒙语音通信场景。PCM 采集固定使用 `SOURCE_TYPE_VOICE_COMMUNICATION`，应用自管的 PCM 播放使用 `STREAM_USAGE_VOICE_COMMUNICATION`，并共享 `AUDIO_SESSION_SCENE_VOICE_COMMUNICATION`。客户端无配件时默认 `EARPIECE`，耳机接入时回到系统默认的耳机路由；输出按钮可以显式切到 `SPEAKER`，再次点击则回到当前系统私密路由。界面监听系统首选输出，按实际路由显示听筒、扬声器或耳机。蓝牙 SCO、NearLink、有线和 USB 设备的实际选择及无输入设备时的手机麦克风回退仍由 HarmonyOS 管理。客户端不调用 `selectMediaInputDevice()`，不再根据输出设备推断输入设备，也不因正常插拔重建 `AudioCapturer`。`inputDeviceChange` 仅用于刷新手机或耳机麦克风标签和记录诊断日志。短提示音不持有通信 Session，避免麦克风关闭后反复切换 A2DP/SCO。STT 和 TTS 保持并行；用户开口后只停止旧播报，不停止或重建识别 session。客户端不叠加 RMS 声音阈值，以免截断轻声发言。外放回声消除和双讲识别的实际效果仍取决于设备系统实现。
 
@@ -55,7 +61,7 @@ CoreSpeechKit 当前使用离线短句识别。真机上单个识别 session 最
 
 1. 通过 `node scripts/verify.mjs`，确认单 Agent 路由和权限没有回退到主持人协议。
 2. 在真机上验证前台文字、连续 ASR、TTS 排空、审批拒绝/允许、网络断开恢复和麦克风权限拒绝。
-3. 确认公网 Adapter 的 HTTPS 证书、WSS 反代、`VOICE_ACCESS_TOKEN` 和三个 Hermes Profile 均可用。
+3. 确认公网 Adapter 的 HTTPS 证书、WSS 反代、`VOICE_ACCESS_TOKEN` 和 Agent Catalog 中的 Hermes 后端均可用。
 4. 在 DevEco Studio 中使用发行签名构建 HAP，再通过 AppGallery Connect 创建版本、上传 HAP、填写隐私与权限说明并提交审核。
 
 真机和 AppGallery Connect 的签名、上传、审核需要开发者账号授权，不能由本地源码或 CI 自动替代。

@@ -15,14 +15,21 @@ import {
   MessageArtifact,
   MessageActivity,
   MessageRole,
-  ProfileInfo,
+  AgentCatalog,
+  AgentInfo,
+  ModelOptionInfo,
+  ModelProviderInfo,
   ProfileKey,
   SingleAgentSnapshot,
   SpeechBackend
 } from '../models/SingleAgentState';
 import { AuthSessionClient } from './AuthSessionClient';
+import { AgentCatalogClient } from './AgentCatalogClient';
+import { ModelOptionsCatalog, ModelOptionsClient } from './ModelOptionsClient';
 import { GatewayListener, HermesGatewayClient } from './HermesGatewayClient';
 import { HermesSessionDetailClient } from './HermesSessionDetailClient';
+import { SecureTokenStore } from './SecureTokenStore';
+import { SpeechTextFilter } from './SpeechTextFilter';
 import { AudioCuePlayer } from './AudioCuePlayer';
 import {
   PcmCapture,
@@ -40,7 +47,9 @@ import {
 } from './SystemSpeechService';
 
 const STOP_PHRASES: string[] = ['停止', 'stop'];
-const CLOSE_MIC_PHRASES: string[] = ['闭麦', '关闭麦克风', '关闭话筒'];
+const CLOSE_MIC_PHRASES: string[] = ['关闭话筒', '关闭麦克风', '关闭microphone', '暂停收音'];
+const APPROVAL_ALLOW_PHRASES: string[] = ['同意', '允许', '可以', '执行', '允许执行', '同意执行'];
+const APPROVAL_DENY_PHRASES: string[] = ['取消', '拒绝', '阻止', '不要', '拒绝执行', '阻止执行'];
 export const DEFAULT_GATEWAY_URL = 'https://voice.daiworld.cc.cd/voice-native';
 const SETTINGS_FILE = 'single_agent_settings';
 const SYSTEM_TTS_FIRST_MIN = 20;
@@ -53,6 +62,12 @@ const SYSTEM_TTS_HARD_MAX = 300;
 const SYSTEM_TTS_HARD_BOUNDARIES = '。！？；.!?;\n';
 const SYSTEM_TTS_SOFT_BOUNDARIES = '，、：,: ';
 const SYSTEM_ASR_STARTUP_TIMEOUT_MS = 15000;
+const ASR_FINALIZATION_GRACE_MS = 1100;
+const REMOTE_VOICE_RECONNECT_DELAYS_MS: number[] = [250, 750, 1500, 3000];
+const GATEWAY_RECONNECT_DELAYS_MS: number[] = [500, 1500, 3000, 5000];
+const GATEWAY_RECONNECT_MAX_ATTEMPTS = 6;
+const GATEWAY_READY_TIMEOUT_MS = 10000;
+const MODEL_SWITCH_CONFIRM_TIMEOUT_MS = 10000;
 const CONTROLLER_LOG_DOMAIN = 0xD004;
 const CONTROLLER_LOG_TAG = 'SingleAgentControl';
 
@@ -177,6 +192,9 @@ export class SingleAgentController {
   private asr: StreamingAsrClient = new StreamingAsrClient();
   private tts: StreamingTtsClient = new StreamingTtsClient();
   private auth: AuthSessionClient = new AuthSessionClient();
+  private agentCatalogClient: AgentCatalogClient = new AgentCatalogClient();
+  private agentCatalog: AgentCatalog = new AgentCatalog();
+  private modelOptionsClient: ModelOptionsClient = new ModelOptionsClient();
   private sessionDetail: HermesSessionDetailClient = new HermesSessionDetailClient();
   private capture: PcmCapture = new PcmCapture();
   private player: PcmPlayer = new PcmPlayer();
@@ -185,6 +203,10 @@ export class SingleAgentController {
   private listener?: SnapshotListener;
   private context?: common.UIAbilityContext;
   private settings?: preferences.Preferences;
+  private secureTokenStore: SecureTokenStore = new SecureTokenStore();
+  private configPersistence: Promise<void> = Promise.resolve();
+  private persistedAccessToken: string = '';
+  private queuedAccessToken: string = '';
   private snapshot: SingleAgentSnapshot = new SingleAgentSnapshot();
   private config: ClientConfig = {
     gatewayUrl: DEFAULT_GATEWAY_URL,
@@ -207,6 +229,11 @@ export class SingleAgentController {
   private messageCounter: number = 0;
   private activeAssistantMessageId: string = '';
   private activeAsrMessageId: string = '';
+  private activeReplayMessageId: string = '';
+  private replayAwaitingSystemStart: boolean = false;
+  private replayGeneration: number = 0;
+  private replayCleanup: Promise<void> = Promise.resolve();
+  private replayCleanupActive: boolean = false;
   private discardInterruptedTurnEvents: boolean = false;
   private replacementPromptSubmitted: boolean = false;
   private useSystemSpeech: boolean = false;
@@ -222,19 +249,42 @@ export class SingleAgentController {
   private systemSpeechPendingText: string = '';
   private systemSpeechReceivedText: string = '';
   private systemSpeechFirstChunkQueued: boolean = false;
+  private speechTextFilter: SpeechTextFilter = new SpeechTextFilter();
   private backgroundTaskRunning: boolean = false;
   private backgroundTaskStarting: boolean = false;
   private backgroundTaskStopping: boolean = false;
   private stopBackgroundTaskAfterStart: boolean = false;
   private lastCueError: string = '';
   private outputRouteInitialized: boolean = false;
+  private modelSwitchTimeout?: number;
+  private modelSwitchSequence: number = 0;
+  private modelOptionsSequence: number = 0;
+  private requestedModelProvider: string = '';
+  private requestedModel: string = '';
+  private modelBeforeSwitch: string = '';
+  private approvalResponseInFlight: boolean = false;
+  private clarifyResponseInFlight: boolean = false;
+  private asrFinalizationTimer?: number;
+  private asrPendingFinalText: string = '';
+  private asrLatestInterimText: string = '';
+  private remoteAsrReconnectTimer?: number;
+  private remoteAsrReconnectAttempt: number = 0;
+  private remoteTtsReconnectTimer?: number;
+  private remoteTtsReconnectAttempt: number = 0;
+  private remoteTtsDrainPending: boolean = false;
+  private gatewayReconnectTimer?: number;
+  private gatewayReconnectAttempt: number = 0;
+  private gatewayReconnectInFlight: boolean = false;
+  private gatewayReconnectBlocked: boolean = false;
+  private gatewayConnectGeneration: number = 0;
+  private gatewayReadyTimeout?: number;
 
   setListener(listener: SnapshotListener): void {
     this.listener = listener;
     this.notify();
   }
 
-  setContext(context: common.UIAbilityContext): void {
+  async setContext(context: common.UIAbilityContext): Promise<void> {
     this.context = context;
     this.systemSpeech = new SystemSpeechService(context, new SystemSpeechCallbacks(
       (active: boolean): void => {
@@ -260,10 +310,10 @@ export class SingleAgentController {
       }
     ));
     const capabilities = this.systemSpeech.getCapabilities();
+    let token = '';
     try {
       this.settings = preferences.getPreferencesSync(context, { name: SETTINGS_FILE });
       const gateway = this.settings.getSync('gatewayUrl', DEFAULT_GATEWAY_URL);
-      const token = this.settings.getSync('accessToken', '');
       const profile = this.settings.getSync('profile', 'default');
       const muted = this.settings.getSync('muted', false);
       const speakerphoneEnabled = this.settings.getSync('speakerphoneEnabled', false);
@@ -271,9 +321,14 @@ export class SingleAgentController {
       const speechBackend = this.settings.getSync('speechBackend', 'harmony_offline');
       const voicePerson = this.settings.getSync('voicePerson', 0);
       const speechRate = this.settings.getSync('speechRate', 1);
+      try {
+        token = await this.secureTokenStore.load(this.settings);
+      } catch (error) {
+        this.snapshot.error = '已保存的访问口令无法从安全存储读取，请重新输入';
+      }
       this.config = {
         gatewayUrl: typeof gateway === 'string' ? this.normalizeGatewayUrl(gateway) : DEFAULT_GATEWAY_URL,
-        accessToken: typeof token === 'string' ? token : '',
+        accessToken: token,
         profile: this.profileFromValue(profile),
         muted: muted === true,
         speakerphoneEnabled: speakerphoneEnabled === true,
@@ -282,6 +337,8 @@ export class SingleAgentController {
         voicePerson: typeof voicePerson === 'number' ? voicePerson : 0,
         speechRate: this.normalizeSpeechRate(typeof speechRate === 'number' ? speechRate : 1)
       };
+      this.persistedAccessToken = token;
+      this.queuedAccessToken = token;
       this.snapshot.selectedProfile = this.config.profile;
     } catch (error) {
       this.settings = undefined;
@@ -294,6 +351,7 @@ export class SingleAgentController {
       this.onOutputRouteChanged(route, headsetAvailable);
     });
     setCommunicationSpeakerphoneEnabled(this.config.speakerphoneEnabled).catch(() => undefined);
+    this.notify();
   }
 
   getConfig(): ClientConfig {
@@ -354,6 +412,115 @@ export class SingleAgentController {
     return this.systemSpeech.listVoices();
   }
 
+  waitForConfigPersistence(): Promise<void> {
+    return this.configPersistence;
+  }
+
+  loadModelOptions(): void {
+    if (this.snapshot.modelOptionsLoading) {
+      return;
+    }
+    if (this.config.accessToken.length === 0) {
+      this.snapshot.modelProviders = [];
+      this.snapshot.modelOptionsError = '请先保存访问口令';
+      this.notify();
+      return;
+    }
+    this.snapshot.modelOptionsLoading = true;
+    this.snapshot.modelProviders = [];
+    this.snapshot.modelOptionsError = '';
+    const sequence = ++this.modelOptionsSequence;
+    const profile = this.config.profile;
+    this.notify();
+    this.modelOptionsClient.fetch(
+      this.config.gatewayUrl,
+      this.config.accessToken,
+      profile
+    ).then((catalog: ModelOptionsCatalog): void => {
+      if (sequence !== this.modelOptionsSequence || profile !== this.config.profile) {
+        return;
+      }
+      const providers = catalog.providers;
+      this.snapshot.modelProviders = providers;
+      this.snapshot.modelOptionsLoading = false;
+      this.snapshot.modelOptionsError = providers.length > 0 ? '' : '服务器暂未返回可用模型';
+      this.reconcileRuntimeProvider(catalog);
+      this.notify();
+    }).catch((error: BusinessError): void => {
+      if (sequence !== this.modelOptionsSequence || profile !== this.config.profile) {
+        return;
+      }
+      this.snapshot.modelProviders = [];
+      this.snapshot.modelOptionsLoading = false;
+      this.snapshot.modelOptionsError = this.errorMessage(error, '模型列表加载失败');
+      this.notify();
+    });
+  }
+
+  switchRuntimeModel(providerId: string, modelId: string): void {
+    if (this.snapshot.modelSwitching) {
+      return;
+    }
+    if (this.snapshot.connection !== 'online' || this.snapshot.runtimeSessionId.length === 0) {
+      this.snapshot.modelSwitchError = '当前会话尚未连接';
+      this.notify();
+      return;
+    }
+    if (this.snapshot.agentBusy) {
+      this.snapshot.modelSwitchError = '请等待当前任务结束后再切换模型';
+      this.notify();
+      return;
+    }
+    const provider = this.snapshot.modelProviders.find(
+      (item: ModelProviderInfo): boolean => item.id === providerId
+    );
+    const model = provider?.models.find((item: ModelOptionInfo): boolean => item.id === modelId);
+    if (provider === undefined || model === undefined ||
+      !this.isSafeConfigAtom(provider.id) || !this.isSafeConfigAtom(model.id)) {
+      this.snapshot.modelSwitchError = '请选择有效的 Provider 和模型';
+      this.notify();
+      return;
+    }
+    this.clearModelSwitchTimeout();
+    const sequence = ++this.modelSwitchSequence;
+    this.requestedModelProvider = provider.id;
+    this.requestedModel = model.id;
+    this.modelBeforeSwitch = this.snapshot.runtimeModel;
+    this.snapshot.modelSwitching = true;
+    this.snapshot.modelSwitchStatus = '正在提交当前会话配置';
+    this.snapshot.modelSwitchError = '';
+    this.notify();
+    this.modelSwitchTimeout = setTimeout((): void => {
+      this.modelSwitchTimeout = undefined;
+      if (sequence !== this.modelSwitchSequence || !this.snapshot.modelSwitching) {
+        return;
+      }
+      this.snapshot.modelSwitching = false;
+      this.snapshot.modelSwitchStatus = '';
+      this.snapshot.modelSwitchError = 'Hermes 未返回 session.info，仍显示上次已确认的运行配置';
+      this.resetRequestedModel();
+      this.notify();
+    }, MODEL_SWITCH_CONFIRM_TIMEOUT_MS);
+    const value = model.id + ' --provider ' + provider.id + ' --session';
+    this.gateway.setConfig('model', value).then((): void => {
+      if (sequence !== this.modelSwitchSequence || !this.snapshot.modelSwitching) {
+        return;
+      }
+      this.snapshot.modelSwitchStatus = '切换请求已提交，等待 Hermes 确认';
+      this.notify();
+    }).catch((error: BusinessError): void => {
+      if (sequence !== this.modelSwitchSequence || !this.snapshot.modelSwitching) {
+        return;
+      }
+      this.clearModelSwitchTimeout();
+      this.snapshot.modelSwitching = false;
+      this.snapshot.modelSwitchStatus = '';
+      this.snapshot.modelSwitchError = this.errorMessage(error, '模型切换失败');
+      this.resetRequestedModel();
+      this.notify();
+    });
+  }
+
   setConfig(config: ClientConfig): boolean {
     const gatewayUrl = this.normalizeGatewayUrl(config.gatewayUrl);
     const connectionChanged = gatewayUrl !== this.config.gatewayUrl ||
@@ -377,6 +544,12 @@ export class SingleAgentController {
     this.snapshot.selectedProfile = this.config.profile;
     this.snapshot.speakerphoneEnabled = this.config.speakerphoneEnabled;
     this.snapshot.debugMode = this.config.debugMode;
+    if (connectionChanged) {
+      this.clearModelOptions();
+      this.cancelModelSwitch('');
+      this.snapshot.modelSwitchStatus = '';
+      this.snapshot.modelSwitchError = '';
+    }
     this.persistConfig();
     this.notify();
     if (speakerphoneChanged) {
@@ -433,6 +606,9 @@ export class SingleAgentController {
     }
     if (this.isStopPhrase(value)) {
       this.interrupt(value);
+      return true;
+    }
+    if (this.consumePendingProtocolReply(value, existingMessage)) {
       return true;
     }
     if (this.snapshot.connection !== 'online' || this.snapshot.runtimeSessionId.length === 0) {
@@ -524,17 +700,21 @@ export class SingleAgentController {
   toggleMute(): void {
     this.config.muted = !this.config.muted;
     if (this.config.muted) {
+      this.cancelRemoteTtsReconnect();
       this.tts.sendStop();
       this.systemSpeech?.stopSpeaking();
       this.player.stop().catch(() => undefined);
       this.clearSystemSpeechQueue();
       this.snapshot.playback = 'none';
+    } else if (!this.useSystemSpeech && this.voiceOutputEnabled) {
+      this.startRemoteVoiceClients();
     }
     this.notify();
   }
 
   newConversation(): void {
     this.pausedForUser = false;
+    this.cancelAsrFinalization();
     this.resetInterruptedTurnGuard();
     this.tts.sendStop();
     this.systemSpeech?.stopSpeaking();
@@ -548,8 +728,7 @@ export class SingleAgentController {
     this.snapshot.storedSessionId = '';
     this.snapshot.runtimeSessionId = '';
     this.snapshot.conversationLoading = false;
-    this.snapshot.approvalPending = false;
-    this.snapshot.clarifyPending = false;
+    this.clearPendingProtocolRequests();
     if (this.snapshot.connection === 'online') {
       this.gateway.createSession(100).then((result: Object) => {
         this.onSessionCreated(result);
@@ -562,32 +741,78 @@ export class SingleAgentController {
     if (this.snapshot.connection === 'connecting' || this.snapshot.connection === 'online') {
       return;
     }
+    this.cancelGatewayReconnect();
+    this.gatewayReconnectBlocked = false;
+    const generation = ++this.gatewayConnectGeneration;
+    await this.connectGateway(false, generation);
+  }
+
+  private async connectGateway(reconnecting: boolean, generation: number): Promise<void> {
+    if (this.snapshot.connection === 'online' ||
+      (!reconnecting && this.snapshot.connection === 'connecting')) {
+      return;
+    }
     this.voiceOutputEnabled = true;
     this.snapshot.connection = 'connecting';
-    this.snapshot.statusTitle = '正在连接';
+    this.snapshot.statusTitle = reconnecting ? '正在恢复连接' : '正在连接';
     this.snapshot.error = '';
+    this.snapshot.agentsLoading = true;
+    this.snapshot.agentsError = '';
     this.notify();
     try {
       const authResult = await this.auth.acquireSessionCookie(this.config.gatewayUrl, this.config.accessToken);
+      if (generation !== this.gatewayConnectGeneration || this.gatewayReconnectBlocked) {
+        this.gatewayReconnectInFlight = false;
+        return;
+      }
       if (authResult.cookie.length === 0) {
+        this.gatewayReconnectInFlight = false;
         this.snapshot.connection = 'offline';
+        this.snapshot.agentsLoading = false;
         this.snapshot.error = authResult.error.length > 0
           ? authResult.error
           : '鉴权失败，请检查网关地址和访问口令';
+        if (authResult.unauthorized) {
+          this.gatewayReconnectBlocked = true;
+        } else if (authResult.retryable) {
+          this.scheduleGatewayReconnect(this.snapshot.error);
+        }
         this.notify();
         return;
       }
       this.cookie = authResult.cookie;
+      if (!await this.loadAgentCatalog(generation)) {
+        this.gatewayReconnectInFlight = false;
+        if (this.snapshot.agentsError.length > 0) {
+          this.scheduleGatewayReconnect(this.snapshot.error);
+          this.notify();
+        }
+        return;
+      }
+      if (generation !== this.gatewayConnectGeneration || this.gatewayReconnectBlocked) {
+        this.gatewayReconnectInFlight = false;
+        return;
+      }
       this.openGateway();
+      this.gatewayReconnectInFlight = false;
     } catch (error) {
       this.snapshot.connection = 'offline';
       this.snapshot.error = '连接失败';
+      this.snapshot.agentsLoading = false;
+      this.gatewayReconnectInFlight = false;
+      this.scheduleGatewayReconnect(this.snapshot.error);
       this.notify();
     }
   }
 
   disconnect(): void {
+    this.gatewayReconnectBlocked = true;
+    this.gatewayConnectGeneration += 1;
+    this.cancelGatewayReconnect();
+    this.clearGatewayReadyTimeout();
     this.resetInterruptedTurnGuard();
+    this.cancelModelSwitch('');
+    this.cancelRemoteVoiceReconnects();
     this.stopVoice();
     this.gateway.close();
     this.asr.close();
@@ -595,13 +820,13 @@ export class SingleAgentController {
     this.snapshot.connection = 'offline';
     this.snapshot.runtimeSessionId = '';
     this.snapshot.conversationLoading = false;
+    this.clearPendingProtocolRequests();
     this.notify();
   }
 
   // Exact-stop phrase: only these interrupt the current agent turn.
   private isStopPhrase(text: string): boolean {
-    const normalized = text.trim().toLowerCase()
-      .replace(/^[\s"'“”‘’.,!?;:，。！？；：、]+|[\s"'“”‘’.,!?;:，。！？；：、]+$/g, '');
+    const normalized = this.normalizeControlPhrase(text);
     for (const phrase of STOP_PHRASES) {
       if (normalized === phrase) {
         return true;
@@ -612,8 +837,7 @@ export class SingleAgentController {
 
   // Exact close-microphone phrase: stops input only, never interrupts work.
   private isCloseMicPhrase(text: string): boolean {
-    const normalized = text.trim().toLowerCase()
-      .replace(/^[\s"'“”‘’.,!?;:，。！？；：、]+|[\s"'“”‘’.,!?;:，。！？；：、]+$/g, '');
+    const normalized = this.normalizeControlPhrase(text);
     for (const phrase of CLOSE_MIC_PHRASES) {
       if (normalized === phrase) {
         return true;
@@ -622,9 +846,90 @@ export class SingleAgentController {
     return false;
   }
 
+  private normalizeControlPhrase(text: string): string {
+    return text.trim().toLowerCase().replace(/[\s\p{P}\p{S}]/gu, '');
+  }
+
+  private isApprovalAllowPhrase(text: string): boolean {
+    return APPROVAL_ALLOW_PHRASES.includes(this.normalizeControlPhrase(text));
+  }
+
+  private isApprovalDenyPhrase(text: string): boolean {
+    return APPROVAL_DENY_PHRASES.includes(this.normalizeControlPhrase(text));
+  }
+
   // Punctuation-only transcripts are dropped before they can reach Hermes.
   private hasSemanticContent(text: string): boolean {
     return /[\p{L}\p{N}]/u.test(String(text || ''));
+  }
+
+  private commitProtocolReply(value: string, label: string, existingMessage?: ChatMessage): void {
+    if (existingMessage !== undefined) {
+      existingMessage.text = value;
+      existingMessage.label = label;
+      existingMessage.status = 'submitted';
+      existingMessage.transient = false;
+      existingMessage.revision += 1;
+      this.activeAsrMessageId = '';
+      return;
+    }
+    const message = new ChatMessage();
+    message.id = this.nextMessageId();
+    message.role = 'user';
+    message.label = label;
+    message.text = value;
+    message.status = 'submitted';
+    message.timestamp = Date.now();
+    this.snapshot.messages.push(message);
+  }
+
+  private consumePendingProtocolReply(value: string, existingMessage?: ChatMessage): boolean {
+    if (this.snapshot.approvalPending) {
+      if (this.approvalResponseInFlight) {
+        this.discardAsrPreview();
+        this.snapshot.statusDetail = '审批回复正在提交';
+        this.notify();
+        return true;
+      }
+      const allow = this.isApprovalAllowPhrase(value);
+      const deny = this.isApprovalDenyPhrase(value);
+      if (allow || deny) {
+        this.commitProtocolReply(value, '你 · 审批回复', existingMessage);
+        this.stopProtocolPromptPlayback();
+        this.respondApproval(allow);
+        return true;
+      }
+      this.commitProtocolReply(value, '你 · 未识别为审批回复', existingMessage);
+      const reminder = '审批仍在等待，请只回复“同意”或“取消”。';
+      this.appendMessage('assistant', this.agentName(this.snapshot.selectedProfile), reminder);
+      this.replaceProtocolPromptSpeech(reminder);
+      return true;
+    }
+    if (this.snapshot.clarifyPending) {
+      if (this.clarifyResponseInFlight) {
+        this.discardAsrPreview();
+        this.snapshot.statusDetail = '补充回复正在提交';
+        this.notify();
+        return true;
+      }
+      this.commitProtocolReply(value, '你 · 补充回复', existingMessage);
+      this.stopProtocolPromptPlayback();
+      this.respondClarify(value);
+      return true;
+    }
+    return false;
+  }
+
+  private clearPendingProtocolRequests(): void {
+    this.approvalResponseInFlight = false;
+    this.clarifyResponseInFlight = false;
+    this.snapshot.approvalPending = false;
+    this.snapshot.approvalDescription = '';
+    this.snapshot.approvalCommand = '';
+    this.snapshot.clarifyPending = false;
+    this.snapshot.clarifyRequestId = '';
+    this.snapshot.clarifyQuestion = '';
+    this.snapshot.clarifyChoices = [];
   }
 
   private interrupt(displayText: string, existingMessage?: ChatMessage): void {
@@ -649,8 +954,7 @@ export class SingleAgentController {
     this.systemSpeech?.stopSpeaking();
     this.player.stop().catch(() => undefined);
     this.clearSystemSpeechQueue();
-    this.snapshot.approvalPending = false;
-    this.snapshot.clarifyPending = false;
+    this.clearPendingProtocolRequests();
     this.completeInterruptedAssistantMessage();
     this.snapshot.agentBusy = false;
     this.snapshot.playback = 'none';
@@ -672,43 +976,121 @@ export class SingleAgentController {
     this.interrupt('停止');
   }
 
-  // Replay one assistant message through the same output path the live turn uses.
+  canReplayMessage(message: ChatMessage): boolean {
+    const source = this.snapshot.messages.find((item: ChatMessage): boolean => item.id === message.id) || message;
+    if (source.replaying) {
+      return true;
+    }
+    return source.role === 'assistant' && !source.pending && !this.snapshot.agentBusy &&
+      !this.snapshot.asrUtteranceActive && this.voiceOutputEnabled && !this.config.muted &&
+      SpeechTextFilter.clean(source.text).length > 0;
+  }
+
+  // Replay one assistant message without creating a Hermes turn.
   replayMessage(message: ChatMessage): void {
-    if (message.role !== 'assistant' || message.text.trim().length === 0) {
+    const source = this.snapshot.messages.find((item: ChatMessage): boolean => item.id === message.id);
+    if (source === undefined) {
       return;
     }
-    if (message.replaying) {
+    if (source.replaying && this.activeReplayMessageId === source.id) {
+      this.stopMessageReplay();
       return;
     }
-    message.replaying = true;
-    message.revision += 1;
+    if (!this.canReplayMessage(source)) {
+      return;
+    }
+    const text = SpeechTextFilter.clean(source.text);
+    if (text.length === 0) {
+      return;
+    }
+    this.replayGeneration += 1;
+    const replayGeneration = this.replayGeneration;
+    this.clearActiveReplayState();
+    const cleanup = this.stopPlaybackForReplay();
+    this.activeReplayMessageId = source.id;
+    source.replaying = true;
+    source.revision += 1;
     this.snapshot.statusDetail = '正在重读这条消息';
+    this.snapshot.error = '';
+    this.snapshot.playback = 'queued';
     this.notify();
-    const text = message.text;
-    const finish = (): void => {
-      message.replaying = false;
-      message.revision += 1;
-      this.snapshot.statusDetail = '';
-      this.notify();
-    };
-    if (this.useSystemSpeech && this.systemSpeech !== undefined) {
-      this.systemSpeech.speak(text, this.config.voicePerson, this.config.speechRate)
-        .then((): void => {
-          this.onTtsJobEnded();
-          finish();
-        })
-        .catch((error: BusinessError): void => {
-          this.snapshot.error = this.errorMessage(error, '重读失败');
-          finish();
-        });
+    this.startReplayAfterCleanup(text, source.id, replayGeneration, cleanup);
+  }
+
+  private stopMessageReplay(): void {
+    this.replayGeneration += 1;
+    const replayGeneration = this.replayGeneration;
+    this.clearActiveReplayState();
+    const cleanup = this.stopPlaybackForReplay();
+    cleanup.then((): void => {
+      if (replayGeneration === this.replayGeneration) {
+        this.replayCleanupActive = false;
+      }
+    }).catch(() => undefined);
+    this.snapshot.statusDetail = '已停止重读';
+    this.notify();
+  }
+
+  private stopPlaybackForReplay(): Promise<void> {
+    this.pausedForUser = false;
+    this.replayCleanupActive = true;
+    this.cancelRemoteTtsReconnect();
+    this.tts.sendStop();
+    this.systemSpeech?.stopSpeaking();
+    this.clearSystemSpeechQueue(false);
+    this.snapshot.playback = 'none';
+    this.snapshot.ttsState = this.voiceOutputEnabled ? 'ready' : 'stopped';
+    const cleanup = this.replayCleanup.then((): Promise<void> => {
+      return this.player.stop().catch(() => undefined);
+    }).catch((): void => undefined);
+    this.replayCleanup = cleanup;
+    return cleanup;
+  }
+
+  private async startReplayAfterCleanup(
+    text: string,
+    replayMessageId: string,
+    replayGeneration: number,
+    cleanup: Promise<void>
+  ): Promise<void> {
+    await cleanup;
+    if (replayGeneration !== this.replayGeneration || this.activeReplayMessageId !== replayMessageId) {
+      if (replayGeneration === this.replayGeneration) {
+        this.replayCleanupActive = false;
+      }
       return;
     }
-    if (!this.tts.isConnected()) {
-      this.tts.connect(this.wsUrl('/api/audio/speak-stream', this.snapshot.selectedProfile), this.cookie);
+    if (this.useSystemSpeech) {
+      this.replayCleanupActive = false;
+      this.replayAwaitingSystemStart = true;
+      this.beginSystemSpeechStream();
+      this.finishSystemSpeechStream(text);
+      return;
     }
+    this.cancelRemoteTtsReconnect();
+    this.tts.close();
+    this.replayCleanupActive = false;
+    this.tts.setListener(new ControllerTtsListener(this));
+    this.tts.connect(this.wsUrl('/api/audio/speak-stream', this.snapshot.selectedProfile), this.cookie);
     this.tts.sendText(text);
     this.tts.sendDone();
-    finish();
+  }
+
+  private clearActiveReplayState(): void {
+    const replayId = this.activeReplayMessageId;
+    this.activeReplayMessageId = '';
+    this.replayAwaitingSystemStart = false;
+    if (this.snapshot.statusDetail === '正在重读这条消息') {
+      this.snapshot.statusDetail = '';
+    }
+    if (replayId.length === 0) {
+      return;
+    }
+    const message = this.snapshot.messages.find((item: ChatMessage): boolean => item.id === replayId);
+    if (message !== undefined && message.replaying) {
+      message.replaying = false;
+      message.revision += 1;
+    }
   }
 
   private ensureConnections(): void {
@@ -766,6 +1148,8 @@ export class SingleAgentController {
 
   private stopVoiceInput(): void {
     this.voiceWanted = false;
+    this.cancelRemoteAsrReconnect();
+    this.cancelAsrFinalization();
     this.systemRecognitionAttempt += 1;
     this.systemRecognitionStartupPhase = '';
     this.stopBackgroundVoiceTask();
@@ -798,6 +1182,7 @@ export class SingleAgentController {
 
   private stopVoice(): void {
     this.voiceOutputEnabled = false;
+    this.cancelRemoteTtsReconnect();
     this.stopVoiceInput();
     this.audioCues.silence();
     this.pausedForUser = false;
@@ -900,9 +1285,65 @@ export class SingleAgentController {
     const url = this.wsUrl('/api/hermes/ws', this.snapshot.selectedProfile);
     this.gateway.setListener(new ControllerGatewayListener(this));
     this.gateway.connect(url, this.cookie);
+    this.clearGatewayReadyTimeout();
+    this.gatewayReadyTimeout = setTimeout((): void => {
+      this.gatewayReadyTimeout = undefined;
+      if (this.snapshot.connection !== 'connecting') {
+        return;
+      }
+      this.gateway.close();
+      this.snapshot.connection = 'offline';
+      this.scheduleGatewayReconnect('网关连接超时');
+      this.notify();
+    }, GATEWAY_READY_TIMEOUT_MS);
+  }
+
+  private async loadAgentCatalog(generation: number): Promise<boolean> {
+    try {
+      const agents = await this.agentCatalogClient.fetch(this.config.gatewayUrl, this.config.accessToken);
+      if (generation !== this.gatewayConnectGeneration || this.gatewayReconnectBlocked) {
+        return false;
+      }
+      this.agentCatalog.agents = agents;
+      this.snapshot.agents = agents.slice();
+      this.snapshot.agentsLoading = false;
+      this.snapshot.agentsError = '';
+      const selected = this.agentCatalog.find(this.config.profile);
+      const fallback = this.agentCatalog.fallback();
+      if (selected === undefined && fallback !== undefined) {
+        this.config.profile = fallback.id;
+        this.snapshot.selectedProfile = fallback.id;
+        this.persistConfig();
+      }
+      if (fallback === undefined) {
+        this.snapshot.connection = 'offline';
+        this.snapshot.error = '服务器暂未配置可用 Agent';
+        this.snapshot.statusTitle = '无可用 Agent';
+        this.snapshot.statusDetail = '';
+        this.notify();
+        return false;
+      }
+      this.snapshot.error = '';
+      this.notify();
+      return true;
+    } catch (error) {
+      if (generation !== this.gatewayConnectGeneration || this.gatewayReconnectBlocked) {
+        return false;
+      }
+      this.snapshot.agentsLoading = false;
+      this.snapshot.agentsError = 'Agent目录加载失败';
+      this.snapshot.connection = 'offline';
+      this.snapshot.error = this.errorMessage(error as BusinessError, 'Agent目录加载失败');
+      this.notify();
+      return false;
+    }
   }
 
   onGatewayReady(): void {
+    this.clearGatewayReadyTimeout();
+    this.gatewayReconnectInFlight = false;
+    this.gatewayReconnectAttempt = 0;
+    this.gatewayReconnectBlocked = false;
     this.snapshot.connection = 'online';
     this.snapshot.error = '';
     if (this.snapshot.storedSessionId.length > 0) {
@@ -919,6 +1360,7 @@ export class SingleAgentController {
   }
 
   onGatewayError(message: string): void {
+    this.clearGatewayReadyTimeout();
     const errorText = typeof message === 'string' && message.length > 0
       ? message
       : '网关连接失败';
@@ -928,11 +1370,14 @@ export class SingleAgentController {
     this.snapshot.playback = 'none';
     this.snapshot.conversationLoading = false;
     this.snapshot.error = errorText;
+    this.cancelModelSwitch('模型切换未确认：' + errorText);
     this.failAssistantMessage(errorText);
+    this.scheduleGatewayReconnect(errorText);
     this.notify();
   }
 
   onGatewayClosed(): void {
+    this.clearGatewayReadyTimeout();
     const wasOnline = this.snapshot.connection === 'online';
     hilog.warn(
       CONTROLLER_LOG_DOMAIN,
@@ -946,9 +1391,63 @@ export class SingleAgentController {
     this.snapshot.conversationLoading = false;
     if (wasOnline) {
       this.snapshot.error = '网关连接已断开';
+      this.cancelModelSwitch('模型切换未确认：网关连接已断开');
       this.failAssistantMessage(this.snapshot.error);
     }
+    this.scheduleGatewayReconnect('网关连接已断开');
     this.notify();
+  }
+
+  private scheduleGatewayReconnect(reason: string): void {
+    if (this.gatewayReconnectBlocked || this.config.accessToken.length === 0 ||
+      this.gatewayReconnectTimer !== undefined || this.gatewayReconnectInFlight ||
+      this.snapshot.connection === 'online') {
+      return;
+    }
+    if (this.gatewayReconnectAttempt >= GATEWAY_RECONNECT_MAX_ATTEMPTS) {
+      this.gatewayReconnectBlocked = true;
+      this.snapshot.connection = 'offline';
+      this.snapshot.statusTitle = '连接已停止恢复';
+      this.snapshot.statusDetail = '请检查网络或重新保存访问口令';
+      this.snapshot.error = reason;
+      return;
+    }
+    const index = Math.min(this.gatewayReconnectAttempt, GATEWAY_RECONNECT_DELAYS_MS.length - 1);
+    const delay = GATEWAY_RECONNECT_DELAYS_MS[index];
+    this.gatewayReconnectAttempt += 1;
+    this.snapshot.connection = 'connecting';
+    this.snapshot.statusTitle = '正在恢复连接';
+    this.snapshot.statusDetail = '将在 ' + String(delay) + ' ms 后重试';
+    this.snapshot.error = '';
+    this.gatewayReconnectTimer = setTimeout((): void => {
+      this.gatewayReconnectTimer = undefined;
+      if (this.gatewayReconnectBlocked || this.snapshot.connection === 'online') {
+        return;
+      }
+      this.gatewayReconnectInFlight = true;
+      const generation = ++this.gatewayConnectGeneration;
+      this.connectGateway(true, generation).then((): void => {
+        this.gatewayReconnectInFlight = false;
+      }).catch((): void => {
+        this.gatewayReconnectInFlight = false;
+      });
+    }, delay);
+  }
+
+  private cancelGatewayReconnect(): void {
+    if (this.gatewayReconnectTimer !== undefined) {
+      clearTimeout(this.gatewayReconnectTimer);
+      this.gatewayReconnectTimer = undefined;
+    }
+    this.gatewayReconnectAttempt = 0;
+    this.gatewayReconnectInFlight = false;
+  }
+
+  private clearGatewayReadyTimeout(): void {
+    if (this.gatewayReadyTimeout !== undefined) {
+      clearTimeout(this.gatewayReadyTimeout);
+      this.gatewayReadyTimeout = undefined;
+    }
   }
 
   private onSessionCreated(result: Object): void {
@@ -971,6 +1470,8 @@ export class SingleAgentController {
       this.snapshot.runtimeProvider = this.providerDisplay(info);
     }
     this.snapshot.conversationLoading = false;
+    this.snapshot.modelSwitchStatus = '';
+    this.snapshot.modelSwitchError = '';
     this.snapshot.statusTitle = '已连接';
     this.snapshot.statusDetail = this.snapshot.selectedProfile;
     this.snapshot.error = '';
@@ -984,6 +1485,7 @@ export class SingleAgentController {
   private startVoiceClients(): void {
     const capabilities: SystemSpeechCapabilities | undefined = this.systemSpeech?.getCapabilities();
     if (this.config.speechBackend === 'harmony_offline') {
+      this.cancelRemoteVoiceReconnects();
       this.useSystemSpeech = true;
       this.snapshot.asrBackend = 'harmony_offline';
       this.snapshot.ttsBackend = 'harmony_offline';
@@ -1022,6 +1524,11 @@ export class SingleAgentController {
     this.systemRecognitionAttempt += 1;
     this.systemRecognitionStartupPhase = '';
     this.systemRecognitionStarting = false;
+    this.cancelRemoteVoiceReconnects();
+    this.cancelAsrFinalization();
+    this.discardAsrPreview();
+    this.snapshot.asrTranscript = '';
+    this.snapshot.asrUtteranceActive = false;
     this.tts.sendStop();
     this.systemSpeech?.stopSpeaking();
     this.player.stop().catch(() => undefined);
@@ -1055,14 +1562,14 @@ export class SingleAgentController {
     this.snapshot.error = '';
     this.notify();
     this.tts.setListener(new ControllerTtsListener(this));
-    if (!this.tts.isConnected()) {
+    if (!this.tts.isConnected() && !this.tts.isConnecting()) {
       this.tts.connect(this.wsUrl('/api/audio/speak-stream', this.snapshot.selectedProfile), this.cookie);
     }
     if (!this.voiceWanted) {
       return;
     }
     this.asr.setListener(new ControllerAsrListener(this));
-    if (!this.asr.isConnected()) {
+    if (!this.asr.isConnected() && !this.asr.isConnecting()) {
       this.asr.connect(this.wsUrl('/api/audio/transcribe-stream', this.snapshot.selectedProfile), this.cookie);
     }
     this.startCapture();
@@ -1117,6 +1624,7 @@ export class SingleAgentController {
   }
 
   private failSystemRecognition(reason: string, phase: string): void {
+    this.finalizeAsrAfterTermination();
     this.systemRecognitionAttempt += 1;
     this.systemRecognitionStarting = false;
     this.clearSystemRecognitionReadyTimeout();
@@ -1176,7 +1684,7 @@ export class SingleAgentController {
       this.startBackgroundVoiceTask();
     }
     if (!active && this.snapshot.asrUtteranceActive) {
-      this.onAsrFinal('');
+      this.queueAsrFinal('', false);
     }
     this.notify();
     if (!active && this.voiceWanted && !this.systemRecognitionStarting) {
@@ -1201,7 +1709,7 @@ export class SingleAgentController {
     }, 150);
   }
 
-  onSystemRecognitionResult(text: string, isFinal: boolean, _isLast: boolean): void {
+  onSystemRecognitionResult(text: string, isFinal: boolean, isLast: boolean): void {
     if (!this.useSystemSpeech) {
       return;
     }
@@ -1209,15 +1717,10 @@ export class SingleAgentController {
     if (value.length > 0) {
       this.onUserSpeechDetected();
     }
-    this.snapshot.asrTranscript = value;
-    const preview = this.currentAsrMessage();
-    if (preview !== undefined) {
-      preview.text = value;
-      preview.revision += 1;
-    }
-    this.notify();
     if (isFinal) {
-      this.onAsrFinal(value);
+      this.queueAsrFinal(value, isLast);
+    } else {
+      this.updateAsrInterim(value);
     }
   }
 
@@ -1234,9 +1737,19 @@ export class SingleAgentController {
     if (!this.useSystemSpeech) {
       return;
     }
+    if (this.replayCleanupActive) {
+      return;
+    }
     if (!this.voiceOutputEnabled) {
       this.snapshot.ttsState = 'stopped';
       this.snapshot.playback = 'none';
+      this.clearActiveReplayState();
+      return;
+    }
+    if (!active && this.activeReplayMessageId.length > 0 && this.replayAwaitingSystemStart) {
+      this.snapshot.ttsState = 'connecting';
+      this.snapshot.playback = 'queued';
+      this.notify();
       return;
     }
     if (active && this.pausedForUser) {
@@ -1247,6 +1760,7 @@ export class SingleAgentController {
       return;
     }
     if (active) {
+      this.replayAwaitingSystemStart = false;
       this.systemSpeechStartedAt = Date.now();
       this.snapshot.ttsState = 'speaking';
       this.snapshot.playback = 'playing';
@@ -1268,6 +1782,10 @@ export class SingleAgentController {
       }
     } else {
       this.snapshot.playback = 'none';
+      if (this.activeReplayMessageId.length > 0) {
+        this.clearActiveReplayState();
+        this.snapshot.statusDetail = '';
+      }
       this.notify();
     }
     if (!active && this.voiceWanted) {
@@ -1277,6 +1795,9 @@ export class SingleAgentController {
 
   onSystemSpeechError(channel: string, message: string): void {
     if (!this.useSystemSpeech) {
+      return;
+    }
+    if (this.replayCleanupActive) {
       return;
     }
     if (channel === 'STT') {
@@ -1318,10 +1839,42 @@ export class SingleAgentController {
     this.startSystemSpeech(value);
   }
 
+  private speakProtocolPrompt(text: string): void {
+    const value = SpeechTextFilter.clean(text).trim();
+    if (value.length === 0 || !this.voiceOutputEnabled || this.config.muted) {
+      return;
+    }
+    if (this.useSystemSpeech) {
+      this.speakWithSystem(value);
+      return;
+    }
+    if (!this.tts.isConnected() && !this.tts.isConnecting()) {
+      this.tts.reconnect(this.wsUrl('/api/audio/speak-stream', this.snapshot.selectedProfile), this.cookie);
+    }
+    this.tts.sendText(value);
+    this.tts.sendDone();
+  }
+
+  private stopProtocolPromptPlayback(): void {
+    this.pausedForUser = false;
+    this.tts.sendStop();
+    this.systemSpeech?.stopSpeaking();
+    this.player.stop().catch(() => undefined);
+    this.clearSystemSpeechQueue();
+    this.snapshot.playback = 'none';
+    this.snapshot.ttsState = this.voiceOutputEnabled ? 'ready' : 'stopped';
+  }
+
+  private replaceProtocolPromptSpeech(text: string): void {
+    this.stopProtocolPromptPlayback();
+    this.speakProtocolPrompt(text);
+  }
+
   private beginSystemSpeechStream(): void {
     this.systemSpeechPendingText = '';
     this.systemSpeechReceivedText = '';
     this.systemSpeechFirstChunkQueued = false;
+    this.speechTextFilter = new SpeechTextFilter();
   }
 
   private appendSystemSpeechStream(text: string): void {
@@ -1512,6 +2065,7 @@ export class SingleAgentController {
   }
 
   onAsrReady(): void {
+    this.cancelRemoteAsrReconnect();
     this.snapshot.asrState = 'listening';
     this.snapshot.error = '';
     this.notify();
@@ -1522,41 +2076,27 @@ export class SingleAgentController {
     if (value.length > 0) {
       this.onUserSpeechDetected();
     }
-    this.snapshot.asrTranscript = value;
-    const preview = this.currentAsrMessage();
-    if (preview !== undefined) {
-      preview.text = value;
-      preview.revision += 1;
-    }
-    this.notify();
     if (final) {
-      this.onAsrFinal(value);
+      this.queueAsrFinal(value, false);
+    } else if (interim) {
+      this.updateAsrInterim(value);
     }
   }
 
   onAsrError(message: string): void {
-    this.snapshot.asrState = 'stopped';
-    if (this.snapshot.asrUtteranceActive) {
-      this.onAsrFinal('');
-    }
-    this.snapshot.error = typeof message === 'string' && message.length > 0
-      ? message
-      : 'ASR 连接失败';
-    this.notify();
+    this.handleRemoteAsrDisconnect(
+      typeof message === 'string' && message.length > 0 ? message : 'ASR 连接失败'
+    );
   }
 
   onAsrClosed(): void {
-    this.snapshot.asrState = 'stopped';
-    if (this.snapshot.asrUtteranceActive) {
-      this.onAsrFinal('');
-    }
-    if (this.voiceWanted) {
-      this.snapshot.error = 'ASR 连接已断开';
-    }
-    this.notify();
+    this.handleRemoteAsrDisconnect('ASR 连接已断开');
   }
 
   onTtsJobStarted(sampleRate: number): void {
+    if (this.replayCleanupActive) {
+      return;
+    }
     this.player.setSampleRate(sampleRate);
     this.snapshot.ttsSampleRate = sampleRate;
     this.snapshot.ttsState = 'speaking';
@@ -1570,19 +2110,33 @@ export class SingleAgentController {
   }
 
   onTtsReady(): void {
+    if (this.replayCleanupActive) {
+      return;
+    }
+    this.cancelRemoteTtsReconnect();
     this.snapshot.ttsState = 'ready';
     this.snapshot.error = '';
     this.notify();
   }
 
   onTtsJobPcm(pcm: ArrayBuffer): void {
+    if (this.replayCleanupActive) {
+      return;
+    }
     this.player.enqueue(pcm);
   }
 
   onTtsJobEnded(): void {
+    if (this.replayCleanupActive) {
+      return;
+    }
     this.player.waitForDrain((): void => {
       this.snapshot.playback = 'none';
       this.snapshot.ttsState = this.voiceOutputEnabled ? 'ready' : 'stopped';
+      if (this.activeReplayMessageId.length > 0) {
+        this.clearActiveReplayState();
+        this.snapshot.statusDetail = '';
+      }
       this.notify();
     });
   }
@@ -1594,23 +2148,169 @@ export class SingleAgentController {
   }
 
   onTtsError(message: string): void {
-    this.snapshot.ttsState = 'error';
-    this.snapshot.error = typeof message === 'string' && message.length > 0
-      ? message
-      : 'TTS 连接失败';
-    this.notify();
+    if (this.replayCleanupActive) {
+      return;
+    }
+    this.handleRemoteTtsDisconnect(
+      typeof message === 'string' && message.length > 0 ? message : 'TTS 连接失败'
+    );
   }
 
   onTtsClosed(): void {
-    this.snapshot.ttsState = this.voiceOutputEnabled ? 'connecting' : 'stopped';
+    if (this.replayCleanupActive) {
+      return;
+    }
+    this.handleRemoteTtsDisconnect('TTS 连接已断开');
+  }
+
+  private handleRemoteAsrDisconnect(message: string): void {
+    if (!this.canRecoverRemoteAsr()) {
+      this.snapshot.asrState = 'stopped';
+      this.finalizeAsrAfterTermination();
+      if (this.voiceWanted && !this.useSystemSpeech) {
+        this.snapshot.error = message;
+      }
+      this.notify();
+      return;
+    }
+    if (this.snapshot.asrUtteranceActive && this.combinedAsrText().length === 0) {
+      this.discardAsrAndResumePlayback();
+    }
+    this.snapshot.asrState = 'connecting';
+    this.snapshot.statusDetail = '远端 ASR 正在恢复';
+    this.snapshot.error = '';
+    this.scheduleRemoteAsrReconnect();
     this.notify();
   }
 
+  private handleRemoteTtsDisconnect(message: string): void {
+    if (!this.canRecoverRemoteTts()) {
+      this.clearActiveReplayState();
+      this.snapshot.ttsState = this.voiceOutputEnabled && !this.config.muted ? 'error' : 'stopped';
+      if (this.voiceOutputEnabled && !this.config.muted && !this.useSystemSpeech) {
+        this.snapshot.error = message;
+      }
+      this.notify();
+      return;
+    }
+    this.snapshot.ttsState = 'connecting';
+    this.snapshot.statusDetail = '远端 TTS 正在恢复';
+    this.snapshot.error = '';
+    this.drainRemotePlaybackAfterDisconnect();
+    this.scheduleRemoteTtsReconnect();
+    this.notify();
+  }
+
+  private canRecoverRemoteAsr(): boolean {
+    return !this.useSystemSpeech && this.config.speechBackend === 'remote' && this.voiceWanted &&
+      this.snapshot.connection === 'online' && this.cookie.length > 0;
+  }
+
+  private canRecoverRemoteTts(): boolean {
+    return !this.useSystemSpeech && this.config.speechBackend === 'remote' &&
+      this.voiceOutputEnabled && !this.config.muted && this.snapshot.connection === 'online' &&
+      this.cookie.length > 0;
+  }
+
+  private scheduleRemoteAsrReconnect(): void {
+    if (!this.canRecoverRemoteAsr() || this.asr.isConnected() || this.asr.isConnecting() ||
+      this.remoteAsrReconnectTimer !== undefined) {
+      return;
+    }
+    const index = Math.min(
+      this.remoteAsrReconnectAttempt,
+      REMOTE_VOICE_RECONNECT_DELAYS_MS.length - 1
+    );
+    const delay = REMOTE_VOICE_RECONNECT_DELAYS_MS[index];
+    this.remoteAsrReconnectAttempt = Math.min(
+      this.remoteAsrReconnectAttempt + 1,
+      REMOTE_VOICE_RECONNECT_DELAYS_MS.length
+    );
+    this.remoteAsrReconnectTimer = setTimeout((): void => {
+      this.remoteAsrReconnectTimer = undefined;
+      if (!this.canRecoverRemoteAsr() || this.asr.isConnected() || this.asr.isConnecting()) {
+        return;
+      }
+      this.asr.setListener(new ControllerAsrListener(this));
+      this.asr.reconnect(
+        this.wsUrl('/api/audio/transcribe-stream', this.snapshot.selectedProfile),
+        this.cookie
+      );
+    }, delay);
+  }
+
+  private scheduleRemoteTtsReconnect(): void {
+    if (!this.canRecoverRemoteTts() || this.tts.isConnected() || this.tts.isConnecting() ||
+      this.remoteTtsReconnectTimer !== undefined) {
+      return;
+    }
+    const index = Math.min(
+      this.remoteTtsReconnectAttempt,
+      REMOTE_VOICE_RECONNECT_DELAYS_MS.length - 1
+    );
+    const delay = REMOTE_VOICE_RECONNECT_DELAYS_MS[index];
+    this.remoteTtsReconnectAttempt = Math.min(
+      this.remoteTtsReconnectAttempt + 1,
+      REMOTE_VOICE_RECONNECT_DELAYS_MS.length
+    );
+    this.remoteTtsReconnectTimer = setTimeout((): void => {
+      this.remoteTtsReconnectTimer = undefined;
+      if (!this.canRecoverRemoteTts() || this.tts.isConnected() || this.tts.isConnecting()) {
+        return;
+      }
+      this.tts.setListener(new ControllerTtsListener(this));
+      this.tts.reconnect(
+        this.wsUrl('/api/audio/speak-stream', this.snapshot.selectedProfile),
+        this.cookie
+      );
+    }, delay);
+  }
+
+  private cancelRemoteAsrReconnect(): void {
+    if (this.remoteAsrReconnectTimer !== undefined) {
+      clearTimeout(this.remoteAsrReconnectTimer);
+      this.remoteAsrReconnectTimer = undefined;
+    }
+    this.remoteAsrReconnectAttempt = 0;
+  }
+
+  private cancelRemoteTtsReconnect(): void {
+    if (this.remoteTtsReconnectTimer !== undefined) {
+      clearTimeout(this.remoteTtsReconnectTimer);
+      this.remoteTtsReconnectTimer = undefined;
+    }
+    this.remoteTtsReconnectAttempt = 0;
+  }
+
+  private cancelRemoteVoiceReconnects(): void {
+    this.cancelRemoteAsrReconnect();
+    this.cancelRemoteTtsReconnect();
+  }
+
+  private drainRemotePlaybackAfterDisconnect(): void {
+    if (this.remoteTtsDrainPending) {
+      return;
+    }
+    this.remoteTtsDrainPending = true;
+    this.player.waitForDrain((): void => {
+      this.remoteTtsDrainPending = false;
+      this.snapshot.playback = 'none';
+      if (this.activeReplayMessageId.length > 0) {
+        this.clearActiveReplayState();
+      }
+      this.notify();
+    });
+  }
+
   private onAsrFinal(text: string): void {
-    const value = text.trim();
+    const value = this.mergeAsrSegments(this.combinedAsrText(), text.trim());
+    this.cancelAsrFinalization();
     const preview = this.currentAsrMessage();
     this.snapshot.asrTranscript = '';
     this.snapshot.asrUtteranceActive = false;
+    if (this.snapshot.asrState === 'finalizing') {
+      this.snapshot.asrState = this.voiceWanted ? 'listening' : 'stopped';
+    }
     if (this.isCloseMicPhrase(value)) {
       this.discardAsrPreview();
       this.stopVoiceInput();
@@ -1619,12 +2319,14 @@ export class SingleAgentController {
       return;
     }
     if (!this.hasSemanticContent(value)) {
-      this.discardAsrPreview();
-      this.notify();
+      this.discardAsrAndResumePlayback();
       return;
     }
     if (this.isStopPhrase(value)) {
       this.interrupt(value, preview);
+      return;
+    }
+    if (this.consumePendingProtocolReply(value, preview)) {
       return;
     }
     if (value.length > 0) {
@@ -1638,6 +2340,134 @@ export class SingleAgentController {
       return;
     }
     this.discardAsrPreview();
+    this.notify();
+  }
+
+  private updateAsrInterim(text: string): void {
+    this.asrLatestInterimText = text.trim();
+    const value = this.combinedAsrText();
+    if (value.length === 0) {
+      return;
+    }
+    this.snapshot.asrTranscript = value;
+    if (this.voiceWanted) {
+      this.snapshot.asrState = 'listening';
+    }
+    const preview = this.ensureAsrPreview();
+    preview.label = '你 · 正在识别';
+    preview.text = value;
+    preview.revision += 1;
+    this.scheduleAsrFinalization();
+    this.notify();
+  }
+
+  private queueAsrFinal(text: string, isLast: boolean): void {
+    const value = text.trim();
+    if (value.length > 0) {
+      this.asrPendingFinalText = this.mergeAsrSegments(this.asrPendingFinalText, value);
+    } else if (this.asrPendingFinalText.length === 0 && this.asrLatestInterimText.length > 0) {
+      this.asrPendingFinalText = this.asrLatestInterimText;
+    }
+    this.asrLatestInterimText = '';
+    const combined = this.combinedAsrText();
+    if (combined.length === 0) {
+      this.discardAsrAndResumePlayback();
+      return;
+    }
+    if (this.shouldFinalizeAsrImmediately(combined)) {
+      this.onAsrFinal(combined);
+      return;
+    }
+    this.snapshot.asrTranscript = combined;
+    this.snapshot.asrUtteranceActive = true;
+    this.snapshot.asrState = 'finalizing';
+    const preview = this.ensureAsrPreview();
+    preview.label = '你 · 等待收句';
+    preview.text = combined;
+    preview.revision += 1;
+    hilog.info(
+      CONTROLLER_LOG_DOMAIN,
+      CONTROLLER_LOG_TAG,
+      'ASR final buffered length=%{public}d isLast=%{public}s graceMs=%{public}d',
+      combined.length,
+      String(isLast),
+      ASR_FINALIZATION_GRACE_MS
+    );
+    this.scheduleAsrFinalization();
+    this.notify();
+  }
+
+  private scheduleAsrFinalization(): void {
+    if (this.asrFinalizationTimer !== undefined) {
+      clearTimeout(this.asrFinalizationTimer);
+    }
+    this.asrFinalizationTimer = setTimeout((): void => {
+      this.asrFinalizationTimer = undefined;
+      const value = this.combinedAsrText();
+      this.onAsrFinal(value);
+    }, ASR_FINALIZATION_GRACE_MS);
+  }
+
+  private finalizeAsrAfterTermination(): void {
+    if (!this.snapshot.asrUtteranceActive && this.combinedAsrText().length === 0) {
+      return;
+    }
+    const preview = this.currentAsrMessage();
+    const previewText = preview !== undefined ? preview.text.trim() : '';
+    const value = this.mergeAsrSegments(this.combinedAsrText(), previewText);
+    if (this.hasSemanticContent(value)) {
+      this.onAsrFinal(value);
+      return;
+    }
+    this.discardAsrAndResumePlayback();
+  }
+
+  private shouldFinalizeAsrImmediately(text: string): boolean {
+    if (this.isStopPhrase(text) || this.isCloseMicPhrase(text) || this.snapshot.clarifyPending) {
+      return true;
+    }
+    return this.snapshot.approvalPending &&
+      (this.isApprovalAllowPhrase(text) || this.isApprovalDenyPhrase(text));
+  }
+
+  private combinedAsrText(): string {
+    return this.mergeAsrSegments(this.asrPendingFinalText, this.asrLatestInterimText);
+  }
+
+  private mergeAsrSegments(previous: string, incoming: string): string {
+    const left = previous.trim();
+    const right = incoming.trim();
+    if (left.length === 0) {
+      return right;
+    }
+    if (right.length === 0 || left === right) {
+      return left;
+    }
+    if (right.startsWith(left)) {
+      return right;
+    }
+    const separator = /[A-Za-z0-9]$/.test(left) && /^[A-Za-z0-9]/.test(right) ? ' ' : '';
+    return left + separator + right;
+  }
+
+  private cancelAsrFinalization(): void {
+    if (this.asrFinalizationTimer !== undefined) {
+      clearTimeout(this.asrFinalizationTimer);
+      this.asrFinalizationTimer = undefined;
+    }
+    this.asrPendingFinalText = '';
+    this.asrLatestInterimText = '';
+  }
+
+  private discardAsrAndResumePlayback(): void {
+    this.cancelAsrFinalization();
+    this.snapshot.asrTranscript = '';
+    this.snapshot.asrUtteranceActive = false;
+    this.discardAsrPreview();
+    if (this.pausedForUser) {
+      this.resumePausedPlayback();
+      return;
+    }
     this.notify();
   }
 
@@ -1722,7 +2552,7 @@ export class SingleAgentController {
     return text;
   }
 
-  private clearSystemSpeechQueue(): void {
+  private clearSystemSpeechQueue(clearReplayState: boolean = true): void {
     this.activeSystemSpeechText = '';
     this.pausedSystemSpeechText = '';
     this.systemSpeechQueue = [];
@@ -1730,6 +2560,9 @@ export class SingleAgentController {
     this.systemSpeechPendingText = '';
     this.systemSpeechReceivedText = '';
     this.systemSpeechFirstChunkQueued = false;
+    if (clearReplayState) {
+      this.clearActiveReplayState();
+    }
   }
 
   private handleEvent(type: string, sessionId: string, payload: Object | undefined): void {
@@ -1774,6 +2607,9 @@ export class SingleAgentController {
     }
     if (type === 'message.delta') {
       const text = this.payloadText(data);
+      const speechDelta = this.payloadSpeechText(data).length > 0
+        ? SpeechTextFilter.clean(this.payloadSpeechText(data))
+        : this.speechTextFilter.push(text);
       hilog.info(
         CONTROLLER_LOG_DOMAIN,
         CONTROLLER_LOG_TAG,
@@ -1787,19 +2623,22 @@ export class SingleAgentController {
       if (text.length > 0) {
         this.snapshot.statusDetail = 'Agent 正在回复';
       }
-      if (text.length > 0 && this.voiceOutputEnabled && !this.config.muted) {
+      if (speechDelta.length > 0 && this.voiceOutputEnabled && !this.config.muted) {
         if (this.useSystemSpeech) {
-          this.appendSystemSpeechStream(text);
+          this.appendSystemSpeechStream(speechDelta);
         } else {
-          this.tts.sendText(text);
-          this.ttsTextSent += text;
+          this.tts.sendText(speechDelta);
+          this.ttsTextSent += speechDelta;
         }
       }
       return;
     }
     if (type === 'message.complete') {
       const finalText = this.payloadText(data);
-      const speechText = finalText.length > 0 ? finalText : this.currentAssistantText();
+      const suppliedSpeechText = this.payloadSpeechText(data);
+      const speechText = SpeechTextFilter.clean(suppliedSpeechText.length > 0
+        ? suppliedSpeechText : (finalText.length > 0 ? finalText : this.currentAssistantText()));
+      const speechTail = this.speechTextFilter.flush();
       hilog.info(
         CONTROLLER_LOG_DOMAIN,
         CONTROLLER_LOG_TAG,
@@ -1816,10 +2655,13 @@ export class SingleAgentController {
       hilog.info(CONTROLLER_LOG_DOMAIN, CONTROLLER_LOG_TAG, 'assistant message finalized');
       if (this.voiceOutputEnabled && !this.config.muted) {
         if (this.useSystemSpeech) {
+          if (speechTail.length > 0) {
+            this.appendSystemSpeechStream(speechTail);
+          }
           this.finishSystemSpeechStream(speechText);
         } else {
           if (finalText.length > 0 && this.ttsTextSent.length === 0) {
-            this.tts.sendText(finalText);
+            this.tts.sendText(speechText);
           }
           this.tts.sendDone();
         }
@@ -1845,23 +2687,44 @@ export class SingleAgentController {
       return;
     }
     if (type === 'approval.request') {
+      const description = data !== undefined && data['description'] !== undefined
+        ? String(data['description']).trim() : 'Agent 请求执行高风险操作';
+      const command = data !== undefined && data['command'] !== undefined
+        ? String(data['command']).trim() : '';
+      const duplicate = this.snapshot.approvalPending &&
+        this.snapshot.approvalDescription === description && this.snapshot.approvalCommand === command;
       this.snapshot.approvalPending = true;
-      this.snapshot.approvalDescription = data !== undefined && data['description'] !== undefined
-        ? String(data['description']) : 'Agent 请求执行高风险操作';
-      this.snapshot.approvalCommand = data !== undefined && data['command'] !== undefined
-        ? String(data['command']) : '';
+      this.snapshot.approvalDescription = description;
+      this.snapshot.approvalCommand = command;
+      if (!duplicate) {
+        this.approvalResponseInFlight = false;
+        const prompt = this.approvalConversationText(description, command);
+        this.appendMessage('assistant', this.agentName(this.snapshot.selectedProfile), prompt);
+        this.speakProtocolPrompt(this.approvalSpeechText(description, command));
+      }
       this.notify();
       return;
     }
     if (type === 'clarify.request') {
-      this.snapshot.clarifyPending = true;
-      this.snapshot.clarifyRequestId = data !== undefined && data['request_id'] !== undefined
+      const requestId = data !== undefined && data['request_id'] !== undefined
         ? String(data['request_id']) : '';
-      this.snapshot.clarifyQuestion = data !== undefined && data['question'] !== undefined
-        ? String(data['question']) : '请补充信息';
+      const question = data !== undefined && data['question'] !== undefined
+        ? String(data['question']).trim() : '请补充信息';
       const choices = data !== undefined ? data['choices'] : undefined;
-      this.snapshot.clarifyChoices = Array.isArray(choices)
-        ? choices.map((choice: Object): string => String(choice)) : [];
+      const parsedChoices = Array.isArray(choices)
+        ? choices.map((choice: Object): string => String(choice).trim())
+          .filter((choice: string): boolean => choice.length > 0) : [];
+      const duplicate = this.snapshot.clarifyPending && this.snapshot.clarifyRequestId === requestId;
+      this.snapshot.clarifyPending = true;
+      this.snapshot.clarifyRequestId = requestId;
+      this.snapshot.clarifyQuestion = question;
+      this.snapshot.clarifyChoices = parsedChoices;
+      if (!duplicate) {
+        this.clarifyResponseInFlight = false;
+        const prompt = this.clarifyConversationText(question, parsedChoices);
+        this.appendMessage('assistant', this.agentName(this.snapshot.selectedProfile), prompt);
+        this.speakProtocolPrompt(prompt);
+      }
       this.notify();
       return;
     }
@@ -1899,6 +2762,7 @@ export class SingleAgentController {
       this.snapshot.runtimeModel = data !== undefined && data['model'] !== undefined
         ? String(data['model']) : '';
       this.snapshot.runtimeProvider = this.providerDisplay(data);
+      this.confirmModelSwitch(data);
       const message = this.currentAssistantMessage();
       if (message && message.pending &&
         (this.snapshot.runtimeModel.length > 0 || this.snapshot.runtimeProvider.length > 0)) {
@@ -1925,7 +2789,7 @@ export class SingleAgentController {
     const message = new ChatMessage();
     message.id = this.nextMessageId();
     message.role = 'assistant';
-    message.label = ProfileInfo.displayName(this.snapshot.selectedProfile);
+    message.label = this.agentName(this.snapshot.selectedProfile);
     message.model = this.snapshot.runtimeModel;
     message.provider = this.snapshot.runtimeProvider;
     message.text = '';
@@ -2160,31 +3024,86 @@ export class SingleAgentController {
     return '';
   }
 
+  private approvalConversationText(description: string, command: string): string {
+    let prompt = '需要确认：' + description;
+    if (command.length > 0) {
+      prompt += '\n操作：' + command;
+    }
+    return prompt + '\n请回复“同意”或“取消”。';
+  }
+
+  private approvalSpeechText(description: string, command: string): string {
+    const source = (description || command || '执行一项高风险操作').replace(/\s+/g, ' ').trim();
+    const summary = source.length > 60 ? source.substring(0, 60) + '。' : source;
+    return '需要确认：' + summary + '。请回复同意或取消。';
+  }
+
+  private clarifyConversationText(question: string, choices: string[]): string {
+    let prompt = question;
+    if (choices.length > 0) {
+      const lines: string[] = [];
+      for (let index = 0; index < choices.length; index += 1) {
+        lines.push(String(index + 1) + '. ' + choices[index]);
+      }
+      prompt += '\n可选：\n' + lines.join('\n');
+    }
+    return prompt + '\n请直接回复你的选择。';
+  }
+
   respondApproval(allow: boolean): void {
+    if (!this.snapshot.approvalPending || this.approvalResponseInFlight) {
+      return;
+    }
+    const sessionId = this.snapshot.runtimeSessionId;
+    this.approvalResponseInFlight = true;
+    this.snapshot.statusDetail = allow ? '正在提交同意' : '正在提交取消';
+    this.notify();
     this.gateway.respondApproval(allow ? 'session' : 'deny').then(() => {
+      if (sessionId !== this.snapshot.runtimeSessionId) {
+        return;
+      }
+      this.approvalResponseInFlight = false;
       this.snapshot.approvalPending = false;
       this.snapshot.approvalDescription = '';
       this.snapshot.approvalCommand = '';
+      this.snapshot.statusDetail = allow ? '已同意当前操作' : '已取消当前操作';
       this.notify();
     }).catch((error: BusinessError) => {
-      this.snapshot.error = error.message;
+      if (sessionId !== this.snapshot.runtimeSessionId) {
+        return;
+      }
+      this.approvalResponseInFlight = false;
+      this.snapshot.error = this.errorMessage(error, '审批回复发送失败');
       this.notify();
     });
   }
 
   respondClarify(answer: string): void {
     const value = answer.trim();
-    if (value.length === 0) {
+    if (value.length === 0 || !this.snapshot.clarifyPending || this.clarifyResponseInFlight) {
       return;
     }
-    this.gateway.respondClarify(this.snapshot.clarifyRequestId, value).then(() => {
+    const requestId = this.snapshot.clarifyRequestId;
+    this.clarifyResponseInFlight = true;
+    this.snapshot.statusDetail = '正在提交补充回复';
+    this.notify();
+    this.gateway.respondClarify(requestId, value).then(() => {
+      if (requestId !== this.snapshot.clarifyRequestId) {
+        return;
+      }
+      this.clarifyResponseInFlight = false;
       this.snapshot.clarifyPending = false;
       this.snapshot.clarifyRequestId = '';
       this.snapshot.clarifyQuestion = '';
       this.snapshot.clarifyChoices = [];
+      this.snapshot.statusDetail = '已提交补充回复';
       this.notify();
     }).catch((error: BusinessError) => {
-      this.snapshot.error = error.message;
+      if (requestId !== this.snapshot.clarifyRequestId) {
+        return;
+      }
+      this.clarifyResponseInFlight = false;
+      this.snapshot.error = this.errorMessage(error, '补充回复发送失败');
       this.notify();
     });
   }
@@ -2412,7 +3331,7 @@ export class SingleAgentController {
       const message = new ChatMessage();
       message.id = this.nextMessageId();
       message.role = roleValue === 'user' ? 'user' : 'assistant';
-      message.label = message.role === 'user' ? '你' : ProfileInfo.displayName(this.snapshot.selectedProfile);
+      message.label = message.role === 'user' ? '你' : this.agentName(this.snapshot.selectedProfile);
       message.text = text;
       message.artifacts = artifacts;
       message.model = row['model'] !== undefined
@@ -2446,6 +3365,41 @@ export class SingleAgentController {
       }
     }
     return data['provider'] !== undefined ? String(data['provider']).trim() : '';
+  }
+
+  private providerToken(value: string): string {
+    return value.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+  }
+
+  private isGenericProvider(value: string): boolean {
+    const normalized = this.providerToken(value);
+    return normalized.length === 0 || normalized === 'custom' || normalized === 'openaiapi' ||
+      normalized === 'openaicompatible' || normalized === 'openaicompatibleapi';
+  }
+
+  private reconcileRuntimeProvider(catalog: ModelOptionsCatalog): void {
+    if (!this.isGenericProvider(this.snapshot.runtimeProvider)) {
+      return;
+    }
+    let providerLabel = catalog.activeProviderLabel.trim();
+    if (providerLabel.length === 0 && this.snapshot.runtimeModel.length > 0) {
+      const candidates = catalog.providers.filter((provider: ModelProviderInfo): boolean =>
+        provider.models.find((model: ModelOptionInfo): boolean =>
+          model.id === this.snapshot.runtimeModel) !== undefined);
+      if (candidates.length === 1) {
+        providerLabel = candidates[0].name;
+      }
+    }
+    if (providerLabel.length === 0 || this.isGenericProvider(providerLabel)) {
+      return;
+    }
+    this.snapshot.runtimeProvider = providerLabel;
+    for (const message of this.snapshot.messages) {
+      if (message.role === 'assistant' && this.isGenericProvider(message.provider)) {
+        message.provider = providerLabel;
+        message.revision += 1;
+      }
+    }
   }
 
   private isSessionNotFound(error: BusinessError): boolean {
@@ -2608,11 +3562,19 @@ export class SingleAgentController {
   }
 
   private profileFromValue(value: Object): ProfileKey {
-    const name = String(value);
-    if (name === 'hexiaoma' || name === 'hexiaoxin') {
-      return name as ProfileKey;
+    const name = String(value).trim();
+    return name.length > 0 ? name : 'default';
+  }
+
+  private payloadSpeechText(data: Record<string, Object> | undefined): string {
+    if (data !== undefined && typeof data['speech_text'] === 'string') {
+      return String(data['speech_text']);
     }
-    return 'default';
+    return '';
+  }
+
+  private agentName(profile: string): string {
+    return this.agentCatalog.displayName(profile);
   }
 
   private speechBackendFromValue(value: Object): SpeechBackend {
@@ -2631,6 +3593,79 @@ export class SingleAgentController {
     return normalized.endsWith('/') ? normalized.substring(0, normalized.length - 1) : normalized;
   }
 
+  private isSafeConfigAtom(value: string): boolean {
+    return value.length > 0 && !/\s/.test(value) && !value.startsWith('--');
+  }
+
+  private clearModelOptions(): void {
+    this.modelOptionsSequence += 1;
+    this.snapshot.modelProviders = [];
+    this.snapshot.modelOptionsLoading = false;
+    this.snapshot.modelOptionsError = '';
+  }
+
+  private clearModelSwitchTimeout(): void {
+    if (this.modelSwitchTimeout !== undefined) {
+      clearTimeout(this.modelSwitchTimeout);
+      this.modelSwitchTimeout = undefined;
+    }
+  }
+
+  private resetRequestedModel(): void {
+    this.requestedModelProvider = '';
+    this.requestedModel = '';
+    this.modelBeforeSwitch = '';
+  }
+
+  private cancelModelSwitch(message: string): void {
+    if (!this.snapshot.modelSwitching) {
+      return;
+    }
+    this.modelSwitchSequence += 1;
+    this.clearModelSwitchTimeout();
+    this.snapshot.modelSwitching = false;
+    this.snapshot.modelSwitchStatus = '';
+    this.snapshot.modelSwitchError = message;
+    this.resetRequestedModel();
+  }
+
+  private confirmModelSwitch(data: Record<string, Object> | undefined): void {
+    if (!this.snapshot.modelSwitching || data === undefined || this.requestedModel.length === 0) {
+      return;
+    }
+    const confirmedModel = data['model'] !== undefined ? String(data['model']).trim() : '';
+    if (confirmedModel !== this.requestedModel) {
+      return;
+    }
+    if (this.requestedModel === this.modelBeforeSwitch) {
+      const rawProvider = data['provider'] !== undefined ? String(data['provider']).trim() : '';
+      const displayProvider = this.providerDisplay(data);
+      const option = this.snapshot.modelProviders.find(
+        (item: ModelProviderInfo): boolean => item.id === this.requestedModelProvider
+      );
+      const providerName = option !== undefined ? option.name : '';
+      if (rawProvider !== this.requestedModelProvider &&
+        displayProvider !== this.requestedModelProvider &&
+        (providerName.length === 0 || displayProvider !== providerName)) {
+        return;
+      }
+    }
+    const confirmedProvider = this.snapshot.modelProviders.find(
+      (item: ModelProviderInfo): boolean => item.id === this.requestedModelProvider
+    );
+    if (confirmedProvider !== undefined && this.isGenericProvider(this.snapshot.runtimeProvider)) {
+      this.snapshot.runtimeProvider = confirmedProvider.name;
+    }
+    this.clearModelSwitchTimeout();
+    this.snapshot.modelSwitching = false;
+    this.snapshot.modelSwitchError = '';
+    const identity = [this.snapshot.runtimeProvider, this.snapshot.runtimeModel]
+      .filter((value: string): boolean => value.length > 0).join(' · ');
+    this.snapshot.modelSwitchStatus = identity.length > 0
+      ? '当前会话已确认：' + identity : '当前会话模型已确认';
+    this.resetRequestedModel();
+  }
+
   private persistConfig(): void {
     const store = this.settings;
     if (!store) {
@@ -2638,7 +3673,6 @@ export class SingleAgentController {
     }
     try {
       store.putSync('gatewayUrl', this.config.gatewayUrl);
-      store.putSync('accessToken', this.config.accessToken);
       store.putSync('profile', this.config.profile);
       store.putSync('muted', this.config.muted);
       store.putSync('speakerphoneEnabled', this.config.speakerphoneEnabled);
@@ -2650,6 +3684,27 @@ export class SingleAgentController {
     } catch (error) {
       // Preferences are a convenience; connection must still work in memory.
     }
+    const token = this.config.accessToken;
+    if (token === this.queuedAccessToken) {
+      return;
+    }
+    this.queuedAccessToken = token;
+    const operation = this.configPersistence.catch((): void => undefined).then((): Promise<void> =>
+      this.secureTokenStore.save(store, token)
+    ).then((): void => {
+      this.persistedAccessToken = token;
+    });
+    this.configPersistence = operation;
+    operation.catch((): void => {
+      if (this.queuedAccessToken === token) {
+        this.queuedAccessToken = this.persistedAccessToken;
+      }
+      if (this.configPersistence === operation) {
+        this.configPersistence = Promise.resolve();
+      }
+      this.snapshot.error = '访问口令未能写入安全存储，请重新保存';
+      this.notify();
+    });
   }
 
   private errorMessage(error: BusinessError, fallback: string): string {
@@ -2662,7 +3717,7 @@ export class SingleAgentController {
     const trimmed = base.endsWith('/') ? base.substring(0, base.length - 1) : base;
     const scheme = trimmed.startsWith('https:') ? 'wss:' : 'ws:';
     const rest = trimmed.startsWith('http') ? trimmed.substring(trimmed.indexOf('//')) : trimmed;
-    return scheme + rest + path + '?profile=' + profile;
+    return scheme + rest + path + '?profile=' + encodeURIComponent(profile);
   }
 
   private snapshotForUi(): SingleAgentSnapshot {
@@ -2670,6 +3725,16 @@ export class SingleAgentController {
     const copy = new SingleAgentSnapshot();
     copy.connection = source.connection;
     copy.selectedProfile = source.selectedProfile;
+    copy.agents = source.agents.map((agent: AgentInfo): AgentInfo => {
+      const item = new AgentInfo();
+      item.id = agent.id;
+      item.name = agent.name;
+      item.isDefault = agent.isDefault;
+      item.avatarUrl = agent.avatarUrl;
+      return item;
+    });
+    copy.agentsLoading = source.agentsLoading;
+    copy.agentsError = source.agentsError;
     copy.runtimeSessionId = source.runtimeSessionId;
     copy.storedSessionId = source.storedSessionId;
     copy.voiceEnabled = source.voiceEnabled;
@@ -2699,6 +3764,23 @@ export class SingleAgentController {
     copy.statusDetail = source.statusDetail;
     copy.runtimeModel = source.runtimeModel;
     copy.runtimeProvider = source.runtimeProvider;
+    copy.modelProviders = source.modelProviders.map((provider: ModelProviderInfo): ModelProviderInfo => {
+      const providerCopy = new ModelProviderInfo();
+      providerCopy.id = provider.id;
+      providerCopy.name = provider.name;
+      providerCopy.models = provider.models.map((model: ModelOptionInfo): ModelOptionInfo => {
+        const modelCopy = new ModelOptionInfo();
+        modelCopy.id = model.id;
+        modelCopy.label = model.label;
+        return modelCopy;
+      });
+      return providerCopy;
+    });
+    copy.modelOptionsLoading = source.modelOptionsLoading;
+    copy.modelOptionsError = source.modelOptionsError;
+    copy.modelSwitching = source.modelSwitching;
+    copy.modelSwitchStatus = source.modelSwitchStatus;
+    copy.modelSwitchError = source.modelSwitchError;
     copy.error = source.error;
     copy.approvalDescription = source.approvalDescription;
     copy.approvalCommand = source.approvalCommand;
@@ -2728,6 +3810,7 @@ export class SingleAgentController {
     copy.completedAt = source.completedAt;
     copy.pending = source.pending;
     copy.processExpanded = source.processExpanded;
+    copy.replaying = source.replaying;
     const activities: MessageActivity[] = [];
     for (const sourceActivity of source.activities) {
       const activity = new MessageActivity();

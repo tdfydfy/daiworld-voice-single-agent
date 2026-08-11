@@ -43,5 +43,33 @@
     return {push,flush};
   }
 
-  return {createMediaSpeechFilter};
+  function cleanSpeechText(text){
+    let value=String(text||'').replace(/```[\s\S]*?```/g,' ');
+    value=value.replace(/^\s*MEDIA:\s*.*$/gim,' ');
+    value=value.replace(/\[([^\]]+)\]\([^)]*\)/g,'$1');
+    value=value.replace(/https?:\/\/[^\s]+/gi,' ');
+    value=value.replace(/[\\/~][^\s]+\.[A-Za-z0-9]{1,8}/g,' ');
+    value=value.replace(/[*_#>`~]/g,'');
+    return value.replace(/\s+/g,' ').trim();
+  }
+
+  function createSpeechTextFilter(){
+    let pending='';
+    function push(chunk){
+      pending+=String(chunk||'');
+      let output='',index=pending.search(/[。！？!?；;\n]/);
+      while(index>=0){
+        output+=cleanSpeechText(pending.slice(0,index+1));
+        pending=pending.slice(index+1);index=pending.search(/[。！？!?；;\n]/);
+      }
+      if(pending.length>=160){
+        output+=cleanSpeechText(pending.slice(0,160));pending=pending.slice(160);
+      }
+      return output;
+    }
+    function flush(){const output=cleanSpeechText(pending);pending='';return output}
+    return {push,flush};
+  }
+
+  return {createMediaSpeechFilter,createSpeechTextFilter,cleanSpeechText};
 });

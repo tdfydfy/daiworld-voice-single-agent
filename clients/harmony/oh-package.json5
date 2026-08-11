@@ -1,7 +1,7 @@
 {
   "modelVersion": "5.0.0",
   "name": "daiworld-voice-single-agent-harmony",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "Daiworld Voice Single-Agent native HarmonyOS client",
   "scripts": {
     "verify": "node scripts/verify.mjs"

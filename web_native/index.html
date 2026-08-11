@@ -28,14 +28,19 @@
     </header>
 
     <section class="toolbar">
-      <label class="profile-label">Agent
-        <select id="profile">
-          <option value="default">赫准行</option>
-          <option value="hexiaoma" selected>赫小码</option>
-          <option value="hexiaoxin">赫小新</option>
-        </select>
-      </label>
-      <div id="runtime" class="runtime">等待连接</div>
+      <div class="agent-avatar" aria-hidden="true">
+        <img id="agentAvatarImage" alt="" hidden>
+        <span id="agentAvatarFallback">A</span>
+      </div>
+      <div class="agent-identity">
+        <label class="profile-label">
+          <span class="visually-hidden">Agent</span>
+          <select id="profile" disabled>
+            <option value="">正在加载 Agent…</option>
+          </select>
+        </label>
+        <div id="runtime" class="runtime">等待连接</div>
+      </div>
       <button id="settingsButton" class="ghost settings-trigger" type="button">设置</button>
       <button id="historyButton" class="ghost history-trigger" type="button">历史对话 <span id="historyCount"></span></button>
     </section>
@@ -82,7 +87,7 @@
       <div class="help-content">
         <p>在顶部选择Agent，连接灯变绿后即可使用；历史对话可随时恢复。</p>
         <p>点击“开启实时对话”后直接说话，可连续交流；任务中也能继续补充。</p>
-        <p>说“停止”或点击“停止”可终止当前任务；说“闭麦”只关闭麦克风，思考和播报继续。</p>
+        <p>说“暂停收音”只关闭麦克风，思考和播报继续；“停止”或点击“停止”可终止当前任务。</p>
         <p>需要文字输入时，点击“文字”即可。</p>
       </div>
     </section>
@@ -109,8 +114,8 @@
     </section>
   </div>
 
-  <script src="./assets/voice_filters.js?v=2"></script>
+  <script src="./assets/voice_filters.js?v=3"></script>
   <script src="./assets/media_speech_filter.js?v=1"></script>
-  <script src="./assets/app.js?v=25" defer></script>
+  <script src="./assets/app.js?v=26" defer></script>
 </body>
 </html>

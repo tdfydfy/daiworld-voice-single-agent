@@ -6,6 +6,8 @@ import { webSocket } from '@kit.NetworkKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { TTS_SAMPLE_RATE_DEFAULT, VoiceCommands } from '../models/VoiceProtocol';
 
+const TTS_CONNECT_TIMEOUT_MS = 10000;
+
 export abstract class TtsJobListener {
   abstract onReady(): void;
   abstract onJobStarted(sampleRate: number): void;
@@ -20,8 +22,13 @@ export class StreamingTtsClient {
   private socket: webSocket.WebSocket | undefined = undefined;
   private listener: TtsJobListener | undefined = undefined;
   private connected: boolean = false;
+  private connecting: boolean = false;
   private sampleRate: number = TTS_SAMPLE_RATE_DEFAULT;
   private pendingFrames: string[] = [];
+  private connectionGeneration: number = 0;
+  private pendingFramesGeneration: number = 0;
+  private pendingFlushActive: boolean = false;
+  private connectTimeout?: number;
 
   setListener(listener: TtsJobListener): void {
     this.listener = listener;
@@ -31,27 +38,48 @@ export class StreamingTtsClient {
     return this.connected;
   }
 
+  isConnecting(): boolean {
+    return this.connecting;
+  }
+
   getSampleRate(): number {
     return this.sampleRate;
   }
 
   connect(url: string, cookie: string): void {
-    this.close();
+    this.open(url, cookie, false);
+  }
+
+  reconnect(url: string, cookie: string): void {
+    this.open(url, cookie, true);
+  }
+
+  private open(url: string, cookie: string, preservePendingFrames: boolean): void {
+    this.connectionGeneration += 1;
+    const generation = this.connectionGeneration;
+    this.detachSocket(!preservePendingFrames);
     const socket = webSocket.createWebSocket();
     this.socket = socket;
+    this.connecting = true;
+    this.startConnectTimeout(socket, generation);
     socket.on('open', (err: BusinessError, value: Object) => {
+      if (generation !== this.connectionGeneration || this.socket !== socket) {
+        return;
+      }
+      this.clearConnectTimeout();
       if (!err) {
         this.connected = true;
+        this.connecting = false;
         this.flushPendingFrames();
         if (this.listener) {
           this.listener.onReady();
         }
-      } else if (this.listener) {
-        this.listener.onError(err.message);
+      } else {
+        this.failConnection(socket, generation, err.message);
       }
     });
     socket.on('message', (err: BusinessError, data: string | ArrayBuffer) => {
-      if (err) {
+      if (generation !== this.connectionGeneration || this.socket !== socket || err) {
         return;
       }
       if (typeof data === 'string') {
@@ -61,16 +89,23 @@ export class StreamingTtsClient {
       }
     });
     socket.on('close', (err: BusinessError, value: Object) => {
+      if (generation !== this.connectionGeneration || this.socket !== socket) {
+        return;
+      }
+      this.socket = undefined;
       this.connected = false;
+      this.connecting = false;
+      this.pendingFlushActive = false;
+      this.clearConnectTimeout();
       if (this.listener) {
         this.listener.onClosed();
       }
     });
     socket.on('error', (err: BusinessError) => {
-      this.connected = false;
-      if (this.listener) {
-        this.listener.onError(err.message);
+      if (generation !== this.connectionGeneration || this.socket !== socket) {
+        return;
       }
+      this.failConnection(socket, generation, err.message);
     });
     const headers: Record<string, string> = {};
     if (cookie.length > 0) {
@@ -78,9 +113,10 @@ export class StreamingTtsClient {
     }
     const options: webSocket.WebSocketRequestOptions = { header: headers };
     socket.connect(url, options).catch((error: BusinessError) => {
-      if (this.listener) {
-        this.listener.onError(error.message);
+      if (generation !== this.connectionGeneration || this.socket !== socket) {
+        return;
       }
+      this.failConnection(socket, generation, error.message);
     });
   }
 
@@ -98,12 +134,29 @@ export class StreamingTtsClient {
 
   sendStop(): void {
     this.pendingFrames = [];
+    this.pendingFramesGeneration += 1;
+    if (!this.socket || !this.connected) {
+      return;
+    }
     const frame: Record<string, Object> = {};
     frame[VoiceCommands.TTS_STOP] = true;
-    this.sendFrame(JSON.stringify(frame));
+    const socket = this.socket;
+    const generation = this.connectionGeneration;
+    socket.send(JSON.stringify(frame)).catch((error: BusinessError) => {
+      if (generation !== this.connectionGeneration || this.socket !== socket) {
+        return;
+      }
+      this.failConnection(socket, generation, error.message);
+    });
   }
 
   close(): void {
+    this.connectionGeneration += 1;
+    this.detachSocket(true);
+  }
+
+  private detachSocket(clearPendingFrames: boolean): void {
+    this.clearConnectTimeout();
     const socket = this.socket;
     if (socket) {
       socket.off('open');
@@ -114,25 +167,77 @@ export class StreamingTtsClient {
       this.socket = undefined;
     }
     this.connected = false;
-    this.pendingFrames = [];
+    this.connecting = false;
+    this.pendingFlushActive = false;
+    if (clearPendingFrames) {
+      this.pendingFrames = [];
+      this.pendingFramesGeneration += 1;
+    }
   }
 
   private sendFrame(frame: string): void {
-    if (!this.socket || !this.connected) {
-      this.pendingFrames.push(frame);
-      return;
-    }
-    this.socket.send(frame).catch(() => undefined);
+    this.pendingFrames.push(frame);
+    this.flushPendingFrames();
   }
 
   private flushPendingFrames(): void {
-    if (!this.socket || !this.connected || this.pendingFrames.length === 0) {
+    if (!this.socket || !this.connected || this.pendingFrames.length === 0 || this.pendingFlushActive) {
       return;
     }
-    const frames = this.pendingFrames;
-    this.pendingFrames = [];
-    for (const frame of frames) {
-      this.socket.send(frame).catch(() => undefined);
+    const socket = this.socket;
+    const generation = this.connectionGeneration;
+    this.pendingFlushActive = true;
+    this.sendNextPendingFrame(socket, generation);
+  }
+
+  private sendNextPendingFrame(socket: webSocket.WebSocket, generation: number): void {
+    if (generation !== this.connectionGeneration || this.socket !== socket || !this.connected) {
+      return;
+    }
+    if (this.pendingFrames.length === 0) {
+      this.pendingFlushActive = false;
+      return;
+    }
+    const frame = this.pendingFrames[0];
+    const framesGeneration = this.pendingFramesGeneration;
+    socket.send(frame).then((): void => {
+      if (generation !== this.connectionGeneration || this.socket !== socket) {
+        return;
+      }
+      if (framesGeneration === this.pendingFramesGeneration && this.pendingFrames[0] === frame) {
+        this.pendingFrames.shift();
+      }
+      this.sendNextPendingFrame(socket, generation);
+    }).catch((error: BusinessError): void => {
+      if (generation !== this.connectionGeneration || this.socket !== socket) {
+        return;
+      }
+      this.failConnection(socket, generation, error.message);
+    });
+  }
+
+  private startConnectTimeout(socket: webSocket.WebSocket, generation: number): void {
+    this.clearConnectTimeout();
+    this.connectTimeout = setTimeout((): void => {
+      this.connectTimeout = undefined;
+      this.failConnection(socket, generation, 'TTS 连接超时');
+    }, TTS_CONNECT_TIMEOUT_MS);
+  }
+
+  private clearConnectTimeout(): void {
+    if (this.connectTimeout !== undefined) {
+      clearTimeout(this.connectTimeout);
+      this.connectTimeout = undefined;
+    }
+  }
+
+  private failConnection(socket: webSocket.WebSocket, generation: number, message: string): void {
+    if (generation !== this.connectionGeneration || this.socket !== socket) {
+      return;
+    }
+    this.detachSocket(false);
+    if (this.listener) {
+      this.listener.onError(message.length > 0 ? message : 'TTS 连接失败');
     }
   }
 
@@ -169,8 +274,9 @@ export class StreamingTtsClient {
     }
     if (type === 'error') {
       const message = String(frame['message'] !== undefined ? frame['message'] : 'tts error');
-      if (this.listener) {
-        this.listener.onError(message);
+      const socket = this.socket;
+      if (socket) {
+        this.failConnection(socket, this.connectionGeneration, message);
       }
     }
   }

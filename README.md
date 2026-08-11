@@ -11,7 +11,7 @@ Daiworld Voice 有两种并存的产品形态，单 Agent 版不是主持人多 
 | 产品形态 | 网页版 | HarmonyOS 版 | 定位 |
 |---|---|---|---|
 | 主持人多 Agent 版 | 已有，保持现状 | 已有，保持现状 | 最终高级形态。主持人负责理解意图、调度多个 Agent、组织互动、共享上下文和分配任务；各 Agent 按主持人的安排工作 |
-| 单 Agent 版 | **v21 已稳定** | **1.0 已完成并通过真机验证** | 简化形态。用户直接选择并面对一个 Agent，由该 Agent 自行理解、调用工具、完成任务；用于技术探索、能力验证和聚焦式工作 |
+| 单 Agent 版 | **技术预览** | **最终移动交付面** | 简化形态。用户直接选择并面对一个 Agent，由该 Agent 自行理解、调用工具、完成任务；Web 用于协议验证，HarmonyOS 承担后续产品化 |
 
 本分支只描述和维护**单 Agent 形态**。主持人版网页和主持人版 HarmonyOS 当前不调整，它们拥有独立的交互协议和产品职责。
 
@@ -21,13 +21,15 @@ Daiworld Voice 有两种并存的产品形态，单 Agent 版不是主持人多 
 
 ### 1. Hermes 原生，而不是再造 Agent
 
-Web 和 HarmonyOS 客户端直接复用 Hermes 官方能力：
+Web 技术预览和 HarmonyOS 客户端直接复用 Hermes 官方能力：
 
 - `session.create / session.list / session.resume / session.delete`；
 - `prompt.submit(queued=true)`；
 - `session.interrupt`；
 - 工具事件、思考事件、审批和澄清；
-- Hermes Profile、模型、历史、上下文和工具权限。
+- 动态 Agent Catalog、模型、历史、上下文和工具权限。
+
+Native Adapter 的 `/api/agents` 是 Agent 目录权威来源。客户端只保存不透明 Agent ID 和公开身份字段；Web 在本轮稳定后暂停新增功能，后续以 HarmonyOS 真机体验为主。
 
 客户端不维护第二套 Agent 会话，不复制工具调度，不伪造“已调用某个 Agent”。
 
@@ -84,14 +86,14 @@ WebRTC AEC 是第一层；文本过滤只做兜底：
 
 思考、工具和发言使用不同深浅的深色框体，不把过程和结论混成一团。
 
-### 7. 高风险审批支持屏幕与语音
+### 7. 高风险审批进入对话并支持语音
 
 Hermes 发出 `approval.request` 时：
 
-- 页面显示完整命令、高风险提示和“允许执行 / 阻止执行”；
-- 语音只接受固定的“同意 / 拒绝”词表；
+- HarmonyOS 在 Agent 对话气泡中显示完整命令和高风险提示，不再弹出独立审批卡；
+- 下一条文字或语音只接受固定的“同意 / 取消”词表，并直接映射到 `approval.respond`；
 - 语音同意只作用于当前 Session，不建立永久白名单；
-- 未识别内容保持等待，绝不自动批准。
+- 未识别内容保持等待，绝不自动批准，也不会作为新的 Agent Prompt。
 
 ### 8. Agent 可以发送图片和文件
 
@@ -121,8 +123,11 @@ Agent 显式返回 `MEDIA:<path>` 后：
 - 支持 HarmonyOS 6.1 / API 24，使用 ArkTS 和系统 `CoreSpeechKit`；
 - ASR/TTS 可分别选择鸿蒙离线能力或 Adapter 远端能力；
 - 本地 TTS 按短首段、长续段增量朗读，降低长回复的首句等待；
+- Agent 回复支持单条重读和再次点击停止；重读不创建新会话或重复执行 Agent，并过滤代码、链接、文件路径和 `MEDIA:`；
 - 麦克风持续监听，用户开口暂停当前播报，非停止指令完成后恢复播报并排队提交；
 - 精确整句“停止/stop”会中断任务与播放，并保留在对话上下文中；
+- 远端 ASR/TTS 意外断线后有界退避重连；ASR 保留短 PCM 并合并 1.1 秒内连续 final，TTS 保持待发帧顺序并先排空已收到的 PCM；
+- 纯符号 ASR final 在 Adapter 统一归一为空 final，HarmonyOS 使用相同的 Unicode 字母/数字规则防御性拦截，不创建 Hermes Prompt；
 - 使用 `AUDIO_RECORDING` 长时任务支持后台和息屏监听，实际持续时间仍受设备电源策略约束；
 - 网关、Profile、语音后端、音色、语速和登录状态均持久化保存；
 - 历史按 20 条增量加载，恢复真实日期、模型、耗时、思考和工具过程；工具原始 JSON 不进入回复气泡或 TTS。
@@ -133,19 +138,19 @@ Agent 显式返回 `MEDIA:<path>` 后：
 
 | 领域 | 已实现 |
 |---|---|
-| Agent | 三个独立 Profile 可选：`default / hexiaoma / hexiaoxin`；每次只直接面对一个 Agent |
+| Agent | Adapter 动态 Agent Catalog；兼容三个既有 Profile 环境变量，每次只直接面对一个 Agent |
 | 文字 | 流式回答、工具过程、思考过程、模型与耗时元数据 |
 | 语音输入 | Web：SeedASR-2.0 连续 PCM16/16k；HarmonyOS：CoreSpeechKit 离线识别或远端流式 ASR |
 | 语音输出 | Web：豆包流式 TTS + Edge fallback；HarmonyOS：系统离线 TTS 增量分段或远端 PCM24k |
 | 全双工 | Agent 思考/播报期间持续监听、真人语音暂停/恢复、补充排队 |
 | 控制 | 精确整句“停止/stop”才中断；其他语音默认作为下一轮输入 |
-| 审批 | 高风险卡、按钮、语音同意/拒绝、失败关闭 |
-| 澄清 | `clarify.request` 选择卡 |
+| 审批 | HarmonyOS 对话气泡、文字/语音同意或取消、安全失败；Web 技术预览保留既有协议回归 |
+| 澄清 | HarmonyOS 将问题和编号选项放入对话，下一条回复直达 `clarify.respond` |
 | 文件 | MEDIA 图片预览、附件下载、短期令牌、历史附件恢复 |
 | 历史 | 官方 list/resume/delete、20 条增量、完整日期、模型、耗时、思考与工具过程 |
 | 后台 | HarmonyOS `AUDIO_RECORDING` 长时任务、息屏监听、连接与语音状态恢复 |
 | UI | Web 深色 Linear 桌面/移动端适配；HarmonyOS 原生语音优先界面与持久化设置 |
-| 部署 | 三个 Hermes Profile 后端 + 一个同源 FastAPI Adapter + HTTPS/WSS 反代 |
+| 部署 | 一个或多个 Hermes Agent 后端 + 一个同源 FastAPI Adapter + HTTPS/WSS 反代 |
 
 ---
 
@@ -273,9 +278,9 @@ hvigorw assembleHap --mode module -p product=default -p buildMode=debug
 稳定基线验证记录：
 
 ```text
-Python：8 passed（既有服务器基线）
-Node：11 passed
-HarmonyOS：14 个 ETS 文件静态校验通过，ArkTS/Hvigor 构建通过
+Python：26 passed
+Node：19 passed
+HarmonyOS：17 个 ETS 文件静态校验通过，ArkTS/Hvigor 构建通过
 真机：网关登录、持续离线 ASR、增量离线 TTS、暂停/恢复、硬停止、后台任务、历史恢复已验证
 Native/HarmonyOS 专属代码：`app/native_main.py`、`app/artifacts.py`、`web_native/`、`clients/harmony/`
 桌面/移动端真实服务证据：见 `docs/NATIVE_TEST_MATRIX.md`
@@ -289,6 +294,15 @@ Native版的配置示例见 [`.env.example`](./.env.example)，凭据说明见 [
 
 - `VOICE_ACCESS_TOKEN`：客户端访问Adapter的口令；
 - `HERMES_DASHBOARD_SESSION_TOKEN`：Adapter访问Hermes Profile服务的内部口令；
+- `HERMES_AGENTS_JSON`：可选的动态 Agent Catalog；设置后替代下面三个既有 Profile 地址，内部 URL、Provider 和语音指令不会暴露给客户端；
 - `HERMES_DEFAULT_URL` / `HERMES_HEXIAOMA_URL` / `HERMES_HEXIAOXIN_URL`：Profile服务地址；
 - `HERMES_*_PROVIDER_LABEL`：可选的具体 Provider 显示名，例如 `open1`、`wawapi`；
 - 模型供应商凭据由Hermes自身管理，不进入本项目。
+
+## 八、项目记忆
+
+- [项目路线图](docs/roadmap.md)
+- [当前计划](docs/plan.md)
+- [当前状态](docs/status.md)
+- [变更记录](docs/changelog.md)
+- [关键决策](docs/decisions.md)

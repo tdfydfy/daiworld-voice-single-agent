@@ -1,6 +1,7 @@
 (()=>{
   const $=id=>document.getElementById(id);
   const convo=$('conversation'),profileEl=$('profile'),runtime=$('runtime'),connection=$('connection');
+  const agentAvatarImage=$('agentAvatarImage'),agentAvatarFallback=$('agentAvatarFallback');
   const historyBackdrop=$('historyBackdrop'),historyList=$('historyList'),helpBackdrop=$('helpBackdrop');
   const settingsBackdrop=$('settingsBackdrop'),providerSelect=$('providerSelect'),modelSelect=$('modelSelect');
   const composerBar=document.querySelector('.composer-bar'),textToggle=$('textToggle');
@@ -19,6 +20,7 @@
   let currentSpeechJob=null,activeSpeechJob=null,speechQueue=[];
   let pendingApproval=null,approvalAudio=null;
   let providerOptionsCache=[];
+  let agents=[];
 
   function nearBottom(){return convo.scrollHeight-convo.scrollTop-convo.clientHeight<100}
   function scrollIfFollowing(wasNear=true){if(wasNear)requestAnimationFrame(()=>convo.scrollTop=convo.scrollHeight)}
@@ -36,9 +38,9 @@
     const who=document.createElement('span');who.className='meta-identity';who.textContent=compactAgentIdentity(identity);
     const perf=document.createElement('span');perf.className='meta-timing';perf.textContent=timing;m.replaceChildren(who,perf);
   }
-  function message(role,text,meta='',stamp=true){const follow=nearBottom();clearEmpty();const el=document.createElement('div');el.className='msg '+role;const body=document.createElement('div');body.className='body';body.textContent=text;el.append(body);const shownMeta=meta?`${meta}${stamp?' · '+clock():''}`:(stamp&&(role==='user'||role==='agent')?clock():'');if(shownMeta){const m=document.createElement('span');m.className='meta';m.textContent=shownMeta;el.append(m)}if(role==='agent'){const replay=document.createElement('button');replay.type='button';replay.className='message-replay';replay.textContent='重读';replay.title='重新朗读这条消息';replay.addEventListener('click',()=>void replayMessage(text));el.append(replay)}convo.append(el);scrollIfFollowing(follow);return el}
+  function message(role,text,meta='',stamp=true){const follow=nearBottom();clearEmpty();const el=document.createElement('div');el.className='msg '+role;const body=document.createElement('div');body.className='body';body.textContent=text;el.append(body);const shownMeta=meta?`${meta}${stamp?' · '+clock():''}`:(stamp&&(role==='user'||role==='agent')?clock():'');if(shownMeta){const m=document.createElement('span');m.className='meta';m.textContent=shownMeta;el.append(m)}if(role==='agent'){const replay=document.createElement('button');replay.type='button';replay.className='message-replay';replay.textContent='重读';replay.title='重新朗读这条消息';replay.addEventListener('click',()=>void replayMessage(body.textContent));el.append(replay)}convo.append(el);scrollIfFollowing(follow);return el}
   async function replayMessage(text){
-    const value=cleanMediaText(text||'').trim();
+    const value=mediaSpeech?.cleanSpeechText(text||'')||String(text||'').trim();
     if(!value){message('system','这条消息没有可朗读的正文');return}
     try{
       if(voiceEnabled&&!speechPausedForUser)stopSpeech(true);
@@ -69,6 +71,26 @@
   function setConnected(ok,text){
     const state=ok?'online':text.includes('连接中')?'connecting':'offline';
     connection.className='conn '+state;connection.textContent=text;
+  }
+  function currentAgentDefinition(){return agents.find(agent=>agent.id===profileEl.value)||null}
+  function updateAgentIdentity(){
+    const agent=currentAgentDefinition(),name=agent?.name||'Agent',avatar=String(agent?.avatar_url||'').trim();
+    agentAvatarFallback.textContent=Array.from(name)[0]||'A';agentAvatarFallback.hidden=false;agentAvatarImage.hidden=true;agentAvatarImage.removeAttribute('src');
+    if(avatar){agentAvatarImage.onload=()=>{agentAvatarImage.hidden=false;agentAvatarFallback.hidden=true};agentAvatarImage.onerror=()=>{agentAvatarImage.hidden=true;agentAvatarFallback.hidden=false};agentAvatarImage.src=avatar}
+  }
+  function setCatalogAvailability(available){
+    profileEl.disabled=!available||agents.length<2;$('historyButton').disabled=!available;$('mic').disabled=!available;syncComposer();
+  }
+  async function loadAgentCatalog(preferredId=''){
+    const response=await fetch(base+'api/agents',{headers:{'X-Voice-Token':token()},cache:'no-store'}),data=await response.json();
+    if(!response.ok)throw new Error(data.detail||'Agent目录读取失败');
+    agents=(Array.isArray(data.agents)?data.agents:[]).filter(agent=>agent&&typeof agent.id==='string'&&agent.id&&typeof agent.name==='string'&&agent.name);
+    const saved=preferredId||localStorage.getItem('native_voice_agent_id')||'',matched=agents.find(agent=>agent.id===saved),fallback=agents.find(agent=>agent.is_default)||agents[0]||null;
+    const selected=matched||fallback,fellBack=Boolean(saved&&!matched&&selected);
+    profileEl.replaceChildren();
+    if(!selected){const option=document.createElement('option');option.value='';option.textContent='暂无可用 Agent';profileEl.append(option);runtime.textContent='服务器未配置 Agent';updateAgentIdentity();setCatalogAvailability(false);return {selected:null,fellBack:false}}
+    for(const agent of agents){const option=document.createElement('option');option.value=agent.id;option.textContent=agent.name;profileEl.append(option)}
+    profileEl.value=selected.id;localStorage.setItem('native_voice_agent_id',selected.id);runtime.textContent='模型加载中';updateAgentIdentity();setCatalogAvailability(true);return {selected,fellBack};
   }
   function wsUrl(path,params={}){const u=new URL(base+path,location.href);u.protocol=location.protocol==='https:'?'wss:':'ws:';Object.entries(params).forEach(([k,v])=>u.searchParams.set(k,v));return u.toString()}
   function rpc(method,params={}){return new Promise((resolve,reject)=>{if(!ws||ws.readyState!==1)return reject(new Error('Hermes未连接'));const id=String(++reqId);pending.set(id,{resolve,reject});ws.send(JSON.stringify({jsonrpc:'2.0',id,method,params}));setTimeout(()=>{if(pending.has(id)){pending.delete(id);reject(new Error(method+'超时'))}},30000)})}
@@ -149,16 +171,20 @@
   async function establishSession(){const response=await fetch(base+'api/auth/session',{method:'POST',headers:{'X-Voice-Token':token()},cache:'no-store'});if(!response.ok){let detail='访问口令错误';try{detail=(await response.json()).detail||detail}catch{}throw new Error(detail)}}
   async function connect(){
     closeGateway();setConnected(false,'连接中…');
-    try{await establishSession()}catch(e){setConnected(false,'鉴权失败');message('system',e.message);return}
+    try{
+      await establishSession();const catalog=await loadAgentCatalog(profileEl.value);
+      if(!catalog.selected){setConnected(false,'暂无 Agent');convo.innerHTML='<p class="empty">服务器暂未配置可用 Agent。</p>';return}
+      if(catalog.fellBack)convo.innerHTML=`<p class="empty">原 Agent 已不可用，已切换到 ${catalog.selected.name}。</p>`;
+    }catch(e){setConnected(false,e.message.includes('口令')?'鉴权失败':'目录加载失败');convo.innerHTML='<p class="empty"></p>';convo.querySelector('.empty').textContent=e.message;setCatalogAvailability(false);return}
     ws=new WebSocket(wsUrl('api/hermes/ws',{profile:profileEl.value}));
     ws.onopen=()=>setConnected(true,'Hermes已连接');
-    ws.onclose=()=>{setConnected(false,'连接断开');busy=false;$('stop').disabled=true;stopVoiceConversation(false)};
+    ws.onclose=()=>{setConnected(false,'连接断开');busy=false;$('stop').disabled=true;profileEl.disabled=agents.length<2;stopVoiceConversation(false)};
     ws.onerror=()=>setConnected(false,'连接失败');
     ws.onmessage=event=>{try{handleFrame(JSON.parse(event.data))}catch(e){console.error(e)}};
   }
   function closeGateway(){if(ws){try{ws.close()}catch{}ws=null}pending.forEach(p=>p.reject(new Error('连接关闭')));pending.clear();sessionId=null;storedSessionId=null;stopVoiceConversation(false);stopSpeech(true)}
-  function profileName(){return profileEl.options[profileEl.selectedIndex]?.text||'Agent'}
-  function applyRuntimeInfo(info={}){runtime.textContent=`${profileName()} · ${info.model||'模型加载中'}${info.provider?' · '+info.provider:''}`}
+  function profileName(){return currentAgentDefinition()?.name||profileEl.options[profileEl.selectedIndex]?.text||'Agent'}
+  function applyRuntimeInfo(info={}){const provider=info.provider_label||info.provider_name||info.provider||'';runtime.textContent=`${info.model||'模型加载中'}${provider?' · '+provider:''}`}
   async function createSession(){const r=await rpc('session.create',{cols:100});sessionId=r.session_id;storedSessionId=r.stored_session_id||r.session_key||null;applyRuntimeInfo(r.info||{});if(matchMedia('(min-width:761px)').matches)void openHistory();else void refreshHistoryCount()}
   function historyDate(value){if(!value)return '';return new Date(Number(value)*1000).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false})}
   function closeHistory(){if(matchMedia('(min-width:761px)').matches)return;historyBackdrop.hidden=true}
@@ -267,7 +293,8 @@
   }
 
   function cleanMediaText(text){const filter=mediaSpeech?.createMediaSpeechFilter();return filter?filter.push(String(text||''))+filter.flush():String(text||'')}
-  function createSpeechJob(){return {text:'',ttsText:'',complete:false,ttsFilter:mediaSpeech?.createMediaSpeechFilter()||null,displayFilter:mediaSpeech?.createMediaSpeechFilter()||null}}
+  function cleanSpeechText(text){return mediaSpeech?.cleanSpeechText(text||'')||String(text||'').trim()}
+  function createSpeechJob(){return {text:'',ttsText:'',complete:false,ttsFilter:mediaSpeech?.createSpeechTextFilter()||null,displayFilter:null}}
   function handleFrame(frame){
     if(frame.id&&pending.has(String(frame.id))){const p=pending.get(String(frame.id));pending.delete(String(frame.id));frame.error?p.reject(new Error(frame.error.message||'请求失败')):p.resolve(frame.result);return}
     if(frame.method!=='event')return;const ev=frame.params||{},p=ev.payload||{};
@@ -275,26 +302,26 @@
     if(sessionId&&ev.session_id&&ev.session_id!==sessionId)return;
     if(ev.type==='session.info')applyRuntimeInfo(p);
     else if(ev.type==='message.start'){
-      busy=true;$('stop').disabled=false;turnStartedAt=Date.now();turnFirstTokenAt=0;turnModelLabel=runtime.textContent;activity=null;currentAgent=message('agent','',compactAgentIdentity(turnModelLabel));currentSpeechJob=createSpeechJob();if(activeSpeechJob){speechQueue.push(currentSpeechJob)}else activateSpeechJob(currentSpeechJob);asrInterrupted=false;
+      busy=true;$('stop').disabled=false;profileEl.disabled=true;turnStartedAt=Date.now();turnFirstTokenAt=0;turnModelLabel=runtime.textContent;activity=null;currentAgent=message('agent','',compactAgentIdentity(turnModelLabel));currentSpeechJob=createSpeechJob();if(activeSpeechJob){speechQueue.push(currentSpeechJob)}else activateSpeechJob(currentSpeechJob);asrInterrupted=false;
       if(voiceEnabled){setVoiceState(activeSpeechJob===currentSpeechJob?'thinking':'speaking')}
     }
     else if(ev.type==='message.delta'){
       if(!turnFirstTokenAt)turnFirstTokenAt=Date.now();
       if(!currentAgent)currentAgent=message('agent','',compactAgentIdentity(turnModelLabel||runtime.textContent));
-      const text=p.text||p.rendered||'',follow=nearBottom(),displayDelta=currentSpeechJob?.displayFilter?currentSpeechJob.displayFilter.push(text):text;currentAgent.querySelector('.body').textContent+=displayDelta;if(currentSpeechJob){currentSpeechJob.text+=text;const ttsDelta=currentSpeechJob.ttsFilter?currentSpeechJob.ttsFilter.push(text):text;currentSpeechJob.ttsText+=ttsDelta;if(activeSpeechJob===currentSpeechJob)feedSpeech(ttsDelta)}scrollIfFollowing(follow);
+      const text=p.text||p.rendered||'',speechDelta=typeof p.speech_text==='string'?cleanSpeechText(p.speech_text):(currentSpeechJob?.ttsFilter?currentSpeechJob.ttsFilter.push(text):cleanSpeechText(text)),follow=nearBottom();currentAgent.querySelector('.body').textContent+=text;if(currentSpeechJob){currentSpeechJob.text+=text;currentSpeechJob.ttsText+=speechDelta;if(activeSpeechJob===currentSpeechJob)feedSpeech(speechDelta)}scrollIfFollowing(follow);
     }
     else if(ev.type==='message.complete'){
       const follow=nearBottom(),ended=Date.now(),thinkMs=turnStartedAt?Math.max(0,(turnFirstTokenAt||ended)-turnStartedAt):0,genMs=turnFirstTokenAt?Math.max(0,ended-turnFirstTokenAt):0,totalMs=turnStartedAt?Math.max(0,ended-turnStartedAt):0;
       busy=false;$('stop').disabled=true;const hasFinalText=typeof p.text==='string'||typeof p.rendered==='string',text=typeof p.text==='string'?p.text:(p.rendered||'');
-      if(currentAgent&&hasFinalText)currentAgent.querySelector('.body').textContent=cleanMediaText(text);
+      if(currentAgent&&hasFinalText)currentAgent.querySelector('.body').textContent=text;
       if(currentAgent)renderArtifacts(currentAgent,p.artifacts);
       if(currentAgent)setAgentMeta(currentAgent,turnModelLabel||'Agent',`思考 ${(thinkMs/1000).toFixed(1)}s · 生成 ${(genMs/1000).toFixed(1)}s · 总计 ${(totalMs/1000).toFixed(1)}s · ${clock()}`);
       if(currentSpeechJob){
         const tail=currentSpeechJob.ttsFilter?.flush()||'';currentSpeechJob.ttsText+=tail;if(activeSpeechJob===currentSpeechJob)feedSpeech(tail);
-        if(hasFinalText){currentSpeechJob.text=text;currentSpeechJob.ttsText=cleanMediaText(text)}
+        if(hasFinalText){const speechText=typeof p.speech_text==='string'?p.speech_text:text;currentSpeechJob.text=text;currentSpeechJob.ttsText=cleanSpeechText(speechText)}
         }
         if(turnInterrupted){stopSpeech(true);turnInterrupted=false}else if(currentSpeechJob){currentSpeechJob.complete=true;if(activeSpeechJob===currentSpeechJob)finishSpeech(currentSpeechJob.ttsText)}
-      finishActivity();currentAgent=null;turnStartedAt=0;turnFirstTokenAt=0;scrollIfFollowing(follow);
+      finishActivity();currentAgent=null;turnStartedAt=0;turnFirstTokenAt=0;profileEl.disabled=agents.length<2;scrollIfFollowing(follow);
     }
     else if(ev.type==='tool.start'){
       const id=p.tool_id||`tool-${Date.now()}`,row=activityRow(id,`⏳ ${p.name||'unknown'}`,p.context||p.args_text||'');row.classList.add('tool-step');row.querySelector('.activity-icon').textContent='⏳';if(activity)activity.details.open=true;
@@ -565,7 +592,7 @@
   function speechEnded(){const ended=activeSpeechJob;stopSpeech(true);if(ended&&activeSpeechJob===ended)activeSpeechJob=null;if(speechQueue.length){startNextSpeechJob();return}if(voiceEnabled&&!bargeCapturing){stopBargeMonitor();setVoiceState('idle');scheduleListening()}}
   function playPcm(buffer){const view=new DataView(buffer),samples=new Float32Array(buffer.byteLength/2);for(let i=0;i<samples.length;i++)samples[i]=view.getInt16(i*2,true)/32768;const rate=speechCtx.sampleRate||24000,audio=speechCtx.createBuffer(1,samples.length,24000);audio.copyToChannel(samples,0);const src=speechCtx.createBufferSource();src.buffer=audio;src.connect(speechCtx.destination);speechNext=Math.max(speechNext,speechCtx.currentTime+.02);src.start(speechNext);speechNext+=audio.duration}
 
-  function syncComposer(){const t=$('text'),v=t.value.trim(),s=document.querySelector('.send');if(s)s.disabled=!v;t.style.height='auto';t.style.height=Math.min(t.scrollHeight,200)+'px'}
+  function syncComposer(){const t=$('text'),v=t.value.trim(),s=document.querySelector('.send');if(s)s.disabled=!v||!profileEl.value;t.style.height='auto';t.style.height=Math.min(t.scrollHeight,200)+'px'}
   function setTextComposer(open){
     composerBar.classList.toggle('text-open',open);textToggle.setAttribute('aria-expanded',String(open));
     if(open)setTimeout(()=>$('text').focus(),0);
@@ -589,6 +616,6 @@
   historyBackdrop.onclick=e=>{if(e.target===historyBackdrop)closeHistory()};
   window.addEventListener('keydown',e=>{if(e.key==='Escape'){if(!helpBackdrop.hidden)closeHelp();else if(!historyBackdrop.hidden)closeHistory()}});
   $('newSession').onclick=()=>{closeHistory();convo.innerHTML='<p class="empty">新对话已创建。</p>';connect()};
-  profileEl.onchange=()=>{closeHistory();$('historyCount').textContent='';convo.innerHTML='<p class="empty">已切换Agent，正在创建独立Hermes会话。</p>';connect()};
+  profileEl.onchange=()=>{localStorage.setItem('native_voice_agent_id',profileEl.value);updateAgentIdentity();runtime.textContent='模型加载中';closeHistory();$('historyCount').textContent='';convo.innerHTML='<p class="empty">已切换Agent，正在创建独立Hermes会话。</p>';connect()};
   window.addEventListener('beforeunload',closeGateway);setVoiceState('off');connect();
 })();

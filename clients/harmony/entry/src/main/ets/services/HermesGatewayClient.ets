@@ -108,6 +108,7 @@ export class HermesGatewayClient {
   private requestCounter: number = 0;
   private connected: boolean = false;
   private currentSessionId: string = '';
+  private socketGeneration: number = 0;
 
   setListener(listener: GatewayListener): void {
     this.listener = listener;
@@ -124,8 +125,12 @@ export class HermesGatewayClient {
   connect(url: string, cookie: string): void {
     this.close();
     const socket = webSocket.createWebSocket();
+    const generation = this.socketGeneration;
     this.socket = socket;
     socket.on('open', (err: BusinessError, value: Object) => {
+      if (this.socket !== socket || this.socketGeneration !== generation) {
+        return;
+      }
       if (err) {
         this.connected = false;
         if (this.listener) {
@@ -136,6 +141,9 @@ export class HermesGatewayClient {
       this.connected = true;
     });
     socket.on('message', (err: BusinessError, data: string | ArrayBuffer) => {
+      if (this.socket !== socket || this.socketGeneration !== generation) {
+        return;
+      }
       if (err) {
         return;
       }
@@ -144,6 +152,9 @@ export class HermesGatewayClient {
       }
     });
     socket.on('close', (err: BusinessError, value: Object) => {
+      if (this.socket !== socket || this.socketGeneration !== generation) {
+        return;
+      }
       this.connected = false;
       this.rejectAll('connection closed');
       if (this.listener) {
@@ -151,6 +162,9 @@ export class HermesGatewayClient {
       }
     });
     socket.on('error', (err: BusinessError) => {
+      if (this.socket !== socket || this.socketGeneration !== generation) {
+        return;
+      }
       this.connected = false;
       if (this.listener) {
         this.listener.onError(err.message);
@@ -162,6 +176,9 @@ export class HermesGatewayClient {
     }
     const options: webSocket.WebSocketRequestOptions = { header: headers };
     socket.connect(url, options).catch((error: BusinessError) => {
+      if (this.socket !== socket || this.socketGeneration !== generation) {
+        return;
+      }
       this.connected = false;
       if (this.listener) {
         this.listener.onError(error.message);
@@ -170,6 +187,7 @@ export class HermesGatewayClient {
   }
 
   close(): void {
+    this.socketGeneration += 1;
     const socket = this.socket;
     if (socket) {
       socket.off('open');
@@ -180,6 +198,7 @@ export class HermesGatewayClient {
       this.socket = undefined;
     }
     this.connected = false;
+    this.currentSessionId = '';
     this.rejectAll('client closed');
   }
 

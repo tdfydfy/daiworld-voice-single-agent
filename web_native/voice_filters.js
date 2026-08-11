@@ -38,7 +38,7 @@
   }
 
   function isCloseMicCommand(text){
-    return ['闭麦','关闭麦克风','关闭话筒','mutemicrophone'].includes(normalizeControl(text));
+    return ['关闭话筒','关闭麦克风','关闭microphone','暂停收音'].includes(normalizeControl(text));
   }
 
   function splitThinkingLines(text){

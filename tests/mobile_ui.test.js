@@ -31,15 +31,20 @@ test('usage tips are concise and live behind the help entry', () => {
   assert.match(html, /id="helpButton"/);
   assert.match(html, /id="helpBackdrop"[^>]*hidden/);
   assert.equal((html.match(/<div class="help-content">[\s\S]*?<\/div>/)?.[0].match(/<p>/g) || []).length, 4);
-  assert.match(html, /说“停止”或点击“停止”可终止当前任务/);
+  assert.match(html, /说“暂停收音”只关闭麦克风，思考和播报继续；“停止”或点击“停止”可终止当前任务/);
   assert.doesNotMatch(html, /模型、Provider和执行过程/);
   assert.match(app, /\$\('helpButton'\)\.onclick=openHelp/);
   assert.match(app, /helpBackdrop\.onclick/);
 });
 
-test('mobile header hides runtime detail while message identity keeps provider', () => {
-  assert.match(mobileCss(), /\.runtime\{display:none\}/);
+test('agent header keeps runtime detail beside dynamic identity on mobile', () => {
+  assert.match(html, /id="agentAvatarFallback"/);
+  assert.match(html, /<select id="profile" disabled>/);
+  assert.match(mobileCss(), /\.runtime\{display:block/);
   assert.match(app, /provider\?' · '\+provider/);
+  assert.match(app, /api\/agents/);
+  assert.match(app, /native_voice_agent_id/);
+  assert.match(app, /原 Agent 已不可用/);
   assert.match(app, /activityRow\('status','当前状态',text\)/);
   assert.match(css, /\.conn\.online::before\{box-shadow:/);
   assert.match(css, /\.conn\.connecting/);
@@ -60,8 +65,15 @@ test('messages expose replay and thinking renders as separate lines', () => {
   assert.match(css, /\.thinking-line/);
 });
 
+test('screen text stays complete while speech_text is used for TTS', () => {
+  assert.match(app, /textContent\+=text/);
+  assert.match(app, /typeof p\.speech_text==='string'/);
+  assert.match(app, /cleanSpeechText\(speechText\)/);
+  assert.doesNotMatch(app, /textContent=cleanMediaText\(text\)/);
+});
+
 test('voice input filters punctuation and supports close-microphone command', () => {
   assert.match(app, /hasSemanticContent/);
   assert.match(app, /isCloseMicCommand/);
-  assert.match(html, /“闭麦”/);
+  assert.match(html, /“暂停收音”/);
 });

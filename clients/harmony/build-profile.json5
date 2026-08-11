@@ -1,9 +1,24 @@
 {
   "app": {
-    "signingConfigs": [],
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "C:\\Users\\mydfy\\.ohos\\config\\default_harmony_0v8eWHQYSQfLl_PLt5b455au5ZFGV_6xWDfgT8z6D-o=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001B99507CF1DEBC2169AA95C16B79600457D15F48AC8475CDC4FAC97927FA3C5A689B11570C70ECEC",
+          "profile": "C:\\Users\\mydfy\\.ohos\\config\\default_harmony_0v8eWHQYSQfLl_PLt5b455au5ZFGV_6xWDfgT8z6D-o=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "C:\\Users\\mydfy\\.ohos\\config\\default_harmony_0v8eWHQYSQfLl_PLt5b455au5ZFGV_6xWDfgT8z6D-o=.p12",
+          "storePassword": "0000001B651D5296FEF7083D74BE225A920944AF1FF558365F72FA76C88A2DED26220049E4DCE221F5298F"
+        }
+      }
+    ],
     "products": [
       {
         "name": "default",
+        "signingConfig": "default",
         "compatibleSdkVersion": "6.1.1(24)",
         "targetSdkVersion": "6.1.1(24)",
         "runtimeOS": "HarmonyOS",
