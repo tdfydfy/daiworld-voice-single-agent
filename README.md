@@ -1,7 +1,7 @@
 # Daiworld Voice — Single Agent Edition
 
 > 当前分支：`main`
-> 当前基线：Web v21 + HarmonyOS 1.0
+> 当前基线：Web v21 + HarmonyOS 1.1.1
 > 当前入口：<https://your-gateway.example/voice-native/>
 
 Daiworld Voice 有两种并存的产品形态，单 Agent 版不是主持人多 Agent 版的替代品。
@@ -124,6 +124,7 @@ Agent 显式返回 `MEDIA:<path>` 后：
 - ASR/TTS 可分别选择鸿蒙离线能力或 Adapter 远端能力；
 - 本地 TTS 按短首段、长续段增量朗读，降低长回复的首句等待；
 - Agent 回复支持单条重读和再次点击停止；重读不创建新会话或重复执行 Agent，并过滤代码、链接、文件路径和 `MEDIA:`；
+- Hermes 网关由 Adapter 每 25 秒下发应用层心跳；HarmonyOS 在收到首个心跳后启用 70 秒看门狗，自动重连时保留消息、语音输出开关和当前播放状态；
 - 麦克风持续监听，用户开口暂停当前播报，非停止指令完成后恢复播报并排队提交；
 - 精确整句“停止/stop”会中断任务与播放，并保留在对话上下文中；
 - 远端 ASR/TTS 意外断线后有界退避重连；ASR 保留短 PCM 并合并 1.1 秒内连续 final，TTS 保持待发帧顺序并先排空已收到的 PCM；
@@ -171,7 +172,7 @@ Agent 显式返回 `MEDIA:<path>` 后：
 
 - 访问口令校验；
 - Profile 到 Hermes `serve --isolated` 的映射；
-- JSON-RPC、ASR、TTS WebSocket 透明转发；
+- JSON-RPC、ASR、TTS WebSocket 转发，并在 JSON-RPC 下行链路注入 `gateway.heartbeat`；
 - Hermes 历史详情聚合；
 - MEDIA 文件短期令牌。
 
@@ -278,9 +279,9 @@ hvigorw assembleHap --mode module -p product=default -p buildMode=debug
 稳定基线验证记录：
 
 ```text
-Python：26 passed
+Python：27 passed
 Node：19 passed
-HarmonyOS：17 个 ETS 文件静态校验通过，ArkTS/Hvigor 构建通过
+HarmonyOS：18 个 ETS 文件静态校验通过，ArkTS/Hvigor 构建通过
 真机：网关登录、持续离线 ASR、增量离线 TTS、暂停/恢复、硬停止、后台任务、历史恢复已验证
 Native/HarmonyOS 专属代码：`app/native_main.py`、`app/artifacts.py`、`web_native/`、`clients/harmony/`
 桌面/移动端真实服务证据：见 `docs/NATIVE_TEST_MATRIX.md`

@@ -2,6 +2,12 @@
 
 ## 2026-08-11
 
+- 新增：Adapter 在 Hermes JSON-RPC 下行链路每 25 秒发送 `gateway.heartbeat`；HarmonyOS 在收到首个心跳后启用 70 秒看门狗，并兼容不发送心跳的旧 Adapter。
+- 修复：自动网关重连使用无损 `session.resume`，不再调用 `stopVoice()`、清空消息或重放 Prompt；Gateway 错误不再覆盖独立播放状态。
+- 修复：系统 TTS 单条重读不再等待无关的远端 PCM renderer 清理，远端重读仍按代际串行清理以隔离迟到回调。
+- 发布：本地签名包提升为 `1.1.1 (1010001)`；Python 27 项、Node 19 项、Harmony 静态校验、ArkTS 类型检查和签名构建通过，本条不代表已部署或真机验收。
+- 部署：`foxi` Adapter 已更新并保留现网回滚副本；运行源码哈希、systemd `active/running`、本机/公开 `200` 和未鉴权 `401` 检查通过。`1.1.1 (1010001)` HAP 已保留数据覆盖安装，应用未启动，声音验收仍待用户操作。
+- 验收：用户确认 `1.1.1` 当前基本可用；Agent/运行身份展示、供应商主动刷新、重读无声、思考呼吸音和设置布局问题已转入下一阶段计划。
 - Fixed HarmonyOS replay lifecycle races: old PCM renderer cleanup is serialized before new replay TTS starts, replay generations invalidate stale async work, and late remote/system TTS callbacks cannot clear or overwrite the new replay state.
 - Added cancellation protection for system TTS requests that are still initializing when `stopSpeaking()` is called.
 - Verification and delivery: Harmony static checks, ArkTS type check, signed HAP assembly, and Node tests passed; the signed HAP was cover-installed to device `6HQ0226409028766` (SHA-256 `06558583C0A89E9F5455824463E0AAA803976C7C054F1AC36B5174948DF36BAC`).

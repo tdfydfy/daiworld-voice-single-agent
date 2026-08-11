@@ -80,6 +80,7 @@ export interface SessionSummary {
 
 export class HermesEvents {
   static readonly GATEWAY_READY: string = 'gateway.ready';
+  static readonly GATEWAY_HEARTBEAT: string = 'gateway.heartbeat';
   static readonly SESSION_INFO: string = 'session.info';
   static readonly MESSAGE_START: string = 'message.start';
   static readonly MESSAGE_DELTA: string = 'message.delta';

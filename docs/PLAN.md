@@ -1,20 +1,52 @@
 # 当前计划
 
-## Current follow-up - replay lifecycle
-
-- [x] Serialize replay cleanup before starting a replacement TTS job; protect the active replay from stale renderer and TTS callbacks.
-- [x] Cancel pending system TTS initialization after `stopSpeaking()` so an old replay cannot start after a new replay has been queued.
-- [x] Run Harmony static verification, ArkTS type checking, signed HAP assembly, Node tests, and cover-install the HAP to the connected device.
-- [ ] User true-device acceptance: start the app and confirm replay produces audible output, can be stopped, and can be replayed again without waiting for another message.
-
 更新时间：2026-08-11
+
+## 当前跟进：网关心跳与断线后重读恢复
+
+- 来源：[用户原始任务](plans/2026-08-11-gateway-heartbeat-and-replay-recovery.md)
+- 目标：消除真机约 135 秒一次的阶段性网关断线，并恢复断线重连后的有声重读。
+- [x] Adapter 在 Hermes JSON-RPC 下行链路每 25 秒发送 `gateway.heartbeat`，并用发送锁隔离上游事件与心跳并发写入。
+- [x] HarmonyOS 收到首个心跳后启用 70 秒看门狗；超时关闭悬挂 socket，旧 Adapter 不发送心跳时保持兼容。
+- [x] 自动重连改用无损 Session 恢复，不再调用会执行 `stopVoice()` 的手动历史恢复路径，也不清空消息或重放 Prompt。
+- [x] Gateway 错误不再强制归零独立播放状态；系统 TTS 重读不等待无关的远端 `PcmPlayer.stop()`。
+- [x] 版本提升至 `1.1.1 (1010001)`；Python 27 项、Node 19 项、Harmony 18 个 ETS 静态校验、ArkTS 类型检查和签名 HAP 构建通过。
+- [x] 按[部署授权](plans/2026-08-11-deploy-heartbeat-and-install-v111.md)更新 `foxi` Adapter，并将 `1.1.1` HAP 保留数据覆盖安装到设备 `6HQ0226409028766`。
+- [x] 用户确认当前 `1.1.1` 版本基本可用。
+- [ ] 长连接与重读专项验收：保持连接超过 5 分钟，确认不再按约 135 秒重连；当前重读仍无声，需下一阶段继续定位。
+- 风险：服务、公开 HTTP 入口和安装版本已验证；Cloudflare / OpenResty 的真实长连接保活和系统 TTS 可听结果仍需用户真机确认。
+
+## 下一阶段：HarmonyOS 界面与声音可靠性
+
+- 来源：[1.1.1 基本可用确认与后续问题](plans/2026-08-11-v111-acceptance-and-follow-up-issues.md)
+- 本轮约束：只记录并推送，不修改功能或 UI 代码。
+
+- [ ] [Agent 运行身份] 压缩左上角 Agent 选择框，并让供应商/模型状态主动同步
+  - 目标：Agent 选择不占用过长横向空间，主界面显式呈现当前供应商和模型或提供明确设置入口。
+  - 方案摘要：梳理 Agent Catalog、`session.info` 和模型选项加载时机；应用启动、Session 创建/恢复和运行身份变化时主动刷新，不依赖用户进入设置页触发。
+  - 验收条件：设置页不再长期显示错误的默认 `custom`；无需打开设置即可看到已确认的实际供应商/模型；窄屏标题区不拥挤。
+
+- [ ] [消息重读] 收紧播放按钮布局并继续定位重读无声
+  - 目标：播放按钮不单独占行或撑大消息框，放在气泡外右下角；点击后实际产生可听语音，并支持停止和再次重读。
+  - 方案摘要：先记录系统/远端 TTS 从点击、文本过滤、初始化、`onStart`/PCM 到播放完成的完整状态路径，再确定修复点；布局与播放状态继续解耦。
+  - 验收条件：短/长回复均可重读；播放按钮位置稳定，不扩大正文气泡；停止和二次重读状态正确。
+
+- [ ] [思考提示音] 检查呼吸音偶发缺失路径
+  - 目标：需要思考提示时稳定开始，Agent 结束、错误、中断或 Session 恢复时稳定停止，不出现偶发缺失或残留。
+  - 方案摘要：逐一核对提交、排队、`message.start`、思考事件、终止事件、Gateway 重连及音频焦点变化路径。
+  - 验收条件：相同交互路径下提示音行为一致；正常完成、错误和中断都能正确收尾。
+
+- [ ] [设置布局] 使用成组双列布局并强化分区
+  - 目标：远端地址/口令、供应商/模型、音色/语速等相关设置在可用宽度内成对双列展示，不再每项独占一行。
+  - 方案摘要：按“连接、Agent 运行配置、语音”划分清晰区段，用间距、分隔线和小标题建立层级；窄屏必要时安全回落单列。
+  - 验收条件：常用手机宽度下信息密度提高且标签/控件不截断；不同设置组边界清楚，不发生混淆或重叠。
 
 ## 产品落点与范围（2026-08-11）
 
 - Web Native 仅作为同源技术预览和自动化验证面；本轮动态 Agent 功能稳定后，暂停 Web 客户端新增功能。
 - HarmonyOS 移动应用是最终交付面，后续语音、交互和真机验收优先投入 HarmonyOS；Web 只保留必要的协议回归和稳定性修复。
 
-## 当前里程碑：1.1.0 安全与连接韧性
+## 已完成里程碑：1.1.0 安全与连接韧性
 
 - 来源：`docs/plans/2026-08-11-non-device-development-milestone.md`
 - 目标：先连续完成可在本地验证的安全与连接韧性能力，再统一部署并进行真机验收。
@@ -24,7 +56,7 @@
   - [x] Gateway 鉴权失效和意外断开可恢复，Session 重建/恢复不重复提交用户消息。
   - [x] Python、Node、Harmony 静态校验和 ArkTS 类型检查覆盖新增安全与重连约束。
   - [x] 版本提升至 `1.1.0`，签名 HAP 构建和包内版本核验通过。
-- 当前动作：Adapter 与 `1.1.0` HAP 已完成统一部署/安装；等待用户启动应用并完成真机验收。
+- 交付结果：Adapter 与 `1.1.0` HAP 已完成统一部署/安装；后续连接保活与重读问题由顶部 `1.1.1` 跟进项承接。
 - 风险：HUKS 密钥生命周期、旧明文令牌一次性迁移、Gateway 真实断网恢复和 Session 连续性仍需在统一真机测试中确认。
 
 ## 正在做
@@ -62,7 +94,7 @@
   - [x] 下一条文字或语音直接走 `approval.respond` / `clarify.respond`，不触发新的 Agent Prompt
   - [x] 审批只接受精确同意 / 取消词，未知内容保持等待且默认安全失败
   - [x] Adapter 识别 Hermes 的顶层 `provider` / `is_current` 字段，返回当前具体 Provider（服务器实测为 `open1`，可选 `wawapi`），不再按模型名误匹配 `openai-api`
-  - [x] HarmonyOS 设置页从 HAP 清单读取并显示版本名和版本码，当前本地待部署版本为 `1.1.0 (1010000)`
+  - [x] HarmonyOS 设置页从 HAP 清单读取并显示版本名和版本码，该能力首次随 `1.1.0 (1010000)` 交付
   - [x] Python 25 项、Node 19 项、Harmony 静态校验、ArkTS 编译和签名 HAP 构建通过
   - [x] 新版 Adapter 和可回滚部署脚本已放入 `foxi:/home/admin/daiworld-voice-agent-update-20260811/`，上传哈希一致且暂存源码编译通过
   - [x] 用户执行交互式 `sudo` 完成 Adapter 更新，并确认运行文件哈希与暂存版本一致

@@ -78,6 +78,10 @@ WSS /api/hermes/ws?profile=<profile>
 
 服务端连接成功后发送 `gateway.ready` 事件。客户端再调用 `session.create` 或 `session.resume`。
 
+Adapter 在 `/api/hermes/ws` 建立后每 25 秒向客户端发送 `gateway.heartbeat`。该事件不转发到上游 Hermes，也不进入消息或状态 UI。HarmonyOS 只在收到首个心跳后启动 70 秒看门狗；70 秒内没有后续心跳时关闭旧 socket 并进入有界重连。没有发送心跳的旧 Adapter 不启用该看门狗，以保持协议兼容。
+
+瞬态错误恢复时，客户端重新鉴权并恢复当前 `storedSessionId`，但不得调用手动历史恢复路径、关闭语音输出、清空现有消息或自动重放 Prompt。401/403 仍是终止鉴权失败，不自动重试。
+
 ### 3.2 请求格式
 
 ```json
@@ -134,6 +138,7 @@ WSS /api/hermes/ws?profile=<profile>
 | 事件 | 关键字段 | 行为 |
 |---|---|---|
 | `gateway.ready` | — | create/resume Session |
+| `gateway.heartbeat` | — | 客户端内部刷新网关看门狗，不转发到业务事件监听器 |
 | `session.info` | `model, provider, provider_label/provider_name, profile_name` | 更新运行时身份并确认待处理的模型切换；具体 Provider 名优先于类型字段 |
 | `message.start` | — | 创建 Agent 气泡和 SpeechJob |
 | `message.delta` | `text/rendered, speech_text?` | 屏幕追加完整正文；TTS 优先追加 `speech_text` |
@@ -283,6 +288,7 @@ speechQueue[]
 - HarmonyOS 的文本和 `done` 帧使用单通道有序发送；发送失败时失败帧留在队首，重连后继续，不能按 Promise 回调顺序重排；
 - 远端连接按 `250 / 750 / 1500 / 3000 ms` 封顶退避恢复，单次建连超过 10 秒视为失败，旧 socket 回调不得改变新连接；
 - STOP 和显式关闭才清空待发送队列。
+- 单条重读按当前语音后端清理：系统 TTS 只停止 CoreSpeech 请求，不等待无关的远端 PCM renderer；远端 TTS 必须等待旧 renderer 清理完成，并用代际隔离迟到回调后再启动新任务。
 
 ### 7.4 MEDIA 文本过滤
 
@@ -556,7 +562,7 @@ GET /api/hermes/sessions/{storedId}?profile=...
 | 历史继续 | 同一持久上下文 |
 | 历史模型/时间 | 与实时同一视觉结构 |
 | Profile切换 | 历史和Session隔离 |
-| 网络恢复 | 不显示旧连接迟到事件；远端 ASR 保留短 PCM，TTS 待发帧保持顺序并自动恢复 |
+| 网络恢复 | 25 秒心跳维持网关；70 秒看门狗关闭悬挂连接；不显示旧连接迟到事件、不清空消息或关闭语音输出；远端 ASR 保留短 PCM，TTS 待发帧保持顺序并自动恢复 |
 | 后台/锁屏 | 按平台真实能力显示，不虚假在线 |
 
 ## 17. 变更规则

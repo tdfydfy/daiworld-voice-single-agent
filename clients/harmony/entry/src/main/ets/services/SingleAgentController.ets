@@ -1035,11 +1035,16 @@ export class SingleAgentController {
     this.pausedForUser = false;
     this.replayCleanupActive = true;
     this.cancelRemoteTtsReconnect();
-    this.tts.sendStop();
-    this.systemSpeech?.stopSpeaking();
     this.clearSystemSpeechQueue(false);
     this.snapshot.playback = 'none';
     this.snapshot.ttsState = this.voiceOutputEnabled ? 'ready' : 'stopped';
+    if (this.useSystemSpeech) {
+      this.systemSpeech?.stopSpeaking();
+      const cleanup = Promise.resolve();
+      this.replayCleanup = cleanup;
+      return cleanup;
+    }
+    this.tts.sendStop();
     const cleanup = this.replayCleanup.then((): Promise<void> => {
       return this.player.stop().catch(() => undefined);
     }).catch((): void => undefined);
@@ -1347,7 +1352,7 @@ export class SingleAgentController {
     this.snapshot.connection = 'online';
     this.snapshot.error = '';
     if (this.snapshot.storedSessionId.length > 0) {
-      this.resumeSession(this.snapshot.storedSessionId, true);
+      this.restoreSessionAfterReconnect(this.snapshot.storedSessionId);
       return;
     }
     this.gateway.createSession(100).then((result: Object) => {
@@ -1367,7 +1372,6 @@ export class SingleAgentController {
     hilog.error(CONTROLLER_LOG_DOMAIN, CONTROLLER_LOG_TAG, 'gateway error: %{public}s', errorText);
     this.snapshot.connection = 'offline';
     this.snapshot.agentBusy = false;
-    this.snapshot.playback = 'none';
     this.snapshot.conversationLoading = false;
     this.snapshot.error = errorText;
     this.cancelModelSwitch('模型切换未确认：' + errorText);
@@ -1387,7 +1391,6 @@ export class SingleAgentController {
     );
     this.snapshot.connection = 'offline';
     this.snapshot.agentBusy = false;
-    this.snapshot.playback = 'none';
     this.snapshot.conversationLoading = false;
     if (wasOnline) {
       this.snapshot.error = '网关连接已断开';
@@ -1494,7 +1497,7 @@ export class SingleAgentController {
       if (!capabilities || !capabilities.tts) {
         this.snapshot.ttsState = 'error';
         this.snapshot.error = '设备不支持鸿蒙本地语音合成';
-      } else {
+      } else if (this.snapshot.playback === 'none' && this.snapshot.ttsState !== 'speaking') {
         this.snapshot.ttsState = 'ready';
       }
       if (this.voiceWanted) {
@@ -3232,7 +3235,7 @@ export class SingleAgentController {
     this.listHistory(this.snapshot.historyLimit + 20);
   }
 
-  resumeSession(storedId: string, automatic: boolean = false): void {
+  resumeSession(storedId: string): void {
     if (storedId.length === 0 || this.snapshot.agentBusy || this.snapshot.conversationLoading) {
       return;
     }
@@ -3264,7 +3267,32 @@ export class SingleAgentController {
       if (this.snapshot.storedSessionId !== storedId) {
         return;
       }
-      if (automatic && this.isSessionNotFound(error)) {
+      this.snapshot.conversationLoading = false;
+      this.snapshot.error = this.errorMessage(error, '历史会话恢复失败');
+      this.notify();
+    });
+  }
+
+  private restoreSessionAfterReconnect(storedId: string): void {
+    if (storedId.length === 0 || this.snapshot.conversationLoading) {
+      return;
+    }
+    this.snapshot.conversationLoading = true;
+    this.snapshot.statusTitle = '正在恢复连接';
+    this.snapshot.statusDetail = '正在恢复当前会话';
+    this.snapshot.error = '';
+    this.notify();
+    this.gateway.resumeSession(storedId, 100).then((result: Object) => {
+      if (this.snapshot.storedSessionId !== storedId) {
+        return;
+      }
+      this.snapshot.conversationLoading = false;
+      this.onSessionCreated(result);
+    }).catch((error: BusinessError) => {
+      if (this.snapshot.storedSessionId !== storedId) {
+        return;
+      }
+      if (this.isSessionNotFound(error)) {
         this.snapshot.storedSessionId = '';
         this.snapshot.runtimeSessionId = '';
         this.snapshot.messages = [];
@@ -3280,7 +3308,7 @@ export class SingleAgentController {
         return;
       }
       this.snapshot.conversationLoading = false;
-      this.snapshot.error = this.errorMessage(error, '历史会话恢复失败');
+      this.snapshot.error = this.errorMessage(error, '当前会话恢复失败');
       this.notify();
     });
   }

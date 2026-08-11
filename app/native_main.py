@@ -24,6 +24,19 @@ WEB_DIR = Path(__file__).resolve().parent.parent / "web_native"
 MAX_TRANSCRIBE_BODY = 25 * 1024 * 1024
 MAX_SPEAK_BODY = 1 * 1024 * 1024
 MAX_WS_MESSAGE = 16 * 1024 * 1024
+GATEWAY_HEARTBEAT_INTERVAL_SECONDS = 25.0
+GATEWAY_HEARTBEAT_FRAME = json.dumps(
+    {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {
+            "type": "gateway.heartbeat",
+            "session_id": "",
+            "payload": {},
+        },
+    },
+    separators=(",", ":"),
+)
 AGENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 GENERIC_PROVIDER_NAMES = {
     "",
@@ -485,10 +498,21 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
         upstream_url: str,
         transform_text: Callable[[str], str] | None = None,
         transform_client_text: Callable[[str], str] | None = None,
+        heartbeat_interval: float | None = None,
     ) -> None:
         await client_ws.accept()
         try:
             async with websockets.connect(upstream_url, max_size=MAX_WS_MESSAGE, ping_interval=20) as upstream:
+                client_send_lock = asyncio.Lock()
+
+                async def send_client_text(message: str) -> None:
+                    async with client_send_lock:
+                        await client_ws.send_text(message)
+
+                async def send_client_bytes(message: bytes) -> None:
+                    async with client_send_lock:
+                        await client_ws.send_bytes(message)
+
                 async def client_to_upstream() -> None:
                     while True:
                         message = await client_ws.receive()
@@ -510,14 +534,25 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
                 async def upstream_to_client() -> None:
                     async for message in upstream:
                         if isinstance(message, bytes):
-                            await client_ws.send_bytes(message)
+                            await send_client_bytes(message)
                         else:
-                            await client_ws.send_text(transform_text(message) if transform_text else message)
+                            await send_client_text(transform_text(message) if transform_text else message)
 
-                first = asyncio.create_task(client_to_upstream())
-                second = asyncio.create_task(upstream_to_client())
+                async def heartbeat_to_client() -> None:
+                    if heartbeat_interval is None:
+                        return
+                    while True:
+                        await asyncio.sleep(heartbeat_interval)
+                        await send_client_text(GATEWAY_HEARTBEAT_FRAME)
+
+                tasks = {
+                    asyncio.create_task(client_to_upstream()),
+                    asyncio.create_task(upstream_to_client()),
+                }
+                if heartbeat_interval is not None:
+                    tasks.add(asyncio.create_task(heartbeat_to_client()))
                 done, pending = await asyncio.wait(
-                    {first, second}, return_when=asyncio.FIRST_COMPLETED
+                    tasks, return_when=asyncio.FIRST_COMPLETED
                 )
                 for task in pending:
                     task.cancel()
@@ -552,6 +587,7 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
                 message,
                 settings.instructions[profile],
             ),
+            heartbeat_interval=GATEWAY_HEARTBEAT_INTERVAL_SECONDS,
         )
 
     @app.websocket("/api/audio/speak-stream")

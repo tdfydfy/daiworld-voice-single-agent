@@ -1,22 +1,23 @@
-# Development Status
+# 项目当前状态
 
-## 2026-08-11 - Replay lifecycle fix
+## 2026-08-11 - 1.1.1 基本可用确认与后续问题
 
-- Progress: Fixed HarmonyOS single-message replay startup ordering. Replay now advances a generation, serializes `PcmPlayer.stop()` cleanup, ignores late TTS callbacks while old playback is being released, and starts remote/system TTS only after cleanup completes. System TTS also cancels requests that are still waiting for engine initialization after `stopSpeaking()`.
-- Verification: Harmony static verification passed (18 ETS files), ArkTS type check and signed HAP assembly passed, Node tests passed (19), and `git diff --check` passed. The signed HAP was cover-installed successfully on device `6HQ0226409028766`.
-- Artifact: `clients/harmony/entry/build/default/outputs/default/entry-default-signed.hap`, SHA-256 `06558583C0A89E9F5455824463E0AAA803976C7C054F1AC36B5174948DF36BAC`.
-- Blockers: The app was installed but not started by AI. Audible replay, repeated stop, system/remote TTS output, and headset listening remain user-operated true-device checks.
-- Next: Start the installed app and test a short reply, a long reply, replay after prior playback, replay stop/replay again, and replay while using the microphone. Capture the first TTS state/PCM or system `onStart` if silence remains.
+- 进展：Adapter 已增加 25 秒下行应用层心跳并部署到 `foxi`；HarmonyOS 在收到首个心跳后使用 70 秒看门狗关闭悬挂连接。自动重连使用独立的无损 Session 恢复，不再调用会关闭语音输出的手动历史恢复路径；系统 TTS 重读也不再等待无关的远端 PCM 清理。`1.1.1` HAP 已保留数据覆盖安装到设备 `6HQ0226409028766`，未启动应用。
+- 验证：Python 27 项、Node 19 项、Harmony 18 个 ETS 文件静态校验、ArkTS 类型检查、签名 HAP 构建和 `git diff --check` 通过。远端运行源码 SHA-256 与本地一致，systemd 为 `active/running`，本机与公开根入口返回 `200`，未鉴权 `/api/agents` 返回预期 `401`；设备包信息为 `1.1.1 (1010001)`。
+- 产物：`clients/harmony/entry/build/default/outputs/default/entry-default-signed.hap`，版本 `1.1.1 (1010001)`，SHA-256 `CA8142F0BA161D1C9DEE9C958E25D90ADE9203F1D3CF1D99CD0505F3D468EE68`。
+- 用户结论：`1.1.1` 当前基本可用。
+- 活跃问题：左上 Agent 选择框过长且供应商/模型不显式；设置页供应商默认 `custom` 并依赖打开页面才刷新；重读按钮撑大气泡且重读仍无声；思考呼吸音偶发缺失；设置项缺少双列紧凑布局和清晰分区。
+- 下一恢复点：从[后续问题原文](plans/2026-08-11-v111-acceptance-and-follow-up-issues.md)恢复，先复现并记录供应商刷新、重读 TTS 和呼吸音的完整事件路径，再设计紧凑布局；本轮不改代码。
 
 ## 当前快照（2026-08-11）
 
-- 总体状态：正常推进。
-- 当前阶段：`1.1.0 安全与连接韧性` 已完成部署，进入真机验收。
-- 当前任务：由用户启动已安装的 `1.1.0` HAP，集中进行安全迁移、连接恢复、Session 连续性和语音交互验收。
-- 已完成到：HUKS AES-256-GCM 令牌存储、旧明文一次性迁移、页面异步初始化、Gateway 鉴权分类/有界重连、Session 恢复且不重放 Prompt，以及 `1.1.0 (1010000)` 签名构建。
-- 活跃问题：HUKS 真实密钥生命周期、旧令牌迁移、断网重连、Session 连续性和语音听感尚未真机验证；当前没有服务器部署阻塞。
-- 最近验证：Python 26 项、Node 19 项、Harmony 18 个 ETS 文件静态校验、ArkTS 类型检查、签名构建和 `git diff --check` 通过；包内版本为 `1.1.0 (1010000)`，最新 HAP SHA-256 为 `419dfabdbce307f2b7740404a9b42c73a505ab481e057f6c106b9d7d59857efb`。
-- 下一恢复点：用户启动应用后，按真机清单验证耳机长播报、ASR 连续收音、停止/暂停收音、审批/澄清、Agent/Provider/模型切换和重连恢复。
+- 总体状态：`1.1.1` 已确认基本可用，进入问题记录和下一阶段规划。
+- 当前阶段：HarmonyOS 界面密度、运行身份同步与声音可靠性。
+- 当前任务：已记录四组后续问题；按用户要求本轮不再修改功能或 UI 代码。
+- 已完成到：网关下行心跳、客户端心跳看门狗、无损 Session 恢复、播放状态隔离、系统/远端后端专属重读清理、Adapter 部署，以及 `1.1.1 (1010001)` 安装。
+- 活跃问题：Agent/供应商/模型展示与主动刷新、重读布局和无声、思考呼吸音偶发缺失、设置双列布局及分区。
+- 最近验证：Python 27 项、Node 19 项、Harmony 18 个 ETS 文件静态校验、ArkTS 类型检查、签名构建和 `git diff --check` 通过；最新 HAP SHA-256 为 `CA8142F0BA161D1C9DEE9C958E25D90ADE9203F1D3CF1D99CD0505F3D468EE68`。
+- 下一恢复点：读取 `docs/plans/2026-08-11-v111-acceptance-and-follow-up-issues.md`，按 `docs/plan.md` 的四项顺序进行只读路径分析和后续实现。
 
 ## 2026-08-11
 

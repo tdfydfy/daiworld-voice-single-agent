@@ -89,7 +89,7 @@ Provider Key 只在 Hermes 服务端，不进入 Adapter 静态文件、浏览�
 
 1. 校验内部访问口令；
 2. 把 Agent Catalog 中的不透明 ID 映射到独立 Hermes `serve --isolated`；
-3. 透明转发 JSON-RPC、ASR WS 和 TTS WS；
+3. 转发 JSON-RPC、ASR WS 和 TTS WS，并在 JSON-RPC 下行链路每 25 秒发送 `gateway.heartbeat`；
 4. 聚合 Hermes Session REST 详情和消息时间；
 5. 把 Agent 显式选择的 `MEDIA:<path>` 换成 15 分钟随机令牌；
 6. 受控代理 Provider / 模型公开选项，不向客户端暴露密钥；
@@ -137,6 +137,8 @@ Web 当前实现：`web_native/`。HarmonyOS 后续使用 ArkTS 原生模块。
 | `/api/audio/transcribe-stream?profile=&token=` | Hermes同名路由 | PCM16/16k 持续 ASR |
 | `/api/audio/speak-stream?profile=&token=` | Hermes同名路由 | 文本流 → PCM16/24k TTS |
 
+`/api/hermes/ws` 的 Adapter 心跳是下行客户端的应用层保活事件，不转发给 Hermes。客户端收到首个心跳后才启用 70 秒看门狗，因此仍兼容尚未发送心跳的旧 Adapter；心跳事件由网关客户端内部消费，不进入业务事件流。
+
 ## 5. Session 身份
 
 必须区分：
@@ -179,6 +181,7 @@ historyView      = closed | list | resumed
 10. `停止` 才是当前 Agent turn 的破坏性中断，负责 `session.interrupt` 和清空 TTS 播放队列，但不改变麦克风开关。
 11. HarmonyOS 语音后端由用户显式选择；`harmony_offline` 失败时不得自动切换或连接远端 ASR/TTS。
 12. HarmonyOS 全双工语音统一声明为 `VOICE_COMMUNICATION`，无配件时的通信输出默认设为听筒，用户可以显式切换扬声器；配件选择和麦克风回退由系统自动管理，设备变化只更新诊断与界面状态，不触发手工选路或采集器重建。
+13. Gateway 瞬态断线恢复只能重新鉴权并 `session.resume(storedSessionId)`；不得调用会停止语音的手动历史恢复、清空消息或重放 Prompt，独立的 TTS / 播放状态不随网关错误强制归零。
 
 ## 7. 文字和 Agent 数据流
 
@@ -345,7 +348,7 @@ Public           /voice-native/
 
 ## 16. 当前限制
 
-- HarmonyOS 当前开发版本会在 CoreSpeech 系统 TTS 播放前持有 `VOICE_COMMUNICATION` AudioSession，而系统 TTS 内部使用 `VOICE_ASSISTANT` 播放流；真机已确认合成完成后因音频焦点冲突报 `6800301`，自动播报尚未恢复。系统 TTS 与应用自管通信 PCM 的会话所有权需要分离；
+- HarmonyOS 已分离 CoreSpeech 系统 TTS 与应用自管通信 PCM 的 AudioSession 所有权；自动播报、断线恢复后的重读和耳机听感仍需在 `1.1.1` 真机验收中确认；
 - 首次HTTP鉴权换取1小时HttpOnly Cookie；上游Hermes仍可能在内部URL使用其协议要求的token；
 - 浏览器 ScriptProcessor 是当前稳定实现，后续可换 AudioWorklet；
 - 回音文本判断是 AEC 后的兜底，不等于硬件级全双工保证；

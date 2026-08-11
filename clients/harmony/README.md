@@ -39,6 +39,8 @@ python -m uvicorn app.native_main:app --host 0.0.0.0 --port 8844
 
 在应用设置中填写 Adapter 的基地址，例如 `https://example.com/voice-native`，再填写对应的访问口令；Agent 选择器会从 `/api/agents` 动态加载目录。长期访问口令只用于前置 HTTP 请求换取，WebSocket 只发送短期 `voice_session` Cookie。
 
+Hermes JSON-RPC 链路使用 Adapter 每 25 秒发送的 `gateway.heartbeat` 保活。客户端在收到首个心跳后启用 70 秒看门狗，超时会关闭悬挂 socket 并按有界退避重新鉴权、恢复当前 Session。恢复路径保留现有消息、语音输出开关和播放状态，不会重放 Prompt；旧 Adapter 不发送心跳时不会误触发看门狗。
+
 设置页还可以切换当前 Hermes Session 的 Provider / 模型，并选择鸿蒙离线语音或远端语音。模型列表由 Adapter 的 `/api/hermes/model/options` 受控返回，切换使用 `config.set(... --session)`，不会写回 Agent 默认配置、重建对话或重连语音；界面等待 `session.info` 后才显示已确认。鸿蒙离线模式支持选择系统返回的音色，并将音色和 `0.5x` 到 `2.0x` 的朗读语速长期保存在设备 Preferences 中；远端模式的音色由服务器 TTS 配置决定。关闭设置页不会写入草稿或重连，只有网关地址、访问口令或 Agent 发生变化时才会重建网关连接。
 
 Hermes 的审批和澄清请求直接进入消息流，不显示独立卡片。审批气泡保留完整风险命令，只接受精确的“同意 / 取消”等固定回复；澄清气泡列出编号选项并接受下一条实际回答。两类回复都走 Hermes 专用响应方法，不会再次触发 Agent Prompt。模型设置优先显示 Adapter 返回的具体 Provider 标识，例如 `open1` 或 `waw`，不把通用的 `custom` / `OPENAIAPI` 当成部署名称。

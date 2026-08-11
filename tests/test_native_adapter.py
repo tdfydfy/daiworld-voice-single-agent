@@ -178,6 +178,34 @@ def test_websocket_cookie_auth_and_transparent_relay(monkeypatch):
     assert upstream.sent == [json.dumps({"jsonrpc": "2.0", "method": "ping"})]
 
 
+def test_gateway_websocket_emits_downstream_heartbeat(monkeypatch):
+    upstream = FakeUpstream([json.dumps({"method": "event", "params": {"type": "gateway.ready"}})])
+    monkeypatch.setattr(native_main, "GATEWAY_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(
+        native_main.websockets,
+        "connect",
+        lambda *args, **kwargs: FakeConnect(upstream),
+    )
+    client = TestClient(make_app())
+    auth = client.post("/api/auth/session", headers={"X-Voice-Token": "voice-token"})
+    assert auth.status_code == 200
+
+    with client.websocket_connect("/api/hermes/ws?profile=hexiaoma") as websocket:
+        assert json.loads(websocket.receive_text())["params"]["type"] == "gateway.ready"
+        heartbeat = json.loads(websocket.receive_text())
+
+    assert heartbeat == {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {
+            "type": "gateway.heartbeat",
+            "session_id": "",
+            "payload": {},
+        },
+    }
+    assert upstream.sent == []
+
+
 def test_websocket_injects_voice_instructions_only_into_session_create(monkeypatch):
     monkeypatch.setenv("HERMES_AGENTS_JSON", json.dumps([
         {

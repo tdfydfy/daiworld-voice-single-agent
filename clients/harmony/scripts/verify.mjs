@@ -86,6 +86,7 @@ const MESSAGE_REPLAY_CHECKS = [
   ['entry/src/main/ets/services/SingleAgentController.ets', /private replayGeneration: number = 0/, 'replay generation guard'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /private replayCleanup: Promise<void> = Promise\.resolve\(\)/, 'serialized replay cleanup promise'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /startReplayAfterCleanup\(text, source\.id, replayGeneration, cleanup\)/, 'replay waits for cleanup before TTS start'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /if \(this\.useSystemSpeech\) \{[\s\S]{0,180}const cleanup = Promise\.resolve\(\)/, 'system replay does not wait for remote PCM cleanup'],
   ['entry/src/main/ets/services/SystemSpeechService.ets', /private ttsRequestGeneration: number = 0/, 'system TTS cancellation generation']
 ];
 
@@ -140,12 +141,15 @@ const GATEWAY_RECOVERY_CHECKS = [
   ['entry/src/main/ets/services/AuthSessionClient.ets', /retryable: boolean = false/, 'transient authentication failure classification'],
   ['entry/src/main/ets/services/HermesGatewayClient.ets', /private socketGeneration: number = 0/, 'gateway socket generation isolation'],
   ['entry/src/main/ets/services/HermesGatewayClient.ets', /this\.socket !== socket \|\| this\.socketGeneration !== generation/, 'stale gateway callback guard'],
+  ['entry/src/main/ets/models/HermesProtocol.ets', /GATEWAY_HEARTBEAT: string = 'gateway\.heartbeat'/, 'gateway heartbeat protocol event'],
+  ['entry/src/main/ets/services/HermesGatewayClient.ets', /GATEWAY_HEARTBEAT_TIMEOUT_MS = 70000/, 'gateway heartbeat watchdog timeout'],
+  ['entry/src/main/ets/services/HermesGatewayClient.ets', /this\.recordHeartbeat\(\)/, 'gateway heartbeat refreshes the watchdog'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /GATEWAY_RECONNECT_DELAYS_MS: number\[\] = \[500, 1500, 3000, 5000\]/, 'bounded gateway reconnect backoff'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /GATEWAY_RECONNECT_MAX_ATTEMPTS = 6/, 'gateway reconnect attempt cap'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /GATEWAY_READY_TIMEOUT_MS = 10000/, 'gateway ready watchdog'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /authResult\.unauthorized[\s\S]{0,100}gatewayReconnectBlocked = true/, 'invalid token stops automatic retries'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /scheduleGatewayReconnect\('网关连接已断开'\)/, 'unexpected gateway close recovery'],
-  ['entry/src/main/ets/services/SingleAgentController.ets', /resumeSession\(this\.snapshot\.storedSessionId, true\)/, 'stored session recovery after reconnect'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /restoreSessionAfterReconnect\(this\.snapshot\.storedSessionId\)/, 'non-destructive stored session recovery after reconnect'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /loadAgentCatalog\(generation\)/, 'catalog load follows the active connection generation'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /generation !== this\.gatewayConnectGeneration \|\| this\.gatewayReconnectBlocked/, 'stale authentication and catalog attempt guard'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /scheduleGatewayReconnect\(this\.snapshot\.error\);[\s\S]{0,80}this\.notify\(\)/, 'catalog retry state reaches the UI']
@@ -504,9 +508,27 @@ for (const [pattern, label] of [
   ['def has_semantic_content(text: object) -> bool:', 'Adapter ASR semantic predicate'],
   ['def normalize_asr_transcript_frame(message: str) -> str:', 'Adapter ASR final-frame normalizer'],
   ['transform_text=normalize_asr_transcript_frame', 'ASR route uses the common boundary'],
+  ['GATEWAY_HEARTBEAT_INTERVAL_SECONDS = 25.0', 'Gateway downstream heartbeat interval'],
+  ['await send_client_text(GATEWAY_HEARTBEAT_FRAME)', 'Gateway heartbeat reaches the client'],
+  ['heartbeat_interval=GATEWAY_HEARTBEAT_INTERVAL_SECONDS', 'Hermes route enables downstream heartbeats'],
 ]) {
   if (!nativeAdapterSource.includes(pattern)) {
     ERRORS.push(`missing ASR semantic boundary (${label})`);
+  }
+}
+const reconnectRestoreStart = controllerSource.indexOf('private restoreSessionAfterReconnect(storedId: string): void');
+const reconnectMissingStart = controllerSource.indexOf('if (this.isSessionNotFound(error))', reconnectRestoreStart);
+if (reconnectRestoreStart < 0 || reconnectMissingStart <= reconnectRestoreStart) {
+  ERRORS.push('gateway reconnect must have a distinct non-destructive Session restore path');
+} else {
+  const reconnectRestoreSource = controllerSource.slice(reconnectRestoreStart, reconnectMissingStart);
+  if (!reconnectRestoreSource.includes('this.gateway.resumeSession(storedId, 100)')) {
+    ERRORS.push('gateway reconnect must resume the existing Session');
+  }
+  for (const destructiveRestoreAction of ['this.stopVoice()', 'this.snapshot.messages = []']) {
+    if (reconnectRestoreSource.includes(destructiveRestoreAction)) {
+      ERRORS.push(`gateway reconnect must preserve voice and messages (${destructiveRestoreAction})`);
+    }
   }
 }
 if (!controllerSource.includes('private hasSemanticContent(text: string): boolean')) {

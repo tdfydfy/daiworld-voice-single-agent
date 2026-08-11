@@ -14,6 +14,8 @@ import {
   JsonRpcResponse
 } from '../models/HermesProtocol';
 
+const GATEWAY_HEARTBEAT_TIMEOUT_MS = 70000;
+
 export abstract class GatewayListener {
   abstract onGatewayReady(): void;
   abstract onEvent(type: string, sessionId: string, payload: Object | undefined): void;
@@ -109,6 +111,8 @@ export class HermesGatewayClient {
   private connected: boolean = false;
   private currentSessionId: string = '';
   private socketGeneration: number = 0;
+  private heartbeatWatchdog?: number;
+  private lastHeartbeatAt: number = 0;
 
   setListener(listener: GatewayListener): void {
     this.listener = listener;
@@ -156,6 +160,7 @@ export class HermesGatewayClient {
         return;
       }
       this.connected = false;
+      this.stopHeartbeatWatchdog();
       this.rejectAll('connection closed');
       if (this.listener) {
         this.listener.onClosed();
@@ -166,6 +171,8 @@ export class HermesGatewayClient {
         return;
       }
       this.connected = false;
+      this.stopHeartbeatWatchdog();
+      this.rejectAll('connection error');
       if (this.listener) {
         this.listener.onError(err.message);
       }
@@ -180,6 +187,8 @@ export class HermesGatewayClient {
         return;
       }
       this.connected = false;
+      this.stopHeartbeatWatchdog();
+      this.rejectAll('connection failed');
       if (this.listener) {
         this.listener.onError(error.message);
       }
@@ -188,6 +197,7 @@ export class HermesGatewayClient {
 
   close(): void {
     this.socketGeneration += 1;
+    this.stopHeartbeatWatchdog();
     const socket = this.socket;
     if (socket) {
       socket.off('open');
@@ -321,6 +331,10 @@ export class HermesGatewayClient {
   private handleEvent(params: HermesEventParams): void {
     const sessionId = params.session_id !== undefined ? params.session_id : '';
     const type = params.type;
+    if (type === HermesEvents.GATEWAY_HEARTBEAT) {
+      this.recordHeartbeat();
+      return;
+    }
     if (type === HermesEvents.GATEWAY_READY) {
       if (this.listener) {
         this.listener.onGatewayReady();
@@ -330,6 +344,46 @@ export class HermesGatewayClient {
     if (this.listener) {
       this.listener.onEvent(type, sessionId, params.payload);
     }
+  }
+
+  private recordHeartbeat(): void {
+    const socket = this.socket;
+    if (!socket || !this.connected) {
+      return;
+    }
+    this.lastHeartbeatAt = Date.now();
+    this.armHeartbeatWatchdog(socket, this.socketGeneration);
+  }
+
+  private armHeartbeatWatchdog(socket: webSocket.WebSocket, generation: number): void {
+    if (this.heartbeatWatchdog !== undefined) {
+      clearTimeout(this.heartbeatWatchdog);
+    }
+    this.heartbeatWatchdog = setTimeout((): void => {
+      this.heartbeatWatchdog = undefined;
+      if (this.socket !== socket || this.socketGeneration !== generation || !this.connected) {
+        return;
+      }
+      const elapsed = Date.now() - this.lastHeartbeatAt;
+      if (elapsed < GATEWAY_HEARTBEAT_TIMEOUT_MS) {
+        this.armHeartbeatWatchdog(socket, generation);
+        return;
+      }
+      this.connected = false;
+      this.rejectAll('gateway heartbeat timeout');
+      if (this.listener) {
+        this.listener.onError('网关心跳超时');
+      }
+      socket.close().catch(() => undefined);
+    }, GATEWAY_HEARTBEAT_TIMEOUT_MS);
+  }
+
+  private stopHeartbeatWatchdog(): void {
+    if (this.heartbeatWatchdog !== undefined) {
+      clearTimeout(this.heartbeatWatchdog);
+      this.heartbeatWatchdog = undefined;
+    }
+    this.lastHeartbeatAt = 0;
   }
 
   private rejectAll(message: string): void {
