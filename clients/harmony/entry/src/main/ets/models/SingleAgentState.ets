@@ -57,6 +57,7 @@ export class ChatMessage {
   completedAt: number = 0;
   pending: boolean = false;
   processExpanded: boolean = false;
+  replaying: boolean = false;
 }
 
 export class HistorySession {

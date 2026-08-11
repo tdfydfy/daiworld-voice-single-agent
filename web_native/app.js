@@ -2,6 +2,7 @@
   const $=id=>document.getElementById(id);
   const convo=$('conversation'),profileEl=$('profile'),runtime=$('runtime'),connection=$('connection');
   const historyBackdrop=$('historyBackdrop'),historyList=$('historyList'),helpBackdrop=$('helpBackdrop');
+  const settingsBackdrop=$('settingsBackdrop'),providerSelect=$('providerSelect'),modelSelect=$('modelSelect');
   const composerBar=document.querySelector('.composer-bar'),textToggle=$('textToggle');
   const token=()=>{let v=localStorage.getItem('native_voice_token');if(!v){v=prompt('请输入内部访问口令')||'';if(v)localStorage.setItem('native_voice_token',v)}return v};
   const base=location.pathname.endsWith('/')?location.pathname:location.pathname.replace(/[^/]*$/,'');
@@ -17,6 +18,7 @@
   let turnStartedAt=0,turnFirstTokenAt=0,turnModelLabel='',activity=null;
   let currentSpeechJob=null,activeSpeechJob=null,speechQueue=[];
   let pendingApproval=null,approvalAudio=null;
+  let providerOptionsCache=[];
 
   function nearBottom(){return convo.scrollHeight-convo.scrollTop-convo.clientHeight<100}
   function scrollIfFollowing(wasNear=true){if(wasNear)requestAnimationFrame(()=>convo.scrollTop=convo.scrollHeight)}
@@ -34,7 +36,16 @@
     const who=document.createElement('span');who.className='meta-identity';who.textContent=compactAgentIdentity(identity);
     const perf=document.createElement('span');perf.className='meta-timing';perf.textContent=timing;m.replaceChildren(who,perf);
   }
-  function message(role,text,meta='',stamp=true){const follow=nearBottom();clearEmpty();const el=document.createElement('div');el.className='msg '+role;const body=document.createElement('div');body.className='body';body.textContent=text;el.append(body);const shownMeta=meta?`${meta}${stamp?' · '+clock():''}`:(stamp&&(role==='user'||role==='agent')?clock():'');if(shownMeta){const m=document.createElement('span');m.className='meta';m.textContent=shownMeta;el.append(m)}convo.append(el);scrollIfFollowing(follow);return el}
+  function message(role,text,meta='',stamp=true){const follow=nearBottom();clearEmpty();const el=document.createElement('div');el.className='msg '+role;const body=document.createElement('div');body.className='body';body.textContent=text;el.append(body);const shownMeta=meta?`${meta}${stamp?' · '+clock():''}`:(stamp&&(role==='user'||role==='agent')?clock():'');if(shownMeta){const m=document.createElement('span');m.className='meta';m.textContent=shownMeta;el.append(m)}if(role==='agent'){const replay=document.createElement('button');replay.type='button';replay.className='message-replay';replay.textContent='重读';replay.title='重新朗读这条消息';replay.addEventListener('click',()=>void replayMessage(text));el.append(replay)}convo.append(el);scrollIfFollowing(follow);return el}
+  async function replayMessage(text){
+    const value=cleanMediaText(text||'').trim();
+    if(!value){message('system','这条消息没有可朗读的正文');return}
+    try{
+      if(voiceEnabled&&!speechPausedForUser)stopSpeech(true);
+      const r=await fetch(base+'api/audio/speak?profile='+encodeURIComponent(profileEl.value),{method:'POST',headers:{'Content-Type':'application/json','X-Voice-Token':token()},body:JSON.stringify({text:value})});const d=await r.json();if(!r.ok)throw new Error(d.detail||'重读失败');
+      speechAudio=new Audio(d.data_url);playing=true;if(voiceEnabled)setVoiceState('speaking');speechAudio.onended=()=>{speechAudio=null;playing=false;if(voiceEnabled&&!bargeCapturing){setVoiceState('idle');scheduleListening()}};speechAudio.onerror=()=>{speechAudio=null;playing=false};await speechAudio.play();
+    }catch(e){message('system','重读失败：'+e.message)}
+  }
   function setUserMessageState(el,state){if(!el)return;let m=el.querySelector('.meta');if(!m){m=document.createElement('span');m.className='meta';el.append(m)}m.textContent=`豆包流式ASR · ${state} · ${clock()}`}
   function formatBytes(value){const n=Number(value)||0;if(n<1024)return `${n} B`;if(n<1048576)return `${(n/1024).toFixed(1)} KB`;return `${(n/1048576).toFixed(1)} MB`}
   function renderArtifacts(el,artifacts){
@@ -82,6 +93,13 @@
     const a=ensureActivity();let row=a.rows.get(id);
     if(!row){row=document.createElement('div');row.className='activity-row';const icon=document.createElement('span');icon.className='activity-icon';const label=document.createElement('span');label.className='activity-label';const extra=document.createElement('span');extra.className='activity-detail';row.append(icon,label,extra);a.list.append(row);a.rows.set(id,row);a.count++;refreshActivityHeader()}
     row.querySelector('.activity-label').textContent=title;row.querySelector('.activity-detail').textContent=detail;return row;
+  }
+  function renderThinkingRows(row,text){
+    const detail=row.querySelector('.activity-detail');
+    const lines=voiceFilters?.splitThinkingLines(text)||[];
+    detail.replaceChildren();
+    if(!lines.length){detail.textContent=text;return}
+    for(const line of lines){const span=document.createElement('div');span.className='thinking-line';span.textContent=line;detail.append(span)}
   }
   function shortApprovalText(p){
     let text=String(p.description||'').trim()||String(p.command||'').trim()||'执行一项高风险操作';
@@ -146,6 +164,48 @@
   function closeHistory(){if(matchMedia('(min-width:761px)').matches)return;historyBackdrop.hidden=true}
   function openHelp(){helpBackdrop.hidden=false}
   function closeHelp(){helpBackdrop.hidden=true}
+  async function fetchModelOptions(){
+    const response=await fetch(base+'api/hermes/model/options?profile='+encodeURIComponent(profileEl.value),{headers:{'X-Voice-Token':token()},cache:'no-store'});
+    const data=await response.json();
+    if(!response.ok)throw new Error(data.detail||'模型列表读取失败');
+    return Array.isArray(data.providers)?data.providers:[];
+  }
+  function openSettings(){
+    settingsBackdrop.hidden=false;
+    providerSelect.replaceChildren();
+    modelSelect.replaceChildren();
+    const loading=document.createElement('option');loading.textContent='正在加载…';modelSelect.append(loading);
+    fetchModelOptions().then(providers=>{
+      providerOptionsCache=providers;
+      providerSelect.replaceChildren();
+      const providerOptions=providers.filter(p=>p&&(Array.isArray(p.models)&&p.models.length||Array.isArray(p.model_ids)&&p.model_ids.length));
+      if(!providerOptions.length){const empty=document.createElement('option');empty.textContent='没有可用的供应商';providerSelect.append(empty);return}
+      providerOptions.forEach(p=>{const option=document.createElement('option');option.value=p.slug||p.id||p.name||'';option.textContent=p.name||option.value;providerSelect.append(option)});
+      if(providerSelect.value)renderProviderModels();else providerSelect.onchange();
+    }).catch(e=>{modelSelect.replaceChildren();const fail=document.createElement('option');fail.textContent='加载失败：'+e.message;modelSelect.append(fail)});
+  }
+  function renderProviderModels(){
+    modelSelect.replaceChildren();
+    const option=providerSelect.options[providerSelect.selectedIndex];
+    if(!option)return;
+    const provider=providerOptionsCache.find(p=>(p.slug||p.id||p.name||'')===option.value);
+    const models=provider?(provider.models||provider.model_ids||[]):[];
+    if(!models.length){const empty=document.createElement('option');empty.textContent='该供应商暂无模型';modelSelect.append(empty);return}
+    models.forEach(model=>{const item=document.createElement('option');item.value=typeof model==='string'?model:(model.id||model.model||'');item.textContent=typeof model==='string'?model:(model.id||model.model||'');modelSelect.append(item)});
+  }
+  function closeSettings(){settingsBackdrop.hidden=true}
+  async function applyModelSwitch(){
+    const provider=providerSelect.value,model=modelSelect.value;
+    if(!provider||!model)return;
+    const save=$('settingsSave');save.disabled=true;save.textContent='切换中…';
+    try{
+      await rpc('config.set',{session_id:sessionId,key:'model',value:`${model} --provider ${provider} --session`});
+      message('system',`已切换当前会话模型：${provider} · ${model}`);
+      closeSettings();
+    }catch(e){
+      message('system','模型切换失败：'+e.message);
+    }finally{save.disabled=false;save.textContent='切换模型'}
+  }
   function renderHistoryRows(sessions){
     const priorScroll=historyList.scrollTop;historyList.replaceChildren();$('historyCount').textContent=sessions.length?(historyHasMore?`${sessions.length}+`:String(sessions.length)):'';
     if(!sessions.length){const empty=document.createElement('p');empty.className='history-empty';empty.textContent='这个Agent还没有历史对话。';historyList.append(empty);return}
@@ -246,7 +306,7 @@
       const id=p.tool_id||`tool-${Date.now()}`,row=activityRow(id,`${p.name||'unknown'}${p.summary?` · ${p.summary}`:''}`,p.duration_s!=null?`耗时 ${Number(p.duration_s).toFixed(2)}s`:'');row.classList.add('tool-step','completed');row.querySelector('.activity-icon').textContent=p.error?'✕':'✓';
     }
     else if(ev.type==='thinking.delta'||ev.type==='reasoning.delta'){
-      const a=ensureActivity(),row=activityRow('thinking','思考过程','');a.thinkingText=(a.thinkingText||'')+(p.text||'');row.classList.add('thinking-full');row.querySelector('.activity-icon').textContent='…';row.querySelector('.activity-detail').textContent=a.thinkingText;if(activity)activity.details.open=true;
+      const a=ensureActivity(),row=activityRow('thinking','思考过程','');a.thinkingText=(a.thinkingText||'')+(p.text||'');row.classList.add('thinking-full');row.querySelector('.activity-icon').textContent='…';renderThinkingRows(row,a.thinkingText);if(activity)activity.details.open=true;
     }
     else if(ev.type==='approval.request')renderApproval({...p});
     else if(ev.type==='clarify.request')renderClarify({...p});
@@ -345,6 +405,11 @@
       return;
     }
     if(!event.final||!text||asrFinalizing)return;
+    if(!voiceFilters?.hasSemanticContent(text)){
+      if(asrPreview){asrPreview.remove();asrPreview=null}
+      console.info('[voice-asr] final-filtered-as-punctuation-only');
+      return;
+    }
     asrFinalizing=true;const preview=asrPreview;asrPreview=null;const discardPreview=()=>preview?.remove();
     try{
       if(voiceFilters?.shouldPauseForTranscript(text,speechFullText,playing))await pauseSpeechForUser();
@@ -356,6 +421,7 @@
         }
         message('system','审批中，请只说“同意”或“拒绝”。');void speakApprovalRequest(approval);await resumeSpeechForUser();return;
       }
+      if(voiceFilters?.isCloseMicCommand(text)){discardPreview();stopVoiceConversation(true);console.info('[voice-asr] close-mic-command');return}
       if(isStopCommand(text)){discardPreview();await stopCurrentVoiceTask();return}
       const echo=Boolean((busy||activeSpeechJob)&&voiceFilters?.isLikelyEcho(text,speechFullText));
       if(echo){discardPreview();console.info('[voice-asr] final-filtered-as-echo',{length:text.length,score:voiceFilters.echoScore(text,speechFullText)});await resumeSpeechForUser();return}
@@ -512,6 +578,11 @@
   $('historyButton').onclick=()=>void openHistory();
   $('helpButton').onclick=openHelp;
   $('helpClose').onclick=closeHelp;
+  $('settingsButton').onclick=openSettings;
+  $('settingsClose').onclick=closeSettings;
+  $('settingsSave').onclick=()=>void applyModelSwitch();
+  providerSelect.addEventListener('change',renderProviderModels);
+  settingsBackdrop.onclick=e=>{if(e.target===settingsBackdrop)closeSettings()};
   helpBackdrop.onclick=e=>{if(e.target===helpBackdrop)closeHelp()};
   historyList.addEventListener('scroll',()=>{if(historyList.scrollHeight-historyList.scrollTop-historyList.clientHeight<100)void loadHistory(false)});
   $('historyClose').onclick=closeHistory;

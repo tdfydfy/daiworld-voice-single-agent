@@ -36,6 +36,7 @@
         </select>
       </label>
       <div id="runtime" class="runtime">等待连接</div>
+      <button id="settingsButton" class="ghost settings-trigger" type="button">设置</button>
       <button id="historyButton" class="ghost history-trigger" type="button">历史对话 <span id="historyCount"></span></button>
     </section>
 
@@ -81,14 +82,35 @@
       <div class="help-content">
         <p>在顶部选择Agent，连接灯变绿后即可使用；历史对话可随时恢复。</p>
         <p>点击“开启实时对话”后直接说话，可连续交流；任务中也能继续补充。</p>
-        <p>说“停止”或点击“停止”可终止当前任务；关闭实时对话只停止收音。</p>
+        <p>说“停止”或点击“停止”可终止当前任务；说“闭麦”只关闭麦克风，思考和播报继续。</p>
         <p>需要文字输入时，点击“文字”即可。</p>
       </div>
     </section>
   </div>
 
-  <script src="./assets/voice_filters.js?v=1"></script>
+  <div id="settingsBackdrop" class="help-backdrop" hidden>
+    <section class="help-card" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+      <header class="help-head">
+        <b id="settingsTitle">Hermes 模型设置</b>
+        <button id="settingsClose" type="button" aria-label="关闭设置">×</button>
+      </header>
+      <div class="help-content">
+        <label class="settings-field">供应商
+          <select id="providerSelect"></select>
+        </label>
+        <label class="settings-field">模型
+          <select id="modelSelect"></select>
+        </label>
+        <p class="settings-hint">切换后立即生效（当前会话）；切换失败会保留原配置。</p>
+        <div class="approval-actions">
+          <button id="settingsSave" class="allow" type="button">切换模型</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script src="./assets/voice_filters.js?v=2"></script>
   <script src="./assets/media_speech_filter.js?v=1"></script>
-  <script src="./assets/app.js?v=24" defer></script>
+  <script src="./assets/app.js?v=25" defer></script>
 </body>
 </html>

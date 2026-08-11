@@ -29,5 +29,37 @@
     return Boolean(playbackActive&&text.length>=2&&!isLikelyEcho(text,spoken));
   }
 
-  return {normalize,echoScore,isLikelyEcho,shouldPauseForTranscript};
+  function hasSemanticContent(text){
+    return /[\p{L}\p{N}]/u.test(String(text||''));
+  }
+
+  function normalizeControl(text){
+    return String(text||'').toLowerCase().replace(/[\s\p{P}\p{S}]/gu,'');
+  }
+
+  function isCloseMicCommand(text){
+    return ['闭麦','关闭麦克风','关闭话筒','mutemicrophone'].includes(normalizeControl(text));
+  }
+
+  function splitThinkingLines(text){
+    const lines=[];
+    for(const rawLine of String(text||'').replace(/\r\n?/g,'\n').split('\n')){
+      const chunks=rawLine.match(/[^。！？!?；;]+[。！？!?；;]?/g)||[];
+      for(const chunk of chunks){
+        const value=chunk.trim();
+        if(value)lines.push(value);
+      }
+    }
+    return lines;
+  }
+
+  return {
+    normalize,
+    echoScore,
+    isLikelyEcho,
+    shouldPauseForTranscript,
+    hasSemanticContent,
+    isCloseMicCommand,
+    splitThinkingLines,
+  };
 });

@@ -40,6 +40,7 @@ import {
 } from './SystemSpeechService';
 
 const STOP_PHRASES: string[] = ['停止', 'stop'];
+const CLOSE_MIC_PHRASES: string[] = ['闭麦', '关闭麦克风', '关闭话筒'];
 export const DEFAULT_GATEWAY_URL = 'https://voice.daiworld.cc.cd/voice-native';
 const SETTINGS_FILE = 'single_agent_settings';
 const SYSTEM_TTS_FIRST_MIN = 20;
@@ -424,6 +425,12 @@ export class SingleAgentController {
     if (value.length === 0) {
       return false;
     }
+    if (this.isCloseMicPhrase(value)) {
+      this.stopVoiceInput();
+      this.snapshot.statusDetail = '已关闭麦克风，思考和播报继续';
+      this.notify();
+      return true;
+    }
     if (this.isStopPhrase(value)) {
       this.interrupt(value);
       return true;
@@ -603,6 +610,23 @@ export class SingleAgentController {
     return false;
   }
 
+  // Exact close-microphone phrase: stops input only, never interrupts work.
+  private isCloseMicPhrase(text: string): boolean {
+    const normalized = text.trim().toLowerCase()
+      .replace(/^[\s"'“”‘’.,!?;:，。！？；：、]+|[\s"'“”‘’.,!?;:，。！？；：、]+$/g, '');
+    for (const phrase of CLOSE_MIC_PHRASES) {
+      if (normalized === phrase) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Punctuation-only transcripts are dropped before they can reach Hermes.
+  private hasSemanticContent(text: string): boolean {
+    return /[\p{L}\p{N}]/u.test(String(text || ''));
+  }
+
   private interrupt(displayText: string, existingMessage?: ChatMessage): void {
     const shouldPlayCue = this.voiceOutputEnabled && !this.config.muted;
     this.audioCues.setRunning(false);
@@ -646,6 +670,45 @@ export class SingleAgentController {
 
   stopCurrentTask(): void {
     this.interrupt('停止');
+  }
+
+  // Replay one assistant message through the same output path the live turn uses.
+  replayMessage(message: ChatMessage): void {
+    if (message.role !== 'assistant' || message.text.trim().length === 0) {
+      return;
+    }
+    if (message.replaying) {
+      return;
+    }
+    message.replaying = true;
+    message.revision += 1;
+    this.snapshot.statusDetail = '正在重读这条消息';
+    this.notify();
+    const text = message.text;
+    const finish = (): void => {
+      message.replaying = false;
+      message.revision += 1;
+      this.snapshot.statusDetail = '';
+      this.notify();
+    };
+    if (this.useSystemSpeech && this.systemSpeech !== undefined) {
+      this.systemSpeech.speak(text, this.config.voicePerson, this.config.speechRate)
+        .then((): void => {
+          this.onTtsJobEnded();
+          finish();
+        })
+        .catch((error: BusinessError): void => {
+          this.snapshot.error = this.errorMessage(error, '重读失败');
+          finish();
+        });
+      return;
+    }
+    if (!this.tts.isConnected()) {
+      this.tts.connect(this.wsUrl('/api/audio/speak-stream', this.snapshot.selectedProfile), this.cookie);
+    }
+    this.tts.sendText(text);
+    this.tts.sendDone();
+    finish();
   }
 
   private ensureConnections(): void {
@@ -1548,6 +1611,18 @@ export class SingleAgentController {
     const preview = this.currentAsrMessage();
     this.snapshot.asrTranscript = '';
     this.snapshot.asrUtteranceActive = false;
+    if (this.isCloseMicPhrase(value)) {
+      this.discardAsrPreview();
+      this.stopVoiceInput();
+      this.snapshot.statusDetail = '已关闭麦克风，思考和播报继续';
+      this.notify();
+      return;
+    }
+    if (!this.hasSemanticContent(value)) {
+      this.discardAsrPreview();
+      this.notify();
+      return;
+    }
     if (this.isStopPhrase(value)) {
       this.interrupt(value, preview);
       return;

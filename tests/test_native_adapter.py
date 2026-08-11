@@ -132,3 +132,80 @@ def test_large_http_body_is_rejected_before_upstream():
         content=b"x",
     )
     assert response.status_code == 413
+
+
+class FakeResponse:
+    def __init__(self, status_code, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+
+class FakeHttpClient:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.requests = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def get(self, url, **kwargs):
+        self.requests.append(("GET", url, kwargs))
+        return self.responses.pop(0) if self.responses else FakeResponse(502)
+
+    async def post(self, url, **kwargs):
+        self.requests.append(("POST", url, kwargs))
+        return self.responses.pop(0) if self.responses else FakeResponse(502)
+
+
+def test_model_options_proxy_requires_voice_token_and_forwards_hermes_token(monkeypatch):
+    fake = FakeHttpClient([
+        FakeResponse(200, {"providers": [{"slug": "deepseek", "models": ["deepseek-v4-pro"]}]}),
+    ])
+    monkeypatch.setattr(native_main.httpx, "AsyncClient", lambda **kwargs: fake)
+    client = TestClient(make_app())
+
+    unauthorized = client.get("/api/hermes/model/options?profile=hexiaoma")
+    assert unauthorized.status_code == 401
+    assert fake.requests == []
+
+    response = client.get(
+        "/api/hermes/model/options?profile=hexiaoma",
+        headers={"X-Voice-Token": "voice-token"},
+    )
+    assert response.status_code == 200
+    assert response.json()["providers"][0]["slug"] == "deepseek"
+    method, url, kwargs = fake.requests[-1]
+    assert method == "GET"
+    assert url == "http://127.0.0.1:9121/api/model/options"
+    assert kwargs["headers"] == {"X-Hermes-Session-Token": "hermes-token"}
+
+
+def test_model_set_proxy_posts_body_and_rejects_unknown_profile(monkeypatch):
+    fake = FakeHttpClient([FakeResponse(200, {"ok": True, "scope": "main"})])
+    monkeypatch.setattr(native_main.httpx, "AsyncClient", lambda **kwargs: fake)
+    client = TestClient(make_app())
+
+    response = client.post(
+        "/api/hermes/model/set?profile=hexiaoma",
+        headers={"X-Voice-Token": "voice-token"},
+        json={"scope": "main", "provider": "deepseek", "model": "deepseek-v4-pro"},
+    )
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    method, url, kwargs = fake.requests[-1]
+    assert method == "POST"
+    assert url == "http://127.0.0.1:9121/api/model/set"
+    assert kwargs["json"] == {"scope": "main", "provider": "deepseek", "model": "deepseek-v4-pro"}
+
+    rejected = client.post(
+        "/api/hermes/model/set?profile=unknown",
+        headers={"X-Voice-Token": "voice-token"},
+        json={"scope": "main", "provider": "deepseek", "model": "deepseek-v4-pro"},
+    )
+    assert rejected.status_code == 400

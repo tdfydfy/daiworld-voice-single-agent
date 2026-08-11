@@ -44,3 +44,24 @@ test('mobile header hides runtime detail while message identity keeps provider',
   assert.match(css, /\.conn\.online::before\{box-shadow:/);
   assert.match(css, /\.conn\.connecting/);
 });
+
+test('settings exposes Hermes model switching without config-file editing', () => {
+  assert.match(html, /id="settingsButton"/);
+  assert.match(html, /id="settingsBackdrop"[^>]*hidden/);
+  assert.match(html, /id="providerSelect"/);
+  assert.match(html, /id="modelSelect"/);
+  assert.match(app, /config\.set/);
+  assert.match(app, /api\/hermes\/model\/options/);
+});
+
+test('messages expose replay and thinking renders as separate lines', () => {
+  assert.match(app, /message-replay/);
+  assert.match(app, /splitThinkingLines/);
+  assert.match(css, /\.thinking-line/);
+});
+
+test('voice input filters punctuation and supports close-microphone command', () => {
+  assert.match(app, /hasSemanticContent/);
+  assert.match(app, /isCloseMicCommand/);
+  assert.match(html, /“闭麦”/);
+});

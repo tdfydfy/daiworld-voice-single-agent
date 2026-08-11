@@ -90,6 +90,17 @@ class ClarifyParams extends SessionParams {
   }
 }
 
+class ConfigSetParams extends SessionParams {
+  key: string;
+  value: string;
+
+  constructor(sessionId: string, key: string, value: string) {
+    super(sessionId);
+    this.key = key;
+    this.value = value;
+  }
+}
+
 export class HermesGatewayClient {
   private socket: webSocket.WebSocket | undefined = undefined;
   private listener: GatewayListener | undefined = undefined;
@@ -210,6 +221,13 @@ export class HermesGatewayClient {
     return this.request(
       HermesMethods.CLARIFY_RESPOND,
       new ClarifyParams(this.currentSessionId, requestId, answer)
+    );
+  }
+
+  setConfig(key: string, value: string): Promise<Object> {
+    return this.request(
+      HermesMethods.CONFIG_SET,
+      new ConfigSetParams(this.currentSessionId, key, value)
     );
   }
 

@@ -96,4 +96,5 @@ export class HermesMethods {
   static readonly SESSION_INTERRUPT: string = 'session.interrupt';
   static readonly APPROVAL_RESPOND: string = 'approval.respond';
   static readonly CLARIFY_RESPOND: string = 'clarify.respond';
+  static readonly CONFIG_SET: string = 'config.set';
 }

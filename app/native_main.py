@@ -189,6 +189,45 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
             media_type=response.headers.get("content-type", "application/json"),
         )
 
+    @app.get("/api/hermes/model/options")
+    async def hermes_model_options(
+        profile: str,
+        x_voice_token: str = Header(default=""),
+    ) -> dict:
+        require_access(x_voice_token)
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.get(
+                f"{backend(profile)}/api/model/options",
+                headers={"X-Hermes-Session-Token": settings.hermes_token},
+            )
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Hermes模型列表读取失败",
+                )
+            return response.json()
+
+    @app.post("/api/hermes/model/set")
+    async def hermes_model_set(
+        request: Request,
+        profile: str,
+        x_voice_token: str = Header(default=""),
+    ) -> dict:
+        require_access(x_voice_token)
+        body = await request.json()
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"{backend(profile)}/api/model/set",
+                json=body,
+                headers={"X-Hermes-Session-Token": settings.hermes_token},
+            )
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Hermes模型切换失败",
+                )
+            return response.json()
+
     @app.get("/api/hermes/sessions/{session_id}")
     async def hermes_session_detail(
         session_id: str,
