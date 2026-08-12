@@ -1,7 +1,7 @@
 # Daiworld Voice — Single Agent Edition
 
 > 当前分支：`main`
-> 当前基线：Web v21 + HarmonyOS 1.1.1
+> 当前基线：Web v21 + HarmonyOS 1.2.1
 > 当前入口：<https://your-gateway.example/voice-native/>
 
 Daiworld Voice 有两种并存的产品形态，单 Agent 版不是主持人多 Agent 版的替代品。
@@ -127,9 +127,9 @@ Agent 显式返回 `MEDIA:<path>` 后：
 - Hermes 网关由 Adapter 每 25 秒下发应用层心跳；HarmonyOS 在收到首个心跳后启用 70 秒看门狗，自动重连时保留消息、语音输出开关和当前播放状态；
 - 麦克风持续监听，用户开口暂停当前播报，非停止指令完成后恢复播报并排队提交；
 - 精确整句“停止/stop”会中断任务与播放，并保留在对话上下文中；
-- 远端 ASR/TTS 意外断线后有界退避重连；ASR 保留短 PCM 并合并 1.1 秒内连续 final，TTS 保持待发帧顺序并先排空已收到的 PCM；
+- 远端 ASR/TTS 意外断线后有界退避重连；ASR 保留短 PCM，并以约 1.8 秒停顿窗口合并连续 interim/final，TTS 保持待发帧顺序并先排空已收到的 PCM；
 - 纯符号 ASR final 在 Adapter 统一归一为空 final，HarmonyOS 使用相同的 Unicode 字母/数字规则防御性拦截，不创建 Hermes Prompt；
-- 使用 `AUDIO_RECORDING` 长时任务支持后台和息屏监听，实际持续时间仍受设备电源策略约束；
+- 使用录音/播放长时任务支持后台和息屏：持续监听时保持 `AUDIO_RECORDING`，实际 TTS 播报窗口切换为 `AUDIO_PLAYBACK`，播完恢复录音意图；实际持续时间仍受设备电源策略约束；
 - 网关、Profile、语音后端、音色、语速和登录状态均持久化保存；
 - 历史按 20 条增量加载，恢复真实日期、模型、耗时、思考和工具过程；工具原始 JSON 不进入回复气泡或 TTS。
 
@@ -149,7 +149,7 @@ Agent 显式返回 `MEDIA:<path>` 后：
 | 澄清 | HarmonyOS 将问题和编号选项放入对话，下一条回复直达 `clarify.respond` |
 | 文件 | MEDIA 图片预览、附件下载、短期令牌、历史附件恢复 |
 | 历史 | 官方 list/resume/delete、20 条增量、完整日期、模型、耗时、思考与工具过程 |
-| 后台 | HarmonyOS `AUDIO_RECORDING` 长时任务、息屏监听、连接与语音状态恢复 |
+| 后台 | HarmonyOS 录音/播放长时任务、息屏监听、连接与语音状态恢复 |
 | UI | Web 深色 Linear 桌面/移动端适配；HarmonyOS 原生语音优先界面与持久化设置 |
 | 部署 | 一个或多个 Hermes Agent 后端 + 一个同源 FastAPI Adapter + HTTPS/WSS 反代 |
 
@@ -281,7 +281,7 @@ hvigorw assembleHap --mode module -p product=default -p buildMode=debug
 ```text
 Python：27 passed
 Node：19 passed
-HarmonyOS：18 个 ETS 文件静态校验通过，ArkTS/Hvigor 构建通过
+HarmonyOS：28 个 ETS 文件静态校验通过，ArkTS/Hvigor 构建通过
 真机：网关登录、持续离线 ASR、增量离线 TTS、暂停/恢复、硬停止、后台任务、历史恢复已验证
 Native/HarmonyOS 专属代码：`app/native_main.py`、`app/artifacts.py`、`web_native/`、`clients/harmony/`
 桌面/移动端真实服务证据：见 `docs/NATIVE_TEST_MATRIX.md`

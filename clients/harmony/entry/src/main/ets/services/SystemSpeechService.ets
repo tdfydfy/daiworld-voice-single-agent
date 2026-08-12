@@ -2,7 +2,7 @@ import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { speechRecognizer, textToSpeech } from '@kit.CoreSpeechKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { PcmCapture } from './PcmAudio';
+import { PcmCapture } from './PcmCapture';
 
 const SPEECH_FRAME_BYTES = 640;
 const SPEECH_PRE_ROLL_BYTES = 6400;

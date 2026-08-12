@@ -1,5 +1,27 @@
 # 变更记录
 
+## 2026-08-12
+
+- 修复：连续 ASR 普通本地/远端转写的收句窗口从 1.1 秒延长到 1.8 秒；每个有效 interim/final 到达都会重新计时，连续分段继续合并为同一条用户消息，停止、暂停收音、审批和澄清回复不受延迟影响。签名 HAP SHA-256 为 `3743D0DF1DF2ED857FF8CEF4458BCD25D97266F14E82D482E90C4B3C0D54F728`，已保留数据覆盖安装，待用户真机验证自然停顿和真正结束的体感。
+- 修复：思考呼吸音改由 `VoiceOutputCoordinator` 的显式 Agent-turn 生命周期驱动；提交/`message.start` 开始，正文播报、正常完成、错误、中断、审批/澄清和会话变化结束，避免仅依赖 `agentBusy` 快照与通知时机导致偶发缺失或残留。新增提示音状态变化日志；签名 HAP SHA-256 为 `FE4A294F0DEDEB1FB5FB84A3EA2CC56EE6E8D824DC1E2E8F8CE08DE067038BB6`，待真机听感验收。
+- 验收：用户确认 Session 创建、恢复、重连和 Agent/模型切换后的 Provider/模型身份同步通过；模型目录由 Hermes Provider 配置提供，客户端不写死列表。
+- 配置：确认 Hermes `providers.<provider>.models` 可作为 Provider 的手工模型目录；已为备用 Provider 补充模型并在 HarmonyOS 真机验证可选择和切换。`default_model` 仅表示默认模型，`model.aliases` / `model_aliases` 仅用于快捷别名；客户端无需改动或写死模型列表。
+- 修复：切换 Agent 或 Agent Catalog 回退时同步清除 `RuntimeIdentitySync` 缓存的旧模型目录和未确认运行身份，防止新 Session 暂时返回通用 `custom` Provider 时误显示上一 Agent 的具体 Provider；Session 创建、历史恢复、Gateway 重连和模型切换继续共用同一身份同步入口。
+- 发布：HarmonyOS `1.2.1 (1020001)` 统一新消息自动播报与历史消息重读的系统 TTS 分段入口，不按消息来源或屏幕状态维护两套算法；首段 20–48 字，后续优先 40–80 字且硬上限 96 字，最终余段同样受限。签名 HAP SHA-256 为 `4799478EA34BB22B454F78A9D0686A5699A1A7DEF566AD2AE3F8B0CEF1CB764B`；用户真机确认新消息与历史重读在播放中途息屏均连续无异常，核心语音衔接通过验收。
+- 修复：历史会话恢复在停止旧会话音频后会恢复原有麦克风与语音输出意图，历史 Agent 消息不再因输出总开关被永久关闭而禁用重读；签名 HAP SHA-256 为 `E951C2E41672CDBAED7439E392141214686EF145FD542A2A9619831AF1BDB288`，已覆盖安装，待用户验收历史重读。
+- 架构：第二轮有限拆分将历史恢复解析归入 `ConversationState`，将模型目录/切换和 Gateway 鉴权、Agent 目录、超时及重连状态归入 `HermesRuntime`；`SingleAgentController` 进一步降至 1339 行，继续保留 UI 命令入口与跨域事件协调。
+- 修复：消息按钮系统重读现在直接启动第一段 TTS，仅将剩余分段排队，解除所有分段都排队却没有活动任务的无声死锁；最新签名 HAP SHA-256 为 `D5F88A0DFCAB0C5C463AA254FA1C316F0117E34948CE5EBAB6543F3FD4B5EF18`，待真机听感验收。
+- 阶段构建：HarmonyOS `1.2.0 (1020000)` 第一轮拆分曾产出 SHA-256 `E7DB1AB4BEDFB96225212DB9EA1AB6D43E7AB84711E99C4A73DEB04A99E4BDFC` 的签名 HAP，已由本日顶部的第二轮拆分产物取代。
+- 架构：第一轮按薄客户端原则形成设置/鉴权、Hermes 运行、语音输入、语音输出、对话状态五个责任域，并将音频平台类物理拆开；`SingleAgentController` 从约 3636 行降至约 1920 行，不引入事件总线或多余业务分层。
+- 修复：系统 TTS `queued/playing` 期间以 `AUDIO_PLAYBACK` 作为后台任务意图，播完或用户开口暂停后恢复 `AUDIO_RECORDING`，持续麦克风采集保持不变。
+- 修复：消息重读按钮不再因持续 ASR 的瞬时活动状态被禁用；保留任务忙碌、pending、静音和输出关闭约束，并增加重读及后台任务切换日志。
+- 发布：HarmonyOS 提升为 `1.1.2 (1010002)`，完成签名构建、保留数据覆盖安装、启动和包内版本核验；最终 HAP SHA-256 为 `FCCE719CBFD3378925A97A95EC0A30D90C44A9F11A871751ACF5AC01A9D8AFD6`。
+- 修复：目标真机 HUKS AES-GCM 无法稳定回读后，按用户决定改用应用私有 Preferences 保存访问口令，并执行同步读回验证；旧 HUKS 记录自动清理。真机强制停止重开已读取到持久化口令。
+- 架构：抽出 `GatewayTokenStore`、`SystemSpeechQueue`、`BackgroundAudioTaskOwner` 和 `RuntimeIdentitySync`，将超大控制器从约 3929 行降至约 3636 行；系统语音仍为主路径，远端语音为手动辅助。
+- 声音：系统 TTS 分段队列、循环呼吸音让位、陈旧异步启动隔离和后台录音/播放任务所有权已收敛；用户随后确认息屏长文不再中断或漏字，消息重读由本日顶部修复继续处理。
+- 身份：Session 创建、恢复和 `session.info` 主动同步运行 Provider/模型，设置页只展示共享状态；真实显示结果仍需用户确认。
+- 验证：Python 27 项、Node 19 项、Harmony 21 个 ETS 文件静态校验、ArkTS 类型检查、签名打包、`git diff --check`、公网 `200/401` 及真机包/进程/Ability 检查通过。
+
 ## 2026-08-11
 
 - 新增：Adapter 在 Hermes JSON-RPC 下行链路每 25 秒发送 `gateway.heartbeat`；HarmonyOS 在收到首个心跳后启用 70 秒看门狗，并兼容不发送心跳的旧 Adapter。

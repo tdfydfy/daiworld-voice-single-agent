@@ -37,7 +37,7 @@ $env:HERMES_DASHBOARD_SESSION_TOKEN = 'Hermes 内部口令'
 python -m uvicorn app.native_main:app --host 0.0.0.0 --port 8844
 ```
 
-在应用设置中填写 Adapter 的基地址，例如 `https://example.com/voice-native`，再填写对应的访问口令；Agent 选择器会从 `/api/agents` 动态加载目录。长期访问口令只用于前置 HTTP 请求换取，WebSocket 只发送短期 `voice_session` Cookie。
+在应用设置中填写 Adapter 的基地址，例如 `https://example.com/voice-native`，再填写对应的访问口令；Agent 选择器会从 `/api/agents` 动态加载目录。访问口令当前保存在应用私有 Preferences 中并在写入后立即读回校验；目标 HarmonyOS 6.1 真机上的 HUKS AES-GCM 回读不稳定，因此不再作为连接前置条件。长期访问口令只用于前置 HTTP 请求换取，WebSocket 只发送短期 `voice_session` Cookie。
 
 Hermes JSON-RPC 链路使用 Adapter 每 25 秒发送的 `gateway.heartbeat` 保活。客户端在收到首个心跳后启用 70 秒看门狗，超时会关闭悬挂 socket 并按有界退避重新鉴权、恢复当前 Session。恢复路径保留现有消息、语音输出开关和播放状态，不会重放 Prompt；旧 Adapter 不发送心跳时不会误触发看门狗。
 
@@ -53,11 +53,13 @@ CoreSpeechKit 当前使用离线短句识别。真机上单个识别 session 最
 
 ## 远端 ASR/TTS 恢复
 
-远端语音 WebSocket 意外断开后，客户端按 `250 / 750 / 1500 / 3000 ms` 封顶退避重连，连接成功后重置退避。ASR 在断线和等待 Provider `ready` 期间保留最近 4 个 PCM 块（约 0.8 秒），普通 final 在约 1.1 秒窗口内合并；连接从开始到 `ready` 超过 10 秒会主动进入下一轮恢复。TTS 的文本和 `done` 帧严格按队列顺序发送，失败帧保留到重连后继续；已收到的 PCM 会先排空。暂停收音、静音、切换到鸿蒙离线语音或主动断开会取消对应重连，`停止` 和显式关闭仍会清空待播任务。
+远端语音 WebSocket 意外断开后，客户端按 `250 / 750 / 1500 / 3000 ms` 封顶退避重连，连接成功后重置退避。ASR 在断线和等待 Provider `ready` 期间保留最近 4 个 PCM 块（约 0.8 秒），普通转写在约 1.8 秒停顿窗口内合并连续 interim/final；连接从开始到 `ready` 超过 10 秒会主动进入下一轮恢复。TTS 的文本和 `done` 帧严格按队列顺序发送，失败帧保留到重连后继续；已收到的 PCM 会先排空。暂停收音、静音、切换到鸿蒙离线语音或主动断开会取消对应重连，`停止` 和显式关闭仍会清空待播任务。
 
 全双工音频统一声明为鸿蒙语音通信场景。PCM 采集固定使用 `SOURCE_TYPE_VOICE_COMMUNICATION`，应用自管的 PCM 播放使用 `STREAM_USAGE_VOICE_COMMUNICATION`，并共享 `AUDIO_SESSION_SCENE_VOICE_COMMUNICATION`。客户端无配件时默认 `EARPIECE`，耳机接入时回到系统默认的耳机路由；输出按钮可以显式切到 `SPEAKER`，再次点击则回到当前系统私密路由。界面监听系统首选输出，按实际路由显示听筒、扬声器或耳机。蓝牙 SCO、NearLink、有线和 USB 设备的实际选择及无输入设备时的手机麦克风回退仍由 HarmonyOS 管理。客户端不调用 `selectMediaInputDevice()`，不再根据输出设备推断输入设备，也不因正常插拔重建 `AudioCapturer`。`inputDeviceChange` 仅用于刷新手机或耳机麦克风标签和记录诊断日志。短提示音不持有通信 Session，避免麦克风关闭后反复切换 A2DP/SCO。STT 和 TTS 保持并行；用户开口后只停止旧播报，不停止或重建识别 session。客户端不叠加 RMS 声音阈值，以免截断轻声发言。外放回声消除和双讲识别的实际效果仍取决于设备系统实现。
 
 系统 TTS 的音频焦点冲突已做最小修正：CoreSpeech TTS 不再额外持有客户端通信 AudioSession，麦克风仍在使用的通信会话改为允许与系统 `VOICE_ASSISTANT` 播放器并发。静态校验、ArkTS 类型检查和 HAP 构建已通过；仍需真机确认自动播报恢复，并确认日志中不再出现 `ActivateAudioInterrupt Failed` / `6800301`。
+
+后台长时任务按当前实际音频活动切换：持续收音默认使用 `AUDIO_RECORDING`，系统或远端 TTS 进入 `queued/playing` 后优先使用 `AUDIO_PLAYBACK`，播完或用户开口暂停播报后恢复录音意图；切换不会主动停止麦克风采集。系统 TTS 的新消息和历史重读统一经过同一个句边界分段器：首段 20–48 字快速起播，后续段优先约 40–80 字且硬上限 96 字，最终余段不能绕过上限。亮屏、息屏不选择不同算法；播放中切屏的实际听感仍需真机验收。
 
 ## 发布前检查
 
@@ -67,6 +69,10 @@ CoreSpeechKit 当前使用离线短句识别。真机上单个识别 session 最
 4. 在 DevEco Studio 中使用发行签名构建 HAP，再通过 AppGallery Connect 创建版本、上传 HAP、填写隐私与权限说明并提交审核。
 
 真机和 AppGallery Connect 的签名、上传、审核需要开发者账号授权，不能由本地源码或 CI 自动替代。
+
+## AI 真机验证边界
+
+本项目已获得持续有效的开发期真机授权：构建后可直接检查设备连接、保留数据安装签名 HAP、拉起 `EntryAbility`，并执行包/进程状态及不提交真实业务数据的简单接口检查，无需每轮重复确认。复杂点击流程、麦克风输入、语音听感、功能正确性、截图验收和视觉美感仍由用户操作并反馈；安装或成功拉起不能记为产品功能验收通过。授权原文和撤销边界见 [`docs/plans/2026-08-12-permanent-device-smoke-authorization.md`](../../docs/plans/2026-08-12-permanent-device-smoke-authorization.md)。
 
 ## Voice control semantics
 

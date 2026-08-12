@@ -1,4 +1,4 @@
-import { PcmPlayer } from './PcmAudio';
+import { PcmPlayer } from './PcmPlayer';
 
 const CUE_SAMPLE_RATE = 24000;
 const RUNNING_INITIAL_DELAY_MS = 1200;
@@ -84,6 +84,16 @@ export class AudioCuePlayer {
   private cleanupTimer?: number;
   private running: boolean = false;
   private runningTimer?: number;
+  private speechYieldWaiters: Array<() => void> = [];
+  private stateListener?: () => void;
+
+  isRunning(): boolean {
+    return this.running || this.activeCue.length > 0 || this.cueTimer !== undefined;
+  }
+
+  setStateListener(listener: () => void): void {
+    this.stateListener = listener;
+  }
 
   playAccepted(): void {
     this.playCue(ACCEPTED_CUE, 'accepted');
@@ -103,8 +113,11 @@ export class AudioCuePlayer {
     }
     this.running = active;
     this.clearRunningTimer();
+    this.notifyStateChanged();
     if (!active && this.activeCue === 'running') {
-      this.stopActiveCue();
+      // The cue already has a short fade-out. Let it drain instead of cutting
+      // the waveform mid-cycle before a higher-priority speech output.
+      return;
     }
     if (active) {
       this.scheduleRunningPulse(RUNNING_INITIAL_DELAY_MS);
@@ -116,6 +129,20 @@ export class AudioCuePlayer {
     this.clearRunningTimer();
     this.clearCueTimer();
     this.stopActiveCue();
+    this.notifyStateChanged();
+  }
+
+  yieldForSpeech(): Promise<void> {
+    this.running = false;
+    this.clearRunningTimer();
+    this.clearCueTimer();
+    this.notifyStateChanged();
+    if (!this.player || this.activeCue.length === 0) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve: () => void): void => {
+      this.speechYieldWaiters.push(resolve);
+    });
   }
 
   private scheduleRunningPulse(delayMs: number): void {
@@ -137,6 +164,7 @@ export class AudioCuePlayer {
         this.cueTimer = undefined;
         this.startCue(buffer, kind);
       }, delayMs);
+      this.notifyStateChanged();
       return;
     }
     this.startCue(buffer, kind);
@@ -149,6 +177,7 @@ export class AudioCuePlayer {
     player.setSampleRate(CUE_SAMPLE_RATE);
     this.player = player;
     this.activeCue = kind;
+    this.notifyStateChanged();
     player.enqueue(buffer);
     player.waitForDrain((): void => {
       this.finishCue(player, generation);
@@ -171,7 +200,10 @@ export class AudioCuePlayer {
     this.player = undefined;
     this.activeCue = '';
     this.playbackGeneration += 1;
-    player.stop().catch(() => undefined);
+    this.notifyStateChanged();
+    player.stop().catch(() => undefined).finally((): void => {
+      this.resolveSpeechYieldWaiters();
+    });
   }
 
   private stopActiveCue(): void {
@@ -183,7 +215,22 @@ export class AudioCuePlayer {
     this.player = undefined;
     this.activeCue = '';
     this.playbackGeneration += 1;
-    player?.stop().catch(() => undefined);
+    this.notifyStateChanged();
+    if (!player) {
+      this.resolveSpeechYieldWaiters();
+      return;
+    }
+    player.stop().catch(() => undefined).finally((): void => {
+      this.resolveSpeechYieldWaiters();
+    });
+  }
+
+  private resolveSpeechYieldWaiters(): void {
+    const waiters = this.speechYieldWaiters;
+    this.speechYieldWaiters = [];
+    for (const resolve of waiters) {
+      resolve();
+    }
   }
 
   private clearCueTimer(): void {
@@ -197,6 +244,12 @@ export class AudioCuePlayer {
     if (this.runningTimer !== undefined) {
       clearTimeout(this.runningTimer);
       this.runningTimer = undefined;
+    }
+  }
+
+  private notifyStateChanged(): void {
+    if (this.stateListener) {
+      this.stateListener();
     }
   }
 }

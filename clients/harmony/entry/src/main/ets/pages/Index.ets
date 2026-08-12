@@ -12,10 +12,10 @@ import {
   SpeechBackend
 } from '../models/SingleAgentState';
 import {
-  DEFAULT_GATEWAY_URL,
   SingleAgentController,
   SnapshotListener
 } from '../services/SingleAgentController';
+import { DEFAULT_GATEWAY_URL } from '../services/AppSettingsStore';
 import { VoiceOption } from '../services/SystemSpeechService';
 
 const COLOR_BG = '#08090A';
@@ -105,8 +105,7 @@ struct Index {
       this.finishControllerInitialization();
     }).catch((): void => {
       this.controllerReady = true;
-      this.showSettings = true;
-      this.loadVoiceOptions();
+      this.showSettings = false;
     });
     this.clockTimer = setInterval((): void => {
       this.nowMs = Date.now();
@@ -148,8 +147,8 @@ struct Index {
     this.showHistory = false;
     this.showTextComposer = false;
     this.showSettings = true;
+    this.syncModelSelection(this.snapshot);
     this.loadVoiceOptions();
-    this.reloadModelOptions();
   }
 
   private closeSettings(): void {
@@ -207,7 +206,8 @@ struct Index {
     this.speechRate = config.speechRate;
     this.debugMode = config.debugMode;
     this.controllerReady = true;
-    this.showSettings = !this.hasSavedToken;
+    this.showSettings = this.snapshot.credentialState === 'unconfigured' ||
+      this.snapshot.credentialState === 'storage_error';
     if (this.showSettings) {
       this.loadVoiceOptions();
       return;
@@ -862,6 +862,21 @@ struct Index {
             .onChange((value: string) => {
               this.accessToken = value;
             })
+
+          if (this.snapshot.credentialState === 'storage_error') {
+            Text(this.snapshot.credentialError.length > 0
+              ? this.snapshot.credentialError : '访问口令本地存储不可用，请重新保存')
+              .width('100%')
+              .fontSize(11)
+              .lineHeight(17)
+              .fontColor(COLOR_DANGER)
+          } else if (this.snapshot.credentialState === 'unauthorized') {
+            Text('已保存的访问口令未通过服务器验证，请输入新的口令')
+              .width('100%')
+              .fontSize(11)
+              .lineHeight(17)
+              .fontColor(COLOR_DANGER)
+          }
 
         }
         .width('100%')

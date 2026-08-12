@@ -4,6 +4,8 @@
 
 export type ConnectionState = 'offline' | 'connecting' | 'online';
 
+export type CredentialState = 'unconfigured' | 'ready' | 'storage_error' | 'unauthorized';
+
 // Agent IDs are opaque values supplied by the Adapter catalog.
 export type ProfileKey = string;
 
@@ -85,6 +87,8 @@ export class ClarifyView {
 
 export class SingleAgentSnapshot {
   connection: ConnectionState = 'offline';
+  credentialState: CredentialState = 'unconfigured';
+  credentialError: string = '';
   selectedProfile: ProfileKey = 'default';
   agents: AgentInfo[] = [];
   agentsLoading: boolean = false;
