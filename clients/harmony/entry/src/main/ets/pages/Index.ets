@@ -831,37 +831,54 @@ struct Index {
             .fontWeight(FontWeight.Medium)
             .fontColor(COLOR_TEXT)
 
-          TextInput({ placeholder: '网关地址', text: this.gatewayUrl })
-            .fontSize(13)
-            .fontColor(COLOR_TEXT)
-            .placeholderColor(COLOR_MUTED)
-            .caretColor(COLOR_TEXT)
-            .height(42)
-            .padding({ left: 12, right: 12 })
-            .backgroundColor(COLOR_BG)
-            .border({ width: 1, color: COLOR_LINE })
-            .borderRadius(7)
-            .onChange((value: string) => {
-              this.gatewayUrl = value;
-            })
+          Row({ space: 10 }) {
+            Column({ space: 5 }) {
+              Text('远端地址')
+                .fontSize(11)
+                .fontColor(COLOR_MUTED)
+                .width('100%')
+              TextInput({ placeholder: '网关地址', text: this.gatewayUrl })
+                .fontSize(13)
+                .fontColor(COLOR_TEXT)
+                .placeholderColor(COLOR_MUTED)
+                .caretColor(COLOR_TEXT)
+                .height(42)
+                .padding({ left: 12, right: 12 })
+                .backgroundColor(COLOR_BG)
+                .border({ width: 1, color: COLOR_LINE })
+                .borderRadius(7)
+                .onChange((value: string) => {
+                  this.gatewayUrl = value;
+                })
+            }
+            .layoutWeight(1)
 
-          TextInput({
-            placeholder: this.hasSavedToken ? '口令已保存，留空则不修改' : '访问口令',
-            text: this.accessToken
-          })
-            .fontSize(13)
-            .fontColor(COLOR_TEXT)
-            .placeholderColor(COLOR_MUTED)
-            .caretColor(COLOR_TEXT)
-            .height(42)
-            .padding({ left: 12, right: 12 })
-            .backgroundColor(COLOR_BG)
-            .border({ width: 1, color: COLOR_LINE })
-            .borderRadius(7)
-            .type(InputType.Password)
-            .onChange((value: string) => {
-              this.accessToken = value;
-            })
+            Column({ space: 5 }) {
+              Text('访问口令')
+                .fontSize(11)
+                .fontColor(COLOR_MUTED)
+                .width('100%')
+              TextInput({
+                placeholder: this.hasSavedToken ? '已保存，留空不修改' : '访问口令',
+                text: this.accessToken
+              })
+                .fontSize(13)
+                .fontColor(COLOR_TEXT)
+                .placeholderColor(COLOR_MUTED)
+                .caretColor(COLOR_TEXT)
+                .height(42)
+                .padding({ left: 12, right: 12 })
+                .backgroundColor(COLOR_BG)
+                .border({ width: 1, color: COLOR_LINE })
+                .borderRadius(7)
+                .type(InputType.Password)
+                .onChange((value: string) => {
+                  this.accessToken = value;
+                })
+            }
+            .layoutWeight(1)
+          }
+          .width('100%')
 
           if (this.snapshot.credentialState === 'storage_error') {
             Text(this.snapshot.credentialError.length > 0
@@ -880,12 +897,21 @@ struct Index {
 
         }
         .width('100%')
+        .padding(12)
+        .backgroundColor(COLOR_PANEL)
+        .border({ width: 1, color: COLOR_LINE })
+        .borderRadius(9)
 
         Column({ space: 10 }) {
+          Text('Agent 运行配置')
+            .width('100%')
+            .fontSize(13)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(COLOR_TEXT)
+
           Row() {
-            Text('当前会话模型')
+            Text('当前会话')
               .fontSize(13)
-              .fontWeight(FontWeight.Medium)
               .fontColor(COLOR_TEXT)
             Blank()
             Text(this.runtimeText())
@@ -934,46 +960,55 @@ struct Index {
             }
             .width('100%')
           } else if (this.snapshot.modelProviders.length > 0) {
-            Text('Provider')
-              .width('100%')
-              .fontSize(11)
-              .fontColor(COLOR_MUTED)
-            Select(this.modelProviderItems())
-              .selected(this.modelProviderIndex())
-              .value(this.selectedModelProviderName())
-              .font({ size: 13 })
-              .fontColor(COLOR_TEXT)
-              .backgroundColor(COLOR_BG)
-              .border({ width: 1, color: COLOR_LINE })
-              .borderRadius(7)
-              .width('100%')
-              .height(44)
-              .enabled(!this.snapshot.modelSwitching)
-              .onSelect((index: number, _value: string): void => {
-                this.selectModelProvider(index);
-              })
+            Row({ space: 10 }) {
+              Column({ space: 5 }) {
+                Text('Provider')
+                  .width('100%')
+                  .fontSize(11)
+                  .fontColor(COLOR_MUTED)
+                Select(this.modelProviderItems())
+                  .selected(this.modelProviderIndex())
+                  .value(this.selectedModelProviderName())
+                  .font({ size: 13 })
+                  .fontColor(COLOR_TEXT)
+                  .backgroundColor(COLOR_BG)
+                  .border({ width: 1, color: COLOR_LINE })
+                  .borderRadius(7)
+                  .width('100%')
+                  .height(44)
+                  .enabled(!this.snapshot.modelSwitching)
+                  .onSelect((index: number, _value: string): void => {
+                    this.selectModelProvider(index);
+                  })
+              }
+              .layoutWeight(1)
 
-            Text('模型')
-              .width('100%')
-              .fontSize(11)
-              .fontColor(COLOR_MUTED)
-            Select(this.runtimeModelItems())
-              .selected(this.runtimeModelIndex())
-              .value(this.selectedRuntimeModelLabel())
-              .font({ size: 13 })
-              .fontColor(COLOR_TEXT)
-              .backgroundColor(COLOR_BG)
-              .border({ width: 1, color: COLOR_LINE })
-              .borderRadius(7)
-              .width('100%')
-              .height(44)
-              .enabled(!this.snapshot.modelSwitching)
-              .onSelect((index: number, _value: string): void => {
-                const provider = this.selectedModelProviderOption();
-                if (provider !== undefined && index >= 0 && index < provider.models.length) {
-                  this.selectedRuntimeModel = provider.models[index].id;
-                }
-              })
+              Column({ space: 5 }) {
+                Text('模型')
+                  .width('100%')
+                  .fontSize(11)
+                  .fontColor(COLOR_MUTED)
+                Select(this.runtimeModelItems())
+                  .selected(this.runtimeModelIndex())
+                  .value(this.selectedRuntimeModelLabel())
+                  .font({ size: 13 })
+                  .fontColor(COLOR_TEXT)
+                  .backgroundColor(COLOR_BG)
+                  .border({ width: 1, color: COLOR_LINE })
+                  .borderRadius(7)
+                  .width('100%')
+                  .height(44)
+                  .enabled(!this.snapshot.modelSwitching)
+                  .onSelect((index: number, _value: string): void => {
+                    const provider = this.selectedModelProviderOption();
+                    if (provider !== undefined && index >= 0 && index < provider.models.length) {
+                      this.selectedRuntimeModel = provider.models[index].id;
+                    }
+                  })
+              }
+              .layoutWeight(1)
+            }
+            .width('100%')
 
             if (this.snapshot.modelSwitchStatus.length > 0) {
               Text(this.snapshot.modelSwitchStatus)
@@ -1011,6 +1046,10 @@ struct Index {
           }
         }
         .width('100%')
+        .padding(12)
+        .backgroundColor(COLOR_PANEL)
+        .border({ width: 1, color: COLOR_LINE })
+        .borderRadius(9)
 
         Column({ space: 10 }) {
           Text('语音引擎')
@@ -1047,40 +1086,99 @@ struct Index {
           .backgroundColor(COLOR_BG)
           .borderRadius(7)
 
-          if (this.speechBackend === 'harmony_offline') {
-            if (this.voiceOptionsLoading) {
-              Row({ space: 8 }) {
-                LoadingProgress()
-                  .width(18)
-                  .height(18)
-                  .color(COLOR_ACCENT)
-                Text('正在读取系统音色')
+          Row({ space: 10 }) {
+            Column({ space: 5 }) {
+              Text('音色')
+                .width('100%')
+                .fontSize(11)
+                .fontColor(COLOR_MUTED)
+              if (this.speechBackend === 'harmony_offline') {
+                if (this.voiceOptionsLoading) {
+                  Row({ space: 8 }) {
+                    LoadingProgress()
+                      .width(18)
+                      .height(18)
+                      .color(COLOR_ACCENT)
+                    Text('读取中')
+                      .fontSize(12)
+                      .fontColor(COLOR_MUTED)
+                  }
+                  .width('100%')
+                  .height(44)
+                } else if (this.voiceOptions.length > 0) {
+                  Select(this.voiceSelectItems())
+                    .selected(Math.max(0, this.voiceIndex()))
+                    .value(this.voiceOptions[Math.max(0, this.voiceIndex())].label)
+                    .font({ size: 13 })
+                    .fontColor(COLOR_TEXT)
+                    .backgroundColor(COLOR_BG)
+                    .border({ width: 1, color: COLOR_LINE })
+                    .borderRadius(7)
+                    .width('100%')
+                    .height(44)
+                    .onSelect((index: number, _value: string): void => {
+                      this.voicePerson = this.voiceOptions[index].person;
+                    })
+                } else {
+                  Text('暂无可用音色')
+                    .width('100%')
+                    .height(44)
+                    .fontSize(12)
+                    .fontColor(COLOR_DANGER)
+                }
+              } else {
+                Text('远端配置')
+                  .width('100%')
+                  .height(44)
                   .fontSize(12)
                   .fontColor(COLOR_MUTED)
               }
-              .width('100%')
-              .height(42)
-            } else if (this.voiceOptions.length > 0) {
-              Select(this.voiceSelectItems())
-                .selected(Math.max(0, this.voiceIndex()))
-                .value(this.voiceOptions[Math.max(0, this.voiceIndex())].label)
-                .font({ size: 13 })
-                .fontColor(COLOR_TEXT)
-                .backgroundColor(COLOR_BG)
-                .border({ width: 1, color: COLOR_LINE })
-                .borderRadius(7)
-                .width('100%')
-                .height(44)
-                .onSelect((index: number, _value: string): void => {
-                  this.voicePerson = this.voiceOptions[index].person;
-                })
-            } else {
-              Text('设备未返回可用的离线音色')
-                .width('100%')
-                .fontSize(12)
-                .fontColor(COLOR_DANGER)
             }
-          } else {
+            .layoutWeight(1)
+
+            Column({ space: 5 }) {
+              Row() {
+                Text('朗读语速')
+                  .fontSize(11)
+                  .fontColor(COLOR_MUTED)
+                Blank()
+                Text(this.speechRate.toFixed(1) + 'x')
+                  .fontSize(11)
+                  .fontColor(COLOR_SUCCESS)
+              }
+              .width('100%')
+              Row({ space: 6 }) {
+                Text('0.5')
+                  .fontSize(9)
+                  .fontColor(COLOR_MUTED)
+                Slider({
+                  value: this.speechRate,
+                  min: 0.5,
+                  max: 2,
+                  step: 0.1,
+                  style: SliderStyle.OutSet
+                })
+                  .layoutWeight(1)
+                  .selectedColor(COLOR_SUCCESS)
+                  .trackColor(COLOR_LINE)
+                  .blockColor(COLOR_TEXT)
+                  .enabled(this.speechBackend === 'harmony_offline')
+                  .opacity(this.speechBackend === 'harmony_offline' ? 1 : 0.45)
+                  .onChange((value: number): void => {
+                    this.speechRate = Math.round(value * 10) / 10;
+                  })
+                Text('2.0')
+                  .fontSize(9)
+                  .fontColor(COLOR_MUTED)
+              }
+              .width('100%')
+              .height(44)
+            }
+            .layoutWeight(1)
+          }
+          .width('100%')
+
+          if (this.speechBackend === 'remote') {
             Text('音色由远端语音服务配置；切回本地时会保留当前本地音色和语速。')
               .width('100%')
               .fontSize(11)
@@ -1089,61 +1187,36 @@ struct Index {
           }
         }
         .width('100%')
+        .padding(12)
+        .backgroundColor(COLOR_PANEL)
+        .border({ width: 1, color: COLOR_LINE })
+        .borderRadius(9)
 
-        Column({ space: 8 }) {
-          Row() {
-            Text('朗读语速')
-              .fontSize(13)
-              .fontWeight(FontWeight.Medium)
-              .fontColor(COLOR_TEXT)
-            Blank()
-            Text(this.speechRate.toFixed(1) + 'x')
-              .fontSize(12)
-              .fontColor(COLOR_SUCCESS)
-          }
-          .width('100%')
-          Row({ space: 8 }) {
-            Text('0.5x')
-              .fontSize(10)
-              .fontColor(COLOR_MUTED)
-            Slider({
-              value: this.speechRate,
-              min: 0.5,
-              max: 2,
-              step: 0.1,
-              style: SliderStyle.OutSet
-            })
-              .layoutWeight(1)
-              .selectedColor(COLOR_SUCCESS)
-              .trackColor(COLOR_LINE)
-              .blockColor(COLOR_TEXT)
-              .enabled(this.speechBackend === 'harmony_offline')
-              .opacity(this.speechBackend === 'harmony_offline' ? 1 : 0.45)
-              .onChange((value: number): void => {
-                this.speechRate = Math.round(value * 10) / 10;
-              })
-            Text('2.0x')
-              .fontSize(10)
-              .fontColor(COLOR_MUTED)
-          }
-          .width('100%')
-        }
-        .width('100%')
-
-        Row() {
-          Text('调试模式')
+        Column({ space: 10 }) {
+          Text('应用')
+            .width('100%')
             .fontSize(13)
             .fontWeight(FontWeight.Medium)
             .fontColor(COLOR_TEXT)
-          Blank()
-          Toggle({ type: ToggleType.Switch, isOn: this.debugMode })
-            .selectedColor(COLOR_ACCENT)
-            .onChange((isOn: boolean): void => {
-              this.debugMode = isOn;
-            })
+          Row() {
+            Text('调试模式')
+              .fontSize(13)
+              .fontColor(COLOR_TEXT)
+            Blank()
+            Toggle({ type: ToggleType.Switch, isOn: this.debugMode })
+              .selectedColor(COLOR_ACCENT)
+              .onChange((isOn: boolean): void => {
+                this.debugMode = isOn;
+              })
+          }
+          .width('100%')
+          .height(42)
         }
         .width('100%')
-        .height(42)
+        .padding(12)
+        .backgroundColor(COLOR_PANEL)
+        .border({ width: 1, color: COLOR_LINE })
+        .borderRadius(9)
 
         Button(this.settingsSaving ? '正在安全保存' :
           (this.snapshot.connection === 'online' ? '保存设置' : '保存并连接'), { type: ButtonType.Normal })
