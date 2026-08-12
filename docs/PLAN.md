@@ -2,15 +2,53 @@
 
 更新时间：2026-08-12
 
-## 当前阶段：`1.2.1` 连续 ASR 停顿判定
+## 当前阶段：息屏录播可靠性回归修复
 
-- 来源：[用户原始任务](plans/2026-08-12-core-file-decomposition-and-screen-off-tts.md)
+- 来源：[本次回退反馈](plans/2026-08-12-screen-off-audio-regression-recovery.md)
+- 业务基线：[HarmonyOS 音频用户旅程与业务逻辑](HARMONYOS_AUDIO_USER_JOURNEY.md)，最新来源为[仅系统指令模式与退出软件](plans/2026-08-12-command-only-input-and-exit.md)，并关联[音频提醒、控制和流统一](plans/2026-08-12-audio-cues-controls-and-stream-unification.md)与[用户旅程简化要求](plans/2026-08-12-audio-user-journey-simplification.md)。发起/补充、等待 Agent、聆听播报、停止/补充任务是唯一业务循环；屏幕、前后台、输入路由和播报状态是正交条件。
+- 下游技术参考：[录音、播放与前后台统一策略](HARMONYOS_AUDIO_STRATEGY.md)和[组件拆解蓝图](HARMONYOS_AUDIO_COMPONENT_DESIGN.md)。后者的 `S00-S21` 只用于实现期故障序列验证，不作为用户场景分类或当前设计入口。
+- 关联：[核心文件拆解与息屏语音问题](plans/2026-08-12-core-file-decomposition-and-screen-off-tts.md)、[核心语音架构收敛](plans/2026-08-12-core-voice-architecture-convergence.md)
 - 拆解原则：[薄客户端拆解原则](plans/2026-08-12-thin-client-decomposition-principles.md)
-- 真机授权：[长期构建部署与简单冒烟授权](plans/2026-08-12-permanent-device-smoke-authorization.md)。本项目后续可直接安装签名 HAP、拉起声明的 Ability，并执行设备/包/进程和简单接口检查；复杂交互、功能判断、语音听感与视觉美感仍由用户验收。
-- 目标：保持薄客户端边界，将普通连续 ASR 的收句窗口从 1.1 秒延长到 1.8 秒，减少自然气口和短暂思考造成的过早提交。
-- 架构约束：麦克风输入、Agent/Session、音频输出和应用前后台状态正交；Gateway 重连不得重置音频；系统语音是默认主路径，远端语音仅由用户手动选择；思考呼吸音保留循环播放但服从统一输出优先级。
-- 方案状态：结构拆解、历史按钮恢复、公共 TTS 分段、运行身份同步和暂停收音均已完成；思考提示音已实现显式生命周期，转入长期观察；当前只开发连续 ASR 停顿判定。
-- 简化原则：保留一个面向 UI 的薄控制器，只拆为设置/鉴权、Hermes 运行、语音输入、语音输出、对话状态五个清晰责任域；不引入事件总线、通用依赖注入、重复仓储/用例层或“一方法一模块”。
+- 真机授权：[长期构建部署与简单冒烟授权](plans/2026-08-12-permanent-device-smoke-authorization.md)。可直接构建、保留数据安装、拉起应用并检查包/进程/系统音频状态；语音听感和复杂交互仍由用户验收。
+- 目标：在不回退结构拆解的前提下，消除息屏播放中断、卡顿、吞字和录音中断，并建立能检测真实音频失活的恢复闭环。
+- 业务约束：`停止任务`等价于 Hermes `/stop`，清空当前/排队任务和全部本地输出，但保持输入模式；`关闭话筒`不停止采集或ASR，只切换到仅识别“停止任务/打开话筒/退出软件”的本地系统指令模式；`打开话筒`恢复普通消息提交；`退出软件`释放全部本地资源和连接，默认不隐式停止远端任务。每次冷启动首次完整话筒链路必须由用户手动开启。
+- 架构约束：麦克风意图、真实采集状态、TTS 队列、真实播放状态和后台持续任务分别有单一所有者；屏幕状态不进入 ASR/TTS 业务分支；Gateway 重连不得重置音频；系统语音仍是默认主路径。
+- 当前判断：`1.2.1` 真机回退已确认；源码存在后台模式异步切换窗口，`PcmCapture` 缺少 `stateChange`、`audioInterrupt` 和无数据看门。查询时系统无 AudioCapturer 只能作为诊断线索，仍需在复现日志中与“收音意图开启”同时确认。
+- 简化原则：先修后台所有权和采集健康，不立即重写系统 TTS；只有前两阶段后仍能复现吞音，才使用 CoreSpeech `onData` 做 PCM 自管播放。
+
+- [ ] [P0/业务状态] 实现精确系统指令门和完整释放语义
+  - 方案摘要：final 先在本地匹配“停止任务/关闭话筒/打开话筒/退出软件”；普通对话模式才允许普通消息进入 Agent。停止任务清空当前及排队任务和所有输出；退出软件按 Output -> Input -> Background -> Runtime 顺序释放并终止 UIAbility。
+  - 验收条件：仅系统指令模式的普通文本不建气泡、不响收到提示、不访问 Agent；三条允许指令在亮屏/息屏均有效；退出后无 Capturer、ASR、播放器、后台任务、socket 或重连定时器；每次冷启动首次输入仍需手动启动。
+  - 待确认：验证 `session.interrupt` 是否完整等价于 Hermes `/stop` 的排队清理；确认 HarmonyOS 主动终止 UIAbility 的稳定入口。
+
+- [ ] [P0/后台所有权] 使用一个同时声明录音与播放的持续任务，取消录播窗口之间的 stop/start
+  - 方案摘要：目标 API 24 支持 `startBackgroundRunning(context, ['audioPlayback', 'audioRecording'], wantAgent)`；完整话筒链路手动开启后保持该组合任务，普通对话/仅系统指令切换不改变租约；首段 TTS 等待后台 owner 的 ready Promise。只有退出软件且输出排空后才释放。
+  - 降级路径：若目标真机拒绝多模式申请，改用 `updateBackgroundRunning` 或串行 stop/start，但必须等待目标模式确认、有限重试且无后台保护时不启动 TTS；不能继续 fire-and-forget。
+  - 验收条件：持续开麦时一次任务覆盖录音和播放，整次回复不切换模式；闭麦播报时后台任务先 ready 后 TTS `speak`；停止、中断和失败不会遗留持续任务。
+
+- [ ] [P0/录音健康] 让真实 AudioCapturer 状态替代 `captureRunning` 单一布尔假设
+  - 方案摘要：`PcmCapture` 增加 `stateChange`、`audioInterrupt`、`readData` 时间戳和通信 AudioSession 恢复监听；完整链路运行时，非 RUNNING 状态或连续约 2 秒无 PCM 触发一次串行重建。重建保留ASR、消息路由与有限 pre-roll，不重复创建并发 Capturer；只有退出软件/完整释放时取消看门和重试。
+  - 所有权：`PcmCapture` 只报告平台健康事件并执行采集器重建；`SystemSpeechService` 负责 `captureRunning`、识别 session 和重试上限；`VoiceInputCoordinator` 只维护用户意图和 UI 状态。
+  - 验收条件：息屏、锁屏/解锁、短暂音频中断和 AudioSession 恢复后 PCM 自动继续；恢复耗尽时明确停止收音并显示错误，不能保持虚假的“监听中”。
+
+- [ ] [P0/播放状态] 收紧系统 TTS 首段启动和完成语义
+  - 方案摘要：新消息、历史重读、协议播报和 accepted/running/stop/error 提醒进入唯一输出仲裁；正文共用公共短分段，首段等待后台 ready。统一优先级为停止/错误警示 > 用户讲话静默 > 正文/重读 > 收到提示 > 思考呼吸；旧 generation 不能推进新队列。
+  - 验收条件：任一时刻只有一个可听输出；提醒不切断正文或制造破音；新消息与重读共用分段/播放器；停止清空全部输出后只响一次停止提示；错误不重复轰炸。
+
+- [ ] [条件升级/PCM] 若上述修复后系统 TTS 仍吞音，切换为 CoreSpeech 合成 PCM + `PcmPlayer` 自管播放
+  - 进入条件：组合后台任务和采集恢复已在真机生效，日志仍显示系统 TTS `onComplete` 但用户听到缺字、漏句或分段跳跃。
+  - 验证顺序：先做独立真机 spike，确认设置 `SpeakListener.onData` 后的音频类型、序号、采样率以及是否会与系统播放器重复发声；再决定替换默认播放路径。
+  - 实施边界：PCM 按 `onData.sequence` 入队，`onComplete` 只表示合成完成，必须等待 `PcmPlayer` drain 才算播放完成；播放器按实际采样率创建 renderer，并复用现有写入看门、AudioSession 恢复和中断处理。
+  - 验收条件：客户端能以 renderer 消费进度判断真正播完；暂停、恢复、停止、打断、路由变化和息屏均不丢缓冲、不重复播放。
+
+- [ ] [P0/行为回归] 先按四段用户旅程建立状态转换测试，再补平台故障序列
+  - 覆盖：组合后台任务只启动一次；消息路由切换不启停 Capturer/ASR/租约；后台 ready 前不得 `speak`；停止/退出不会陈旧起播或重连；采集 STOPPED/中断/无 PCM 只触发一次恢复；TTS/提示音陈旧回调不能推进队列。
+  - 拆解顺序：先覆盖发起/补充、等待 Agent、聆听播报和停止/补充任务的业务不变量，再按组件蓝图执行组合租约、统一采集、系统 ASR/TTS 分离、公共播放 job、远端播放后端和全矩阵六个实现切片；`S00-S21` 只作为故障序列，不扩展业务分类。
+  - 真机矩阵：亮屏开始后中途息屏、息屏后开始播报、新消息/历史重读/四类提醒、普通/仅指令模式、至少 5 分钟连续采集和ASR、单句跨 Session 轮换、播放中开口、停止任务、退出软件、锁屏/解锁、听筒/扬声器/耳机。
+  - 通过标准：无播放中断、爆破音、明显卡顿、缺字、漏段或重复；收音意图开启时系统持续存在采集流，异常后能恢复；日志中无 `6800301`，无后台任务空窗或无限重试。
+
+- [ ] [后续/ASR] 连续 ASR 1.8 秒停顿判定真机验收
+  - 状态：代码已完成，本轮让位于息屏录播 P0；核心音频可靠性通过后继续验收自然停顿、真正结束和即时控制词。
 
 - [x] [P0/凭据] 可靠恢复访问口令并区分未配置、写盘失败和服务端鉴权失败
   - 方案摘要：目标真机 HUKS AES-GCM 保存后无法回读，按用户决定降级为应用私有 Preferences；写入后同步读回验证，启动时清理不可恢复的旧 HUKS 记录。

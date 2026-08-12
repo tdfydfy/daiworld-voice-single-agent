@@ -127,9 +127,11 @@ Agent 显式返回 `MEDIA:<path>` 后：
 - Hermes 网关由 Adapter 每 25 秒下发应用层心跳；HarmonyOS 在收到首个心跳后启用 70 秒看门狗，自动重连时保留消息、语音输出开关和当前播放状态；
 - 麦克风持续监听，用户开口暂停当前播报，非停止指令完成后恢复播报并排队提交；
 - 精确整句“停止/stop”会中断任务与播放，并保留在对话上下文中；
+- 目标控制语义已收敛为“停止任务 / 关闭话筒 / 打开话筒 / 退出软件”：停止任务等价于 Hermes `/stop` 并清空排队任务；关闭话筒保持采集和ASR、只响应本地系统指令；退出软件释放本地音频与连接。当前 `1.2.1` 尚未实现这组新语义，详见音频用户旅程；
+- 已有收到、思考呼吸、停止和错误四类提醒音；后续可靠性重构必须让提醒、新消息播报和历史重读进入同一输出仲裁，避免并发播放和破音；
 - 远端 ASR/TTS 意外断线后有界退避重连；ASR 保留短 PCM，并以约 1.8 秒停顿窗口合并连续 interim/final，TTS 保持待发帧顺序并先排空已收到的 PCM；
 - 纯符号 ASR final 在 Adapter 统一归一为空 final，HarmonyOS 使用相同的 Unicode 字母/数字规则防御性拦截，不创建 Hermes Prompt；
-- 使用录音/播放长时任务支持后台和息屏：持续监听时保持 `AUDIO_RECORDING`，实际 TTS 播报窗口切换为 `AUDIO_PLAYBACK`，播完恢复录音意图；实际持续时间仍受设备电源策略约束；
+- 使用录音/播放长时任务支持后台和息屏；当前 `1.2.1` 的录播模式切换已确认存在可靠性回退，正在收敛为同时声明录音与播放的单一持续任务，并以真实采集/播放健康而不是屏幕状态驱动恢复；实际持续时间仍受设备电源策略约束；
 - 网关、Profile、语音后端、音色、语速和登录状态均持久化保存；
 - 历史按 20 条增量加载，恢复真实日期、模型、耗时、思考和工具过程；工具原始 JSON 不进入回复气泡或 TTS。
 
@@ -144,7 +146,7 @@ Agent 显式返回 `MEDIA:<path>` 后：
 | 语音输入 | Web：SeedASR-2.0 连续 PCM16/16k；HarmonyOS：CoreSpeechKit 离线识别或远端流式 ASR |
 | 语音输出 | Web：豆包流式 TTS + Edge fallback；HarmonyOS：系统离线 TTS 增量分段或远端 PCM24k |
 | 全双工 | Agent 思考/播报期间持续监听、真人语音暂停/恢复、补充排队 |
-| 控制 | 精确整句“停止/stop”才中断；其他语音默认作为下一轮输入 |
+| 控制 | 当前 `1.2.1`：精确“停止/stop”中断当前 turn；目标：停止任务 `/stop`、普通/仅系统指令路由、打开话筒和退出软件 |
 | 审批 | HarmonyOS 对话气泡、文字/语音同意或取消、安全失败；Web 技术预览保留既有协议回归 |
 | 澄清 | HarmonyOS 将问题和编号选项放入对话，下一条回复直达 `clarify.respond` |
 | 文件 | MEDIA 图片预览、附件下载、短期令牌、历史附件恢复 |
@@ -217,6 +219,9 @@ Agent 显式返回 `MEDIA:<path>` 后：
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)：单 Agent v21 当前架构、状态所有权、数据流和安全边界。
 - [`docs/INTERACTION_AND_PORTING_SPEC.md`](docs/INTERACTION_AND_PORTING_SPEC.md)：跨端交互、JSON-RPC、ASR/TTS、审批、附件和历史契约。
 - [`docs/HARMONYOS_SINGLE_AGENT_MIGRATION.md`](docs/HARMONYOS_SINGLE_AGENT_MIGRATION.md)：只针对单 Agent 鸿蒙形态的迁移分层、文件落点、阶段与验收。
+- [`docs/HARMONYOS_AUDIO_USER_JOURNEY.md`](docs/HARMONYOS_AUDIO_USER_JOURNEY.md)：HarmonyOS 音频业务入口；以发起/补充、等待 Agent、聆听播报和停止/补充任务构成唯一用户循环。
+- [`docs/HARMONYOS_AUDIO_STRATEGY.md`](docs/HARMONYOS_AUDIO_STRATEGY.md)：用户旅程下游的录音、播放、后台保障与恢复技术策略。
+- [`docs/HARMONYOS_AUDIO_COMPONENT_DESIGN.md`](docs/HARMONYOS_AUDIO_COMPONENT_DESIGN.md)：后续实现参考；故障序列、组件契约、代码迁移表和分阶段拆解蓝图。
 - [`docs/NATIVE_TEST_MATRIX.md`](docs/NATIVE_TEST_MATRIX.md)：单 Agent 专属自动化、真实服务证据、缺口及 HarmonyOS L1-L6 验证阶梯。
 - [`README_NATIVE.md`](README_NATIVE.md)：本地启动和运行速查。
 - [`clients/harmony/README.md`](clients/harmony/README.md)：HarmonyOS 工程、签名、构建、语音边界和真机检查说明。

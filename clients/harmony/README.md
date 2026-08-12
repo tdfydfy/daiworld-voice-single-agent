@@ -59,7 +59,7 @@ CoreSpeechKit 当前使用离线短句识别。真机上单个识别 session 最
 
 系统 TTS 的音频焦点冲突已做最小修正：CoreSpeech TTS 不再额外持有客户端通信 AudioSession，麦克风仍在使用的通信会话改为允许与系统 `VOICE_ASSISTANT` 播放器并发。静态校验、ArkTS 类型检查和 HAP 构建已通过；仍需真机确认自动播报恢复，并确认日志中不再出现 `ActivateAudioInterrupt Failed` / `6800301`。
 
-后台长时任务按当前实际音频活动切换：持续收音默认使用 `AUDIO_RECORDING`，系统或远端 TTS 进入 `queued/playing` 后优先使用 `AUDIO_PLAYBACK`，播完或用户开口暂停播报后恢复录音意图；切换不会主动停止麦克风采集。系统 TTS 的新消息和历史重读统一经过同一个句边界分段器：首段 20–48 字快速起播，后续段优先约 40–80 字且硬上限 96 字，最终余段不能绕过上限。亮屏、息屏不选择不同算法；播放中切屏的实际听感仍需真机验收。
+当前 `1.2.1` 的后台长时任务仍会按录音/播放活动在 `AUDIO_RECORDING` 和 `AUDIO_PLAYBACK` 之间切换，该机制已确认存在息屏可靠性回退，不再作为目标架构。修复方向是只要存在录音或播放需求，就持有一个同时声明两种能力的组合持续任务；首段 TTS 和 AudioCapturer 启动必须等待任务 ready，并以真实 PCM、平台状态和播放进度判断健康。系统 TTS 的新消息和历史重读继续共用句边界分段器：首段 20–48 字快速起播，后续段优先约 40–80 字且硬上限 96 字。亮屏、息屏不选择不同算法；完整策略和验收矩阵见 [`docs/HARMONYOS_AUDIO_STRATEGY.md`](../../docs/HARMONYOS_AUDIO_STRATEGY.md)。
 
 ## 发布前检查
 
@@ -76,4 +76,6 @@ CoreSpeechKit 当前使用离线短句识别。真机上单个识别 session 最
 
 ## Voice control semantics
 
-The microphone button controls input only: it stops `AudioCapturer`, PCM delivery, and ASR sessions. It does not interrupt an Agent turn or stop an active TTS job. The `停止` button is the explicit current-turn interrupt: it cancels the Agent task and clears TTS playback while leaving microphone state unchanged. Re-enabling the microphone resumes ASR without needlessly reconnecting an active TTS stream.
+Current `1.2.1` behavior: the microphone button and close-microphone phrases stop `AudioCapturer` and ASR. The `停止` button interrupts the current turn and clears local playback. This is legacy behavior and not the target contract.
+
+Target contract: every cold app start requires one manual activation of the full capture/ASR chain. After that, `关闭话筒` keeps capture and ASR running but routes finals through a local command-only gate; only exact `停止任务`, `打开话筒`, and `退出软件` commands are actionable, while ordinary results never reach the Agent. `停止任务` has Hermes `/stop` semantics and cancels the active plus queued tasks. `退出软件` releases all local audio, background, and network resources and closes the app; it does not implicitly stop a remote task. These target behaviors are documented but not implemented yet.

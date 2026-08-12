@@ -155,11 +155,14 @@ Web 当前实现：`web_native/`。HarmonyOS 后续使用 ArkTS 原生模块。
 
 ## 6. 正交状态
 
+HarmonyOS 音频的用户环节、控制语义和前后台业务规则以 [`HARMONYOS_AUDIO_USER_JOURNEY.md`](./HARMONYOS_AUDIO_USER_JOURNEY.md) 为准；平台资源和故障恢复再下钻到 [`HARMONYOS_AUDIO_STRATEGY.md`](./HARMONYOS_AUDIO_STRATEGY.md)。核心原则是屏幕状态只作为运行环境和诊断维度，不作为 ASR/TTS 业务分支；任一持续录音或播放需求使用同一个录播组合后台租约。
+
 ### 6.1 客户端状态
 
 ```text
 connection       = offline | connecting | online
-voiceEnabled     = false | true
+voiceChain       = not_started | running | exiting
+inputRouting     = conversation | system_commands_only
 asrState         = stopped | connecting | listening | finalizing
 agentBusy        = false | true
 approvalPending  = false | true
@@ -169,19 +172,20 @@ historyView      = closed | list | resumed
 
 ### 6.2 核心约束
 
-1. `voiceEnabled` 只能由用户开关；Agent 完成和 TTS 结束不能关闭它。
+1. 每次冷启动的完整话筒链路只能由用户手动开启；Agent 完成、TTS结束和关闭/打开话筒不能停止或重启它，退出软件才统一释放。
 2. ASR、Agent、TTS 是三条独立生命周期。
 3. Agent 生成完成不代表浏览器播放完成。
 4. `message.complete` 不能抢断上一条已接受播报。
-5. 非精确停止的 final 语音必须成为一条正式用户消息。
+5. 普通对话模式下，非系统指令的有效 final 必须成为正式用户消息；仅系统指令模式下，普通 final 必须在本地丢弃且不得发送远端。
 6. 审批期间普通 final 不得进入 Agent 队列。
 7. 历史显示用持久 ID，继续对话用 resume 返回的新运行时 ID。
 8. 文件读取权限由 Agent/OS 决定，浏览器不能传服务器路径。
-9. HarmonyOS 的麦克风按钮只控制 `AudioCapturer` 和 ASR 输入；关闭输入不得中断 Agent 或 TTS。
-10. `停止` 才是当前 Agent turn 的破坏性中断，负责 `session.interrupt` 和清空 TTS 播放队列，但不改变麦克风开关。
+9. 目标语义中，“关闭话筒/打开话筒”只切换 `inputRouting`；`AudioCapturer` 和ASR持续运行。当前 `1.2.1` 停止采集/ASR的行为属于待迁移旧实现。
+10. `停止任务`等价于 Hermes `/stop`：取消当前及全部排队任务，清空正文、重读、待播和思考提醒，但不改变输入链路或路由模式。
 11. HarmonyOS 语音后端由用户显式选择；`harmony_offline` 失败时不得自动切换或连接远端 ASR/TTS。
 12. HarmonyOS 全双工语音统一声明为 `VOICE_COMMUNICATION`，无配件时的通信输出默认设为听筒，用户可以显式切换扬声器；配件选择和麦克风回退由系统自动管理，设备变化只更新诊断与界面状态，不触发手工选路或采集器重建。
 13. Gateway 瞬态断线恢复只能重新鉴权并 `session.resume(storedSessionId)`；不得调用会停止语音的手动历史恢复、清空消息或重放 Prompt，独立的 TTS / 播放状态不随网关错误强制归零。
+14. `退出软件`统一释放本地输入、输出、后台任务和网络连接并终止应用，且不得残留自动重连；默认不隐式执行远端 `/stop`。
 
 ## 7. 文字和 Agent 数据流
 
