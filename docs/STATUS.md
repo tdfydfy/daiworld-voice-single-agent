@@ -4,7 +4,7 @@
 
 - 总体状态：用户确认 `1.2.4` 真机报“本地 TTS 未返回 PCM 音频流”；目标设备即使显式请求 `audioType: pcm`，CoreSpeech 也不回调可用的 `SpeakListener.onData`。已按用户要求检查老代码，确认 `1.1.2/1.2.1` 曾通过真机息屏长文验收的路径是系统 `engine.speak()` 加播放优先的专用 `AUDIO_PLAYBACK` 后台模式。
 - 当前阶段：P0 持续运行底座与本地播放连续性真机门。`1.2.5` 已撤销本地 CoreSpeech PCM 接管和录播组合租约，恢复系统播放器及专用 `AUDIO_PLAYBACK`/`AUDIO_RECORDING` 串行切换；代码、自动化和签名构建已完成，待覆盖安装后的用户听感验收。
-- 当前任务：[用户旅程驱动的当前计划](PLAN.md)，本轮来源为[恢复旧版已验证的息屏播放路径](plans/2026-08-13-restore-proven-screen-off-playback.md)。
+- 当前任务：[用户旅程驱动的当前计划](PLAN.md)，实现依据见[关键决策记录](decisions.md)。
 - 已完成到：系统 TTS 排队或播放时，控制器优先请求播放意图；`BackgroundAudioTaskOwner` 停止旧模式并等待 `AUDIO_PLAYBACK` ready 后才允许 `engine.speak()`。平台 `onComplete(type=1)` 推进短段队列，结束或用户开口后恢复 `AUDIO_RECORDING`。停止旧任务遇到 `9800005` 按已经停止处理；request generation 和完成后清空 request ID 保留重复点击幂等。
 - 保留能力：输出按钮任何时候都可打开 HarmonyOS `voice_call` 原生设备面板；耳机插拔恢复系统首选，用户仍可自由覆盖。采集状态、中断和无 PCM 看门仍按 `100 / 500 / 1500 ms` 三次有界恢复；远端 TTS 继续使用应用 `PcmPlayer` 和 drain。
 - 当前实现基线：`1.2.5 (1020005)`。已具备动态 Agent、Session 恢复、连续 ASR、系统/远端 TTS、消息重读和四类提醒入口；目标控制语义仍未落地。

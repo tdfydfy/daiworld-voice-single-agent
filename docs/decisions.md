@@ -7,7 +7,7 @@
 - 依据：目标设备的真实回调行为优先于 API 形式上的可选参数；组合后台任务虽保持存活，却没有阻止 CoreSpeech 在 `OnPageHide` 停止。旧版代码和真机验收提供了可复现的回退基线。
 - 影响：撤销 `1.2.3/1.2.4` 的本地 PCM 格式、序号和无数据超时逻辑；保留 request generation、重复停止幂等、短段队列、采集恢复和系统设备选择。
 - 重新评估条件：HarmonyOS 后续版本在目标设备稳定返回本地 TTS PCM，或专用后台模式经真机复验仍无法保持系统播放器。
-- 来源：[用户真机反馈](plans/2026-08-13-audio-output-and-screen-off-followup.md)
+- 长期约束：[HarmonyOS 音频用户旅程与业务逻辑](HARMONYOS_AUDIO_USER_JOURNEY.md)
 
 ## 2026-08-13 - CoreSpeech 只合成 PCM，应用确认真实播放完成（已由上方决策取代）
 
@@ -16,7 +16,7 @@
 - 依据：API 24 提供连续 PCM 序号、硬件播放时间戳和 renderer `drain()`；这些证据比屏幕事件、JS 回调间隔和时长估算更接近用户实际听到的进度。用户接受有限重复的风险边界优于跳字。
 - 影响：本地 TTS 和远端 TTS 共用应用通信 renderer 与系统通信路由；停止、重播和迟到回调必须保持 request/generation 隔离。真机仍需确认息屏调度和具体设备驱动是否遵守 `drain()` 契约。
 - 重新评估条件：目标设备返回非 PCM 或不连续分片、`drain()` 在真机上无法可靠完成，或回放检查点导致不可接受的重复；届时以完整短段重播或系统支持的持久播放器作为降级，不恢复按时长猜测完成。
-- 来源：[用户真机反馈](plans/2026-08-13-audio-output-and-screen-off-followup.md)
+- 长期约束：[HarmonyOS 音频用户旅程与业务逻辑](HARMONYOS_AUDIO_USER_JOURNEY.md)
 
 ## 2026-08-13 - 输出默认路由与用户自由选择分离
 
@@ -25,7 +25,7 @@
 - 依据：HarmonyOS 对附件枚举、可用性和通信路由拥有更完整的系统状态；应用只维护默认偏好容易与耳机热插拔及实际路由冲突。默认与手动选择分离也符合用户对可控性的明确要求。
 - 影响：UI 不得按 `headsetOutputAvailable`、会话加载或播放状态禁用输出入口；应用不再叠加 `setDefaultOutputDevice`，实际设备标签由系统首选输出事件回写。
 - 重新评估条件：目标系统不提供可用的 `voice_call` 设备面板，或真机证明面板无法覆盖通信 PCM renderer；届时保留始终可用的应用内三设备选择器，并继续以系统实际路由为权威状态。
-- 来源：[用户真机反馈与输出选择要求](plans/2026-08-13-audio-output-and-screen-off-followup.md)
+- 长期约束：[HarmonyOS 音频用户旅程与业务逻辑](HARMONYOS_AUDIO_USER_JOURNEY.md)
 
 ## 2026-08-12 - 关闭话筒切换消息路由，退出软件才释放完整链路
 

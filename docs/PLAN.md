@@ -5,7 +5,7 @@
 ## 北极星与当前阶段
 
 - 北极星：[HarmonyOS 音频用户旅程与业务逻辑](HARMONYOS_AUDIO_USER_JOURNEY.md)。业务只按“发起或补充 -> 等待 Agent -> 聆听播报 -> 停止或继续补充”理解；亮屏/息屏、前台/后台、话筒消息路由和播报状态是正交条件。
-- 本次来源：[恢复旧版已验证的息屏播放路径](plans/2026-08-13-restore-proven-screen-off-playback.md)，长期范围仍以[用户旅程北极星](plans/2026-08-13-user-journey-north-star.md)为准。
+- 本次实现依据：[关键决策记录](decisions.md)，长期范围仍以[HarmonyOS 音频用户旅程与业务逻辑](HARMONYOS_AUDIO_USER_JOURNEY.md)为准。
 - 技术依据：[恢复 CoreSpeech 原生播放与专用后台模式](decisions.md)；旧的组合租约策略和组件蓝图仅保留为历史参考。
 - 当前阶段：P0 持续运行底座，代码与自动化门已通过，等待真机完成平台能力门。
 - 阶段目标：恢复已验证的专用后台模式切换，同时消除虚假采集状态和陈旧异步回调，使四段旅程共享一套可观测、可恢复的输入输出基础。
