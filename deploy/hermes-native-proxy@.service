@@ -1,0 +1,15 @@
+[Unit]
+Description=On-demand proxy for Hermes native Profile (%i)
+Requires=hermes-native-profile@%i.service
+After=hermes-native-profile@%i.service
+
+[Service]
+Type=simple
+DynamicUser=true
+NoNewPrivileges=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ExecStart=/bin/sh -c 'case "%i" in default) port=9220;; hexiaoma) port=9221;; hexiaoxin) port=9222;; *) exit 64;; esac; exec /lib/systemd/systemd-socket-proxyd "127.0.0.1:$port" --exit-idle-time=5min'
+TimeoutStopSec=10

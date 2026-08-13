@@ -1,0 +1,10 @@
+[Unit]
+Description=On-demand socket for Hermes native Profile (default)
+
+[Socket]
+ListenStream=127.0.0.1:9120
+Service=hermes-native-proxy@default.service
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

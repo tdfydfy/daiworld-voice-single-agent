@@ -1,8 +1,7 @@
 [Unit]
 Description=Daiworld Native Hermes Web Adapter
-After=network-online.target hermes-native-profile@default.service hermes-native-profile@hexiaoma.service hermes-native-profile@hexiaoxin.service
+After=network-online.target
 Wants=network-online.target
-Requires=hermes-native-profile@default.service hermes-native-profile@hexiaoma.service hermes-native-profile@hexiaoxin.service
 
 [Service]
 Type=simple
@@ -10,6 +9,7 @@ User=daiworld-voice
 Group=daiworld-voice
 WorkingDirectory=/opt/daiworld-voice-native
 EnvironmentFile=/etc/daiworld-voice-native/native.env
+Environment=HERMES_BACKEND_ON_DEMAND=true
 UMask=0077
 NoNewPrivileges=true
 ProtectKernelTunables=true

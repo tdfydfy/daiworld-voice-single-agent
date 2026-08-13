@@ -2,6 +2,7 @@
 Description=Hermes isolated Profile for Daiworld Native Voice (%i)
 After=network-online.target
 Wants=network-online.target
+StopWhenUnneeded=yes
 
 [Service]
 Type=simple
@@ -22,12 +23,10 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadWritePaths=/var/lib/daiworld-voice-native
-ExecStart=/bin/sh -c 'case "%i" in default) p=default; port=9120;; hexiaoma) p=hexiaoma; port=9121;; hexiaoxin) p=hexiaoxin; port=9122;; *) exit 64;; esac; exec /opt/hermes-agent/venv/bin/hermes -p "$p" serve --isolated --host 127.0.0.1 --port "$port" --skip-build'
-Restart=always
+ExecStart=/bin/sh -c 'case "%i" in default) port=9220;; hexiaoma) port=9221;; hexiaoxin) port=9222;; *) exit 64;; esac; exec /opt/hermes-agent/venv/bin/hermes -p "%i" serve --isolated --host 127.0.0.1 --port "$port" --skip-build'
+ExecStartPost=/bin/bash -c 'case "%i" in default) port=9220;; hexiaoma) port=9221;; hexiaoxin) port=9222;; *) exit 64;; esac; n=0; while test "$n" -lt 30; do timeout 1 bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null && exit 0; n=$((n + 1)); sleep 1; done; exit 1'
+Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal
-
-[Install]
-WantedBy=multi-user.target

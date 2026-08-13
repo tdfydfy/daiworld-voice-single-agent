@@ -175,6 +175,7 @@ def test_websocket_cookie_auth_and_transparent_relay(monkeypatch):
     assert "token=hermes-token" in seen["url"]
     assert "voice-token" not in seen["url"]
     assert seen["kwargs"]["max_size"] == native_main.MAX_WS_MESSAGE
+    assert seen["kwargs"]["open_timeout"] == native_main.BACKEND_WS_OPEN_TIMEOUT_SECONDS
     assert upstream.sent == [json.dumps({"jsonrpc": "2.0", "method": "ping"})]
 
 
@@ -302,6 +303,28 @@ def test_large_http_body_is_rejected_before_upstream():
         content=b"x",
     )
     assert response.status_code == 413
+
+
+def test_on_demand_health_does_not_connect_to_backends(monkeypatch):
+    settings = NativeSettings()
+    settings.access_token = "voice-token"
+    settings.backend_on_demand = True
+
+    class UnexpectedClient:
+        def __init__(self, **kwargs):
+            raise AssertionError("health must not wake an on-demand backend")
+
+    monkeypatch.setattr(native_main.httpx, "AsyncClient", UnexpectedClient)
+    client = TestClient(create_native_app(settings))
+
+    response = client.get("/api/health", headers={"X-Voice-Token": "voice-token"})
+
+    assert response.status_code == 200
+    assert response.json()["mode"] == "hermes-native-on-demand"
+    assert response.json()["profiles"]["default"] == {
+        "ok": None,
+        "state": "on-demand",
+    }
 
 
 class FakeResponse:

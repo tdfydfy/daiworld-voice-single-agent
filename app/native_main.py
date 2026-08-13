@@ -24,6 +24,7 @@ WEB_DIR = Path(__file__).resolve().parent.parent / "web_native"
 MAX_TRANSCRIBE_BODY = 25 * 1024 * 1024
 MAX_SPEAK_BODY = 1 * 1024 * 1024
 MAX_WS_MESSAGE = 16 * 1024 * 1024
+BACKEND_WS_OPEN_TIMEOUT_SECONDS = 45
 GATEWAY_HEARTBEAT_INTERVAL_SECONDS = 25.0
 GATEWAY_HEARTBEAT_FRAME = json.dumps(
     {
@@ -290,6 +291,9 @@ class NativeSettings:
         self.access_token = os.getenv("VOICE_ACCESS_TOKEN", "")
         self.hermes_token = os.getenv("HERMES_DASHBOARD_SESSION_TOKEN", "")
         self.cookie_secure = os.getenv("VOICE_COOKIE_SECURE", "").lower() in {"1", "true", "yes"}
+        self.backend_on_demand = os.getenv("HERMES_BACKEND_ON_DEMAND", "").lower() in {
+            "1", "true", "yes"
+        }
         self.agents = _load_agents()
         self.backends = {agent.id: agent.url for agent in self.agents}
         self.provider_labels = {agent.id: agent.provider_label for agent in self.agents}
@@ -356,6 +360,15 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
     @app.get("/api/health")
     async def health(x_voice_token: str = Header(default="")) -> dict:
         require_access(x_voice_token)
+        if settings.backend_on_demand:
+            return {
+                "status": "ok",
+                "mode": "hermes-native-on-demand",
+                "profiles": {
+                    profile: {"ok": None, "state": "on-demand"}
+                    for profile in settings.backends
+                },
+            }
         states: dict[str, dict] = {}
         async with httpx.AsyncClient(timeout=8) as client:
             for profile in settings.backends:
@@ -456,7 +469,7 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
     ) -> dict:
         require_access(x_voice_token)
         body = await request.json()
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
                 f"{backend(profile)}/api/model/set",
                 json=body,
@@ -502,7 +515,12 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
     ) -> None:
         await client_ws.accept()
         try:
-            async with websockets.connect(upstream_url, max_size=MAX_WS_MESSAGE, ping_interval=20) as upstream:
+            async with websockets.connect(
+                upstream_url,
+                max_size=MAX_WS_MESSAGE,
+                open_timeout=BACKEND_WS_OPEN_TIMEOUT_SECONDS,
+                ping_interval=20,
+            ) as upstream:
                 client_send_lock = asyncio.Lock()
 
                 async def send_client_text(message: str) -> None:

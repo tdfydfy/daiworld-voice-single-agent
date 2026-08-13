@@ -1,0 +1,10 @@
+[Unit]
+Description=On-demand socket for Hermes native Profile (hexiaoma)
+
+[Socket]
+ListenStream=127.0.0.1:9121
+Service=hermes-native-proxy@hexiaoma.service
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

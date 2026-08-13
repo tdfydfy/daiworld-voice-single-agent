@@ -1,0 +1,10 @@
+[Unit]
+Description=On-demand socket for Hermes native Profile (hexiaoxin)
+
+[Socket]
+ListenStream=127.0.0.1:9122
+Service=hermes-native-proxy@hexiaoxin.service
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target
