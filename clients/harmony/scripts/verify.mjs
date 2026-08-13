@@ -29,8 +29,12 @@ const REQUIRED_FILES = [
   'entry/src/main/ets/services/SingleAgentController.ets',
   'entry/src/main/ets/services/CommunicationAudioSession.ets',
   'entry/src/main/ets/services/PcmCapture.ets',
+  'entry/src/main/ets/services/CaptureRecoveryState.ets',
+  'entry/src/main/ets/services/CaptureSupervisor.ets',
   'entry/src/main/ets/services/PcmPlayer.ets',
   'entry/src/main/ets/services/AudioCuePlayer.ets',
+  'entry/src/main/ets/services/AudioContinuityState.ets',
+  'entry/src/main/ets/services/AudioContinuityCoordinator.ets',
   'entry/src/main/ets/services/BackgroundAudioTaskOwner.ets',
   'entry/src/main/ets/services/HermesRuntime.ets',
   'entry/src/main/ets/services/RuntimeIdentitySync.ets',
@@ -62,7 +66,8 @@ const REQUIRED_TOKENS = [
   ['@kit.CoreSpeechKit', 'HarmonyOS system speech API'],
   ['online: 1', 'offline system speech mode'],
   ['startBackgroundRunning', 'continuous background voice task'],
-  ['BackgroundMode.AUDIO_RECORDING', 'background audio recording mode'],
+  ['BackgroundMode.AUDIO_PLAYBACK', 'dedicated background playback mode'],
+  ['BackgroundMode.AUDIO_RECORDING', 'dedicated background recording mode'],
   ['recognitionWanted', 'persistent local speech capture state'],
   ['ensureRecognitionCapture', 'persistent local speech capture startup'],
   ['stopRecognitionCapture', 'explicit local speech capture cleanup'],
@@ -98,8 +103,11 @@ const MESSAGE_REPLAY_CHECKS = [
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /private replayGeneration: number = 0/, 'replay generation guard'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /private replayCleanup: Promise<void> = Promise\.resolve\(\)/, 'serialized replay cleanup promise'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /startReplayAfterCleanup\(text, source\.id, replayGeneration, cleanup\)/, 'replay waits for cleanup before TTS start'],
-  ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /if \(this\.useSystemSpeech\) \{[\s\S]{0,180}const cleanup = Promise\.resolve\(\)/, 'system replay does not wait for remote PCM cleanup'],
+  ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /if \(this\.useSystemSpeech\) \{[\s\S]{0,180}this\.systemSpeech\?\.stopSpeaking\(\) \?\? Promise\.resolve\(\)/, 'system replay waits for local TTS cleanup'],
   ['entry/src/main/ets/services/SystemSpeechService.ets', /private ttsRequestGeneration: number = 0/, 'system TTS cancellation generation'],
+  ['entry/src/main/ets/services/SystemSpeechService.ets', /const extraParams:[\s\S]{0,100}'speed': normalizedRate[\s\S]{0,100}engine\.speak/, 'system TTS uses platform playback without requiring PCM callbacks'],
+  ['entry/src/main/ets/services/SystemSpeechService.ets', /onComplete:[\s\S]{0,500}response\.type === 1[\s\S]{0,120}this\.activeTtsRequestId = ''/, 'system TTS completes after platform playback'],
+  ['entry/src/main/ets/services/SystemSpeechService.ets', /stopSpeaking\(\): Promise<void> \{[\s\S]{0,260}this\.activeTtsRequestId = ''/, 'system replay cleanup cannot stop an already completed request'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /message replay requested/, 'replay button request logging'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /message replay state cleared/, 'replay cleanup logging'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /!source\.pending && !this\.snapshot\.agentBusy &&\s*this\.enabled/, 'continuous ASR does not disable replay'],
@@ -251,13 +259,17 @@ const SYSTEM_TTS_STREAM_CHECKS = [
 ];
 
 const BACKGROUND_AUDIO_CHECKS = [
-  ['entry/src/main/ets/services/BackgroundAudioTaskOwner.ets', /BackgroundMode\.AUDIO_RECORDING/, 'background microphone ownership'],
-  ['entry/src/main/ets/services/BackgroundAudioTaskOwner.ets', /BackgroundMode\.AUDIO_PLAYBACK/, 'background playback ownership'],
-  ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /prefersBackgroundPlayback\(\): boolean/, 'active speech exposes playback priority'],
-  ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /if \(this\.pausedForUser \|\| this\.snapshot\.playback === 'paused_for_user'\)[\s\S]{0,80}return false/, 'user speech restores recording priority immediately'],
-  ['entry/src/main/ets/services/SingleAgentController.ets', /if \(this\.output\.prefersBackgroundPlayback\(\)\)[\s\S]{0,100}intent = 'playback'/, 'active speech takes background priority'],
-  ['entry/src/main/ets/services/SingleAgentController.ets', /else if \(this\.input\.isWanted\(\)\)[\s\S]{0,100}intent = 'recording'/, 'microphone resumes background priority'],
-  ['entry/src/main/ets/services/BackgroundAudioTaskOwner.ets', /background intent desired=/, 'background intent transition logging'],
+  ['entry/src/main/ets/services/BackgroundAudioTaskOwner.ets', /BackgroundMode\.AUDIO_RECORDING[\s\S]{0,120}BackgroundMode\.AUDIO_PLAYBACK/, 'recording and playback use dedicated background modes'],
+  ['entry/src/main/ets/services/AudioContinuityState.ets', /this\.runningIntent !== this\.desiredIntent[\s\S]{0,80}return 'stop'/, 'background mode changes stop the old task first'],
+  ['entry/src/main/ets/services/AudioContinuityCoordinator.ets', /ensureRecordingReady\(\): Promise<void>/, 'capture waits for recording mode'],
+  ['entry/src/main/ets/services/AudioContinuityCoordinator.ets', /ensurePlaybackReady\(\): Promise<void>/, 'playback waits for playback mode'],
+  ['entry/src/main/ets/services/BackgroundAudioTaskOwner.ets', /stopBackgroundRunning\(context\)/, 'background cleanup uses the context-owned compatibility path'],
+  ['entry/src/main/ets/services/BackgroundAudioTaskOwner.ets', /background stop reported 9800005; treating the stale task as already stopped/, 'stale background task stop is idempotent'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /this\.callbacks\.ensureRecordingReady\(\)[\s\S]{0,300}speech\.startRecognition\(\)/, 'system capture waits for lease readiness'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /this\.callbacks\.ensureRecordingReady\(\)[\s\S]{0,300}this\.capture\.start/, 'remote capture waits for lease readiness'],
+  ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /yieldForSpeech\(\)[\s\S]{0,180}ensurePlaybackReady\(\)[\s\S]{0,500}speech\.speak/, 'system TTS waits for lease readiness'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /if \(this\.output\.prefersBackgroundPlayback\(\)\)[\s\S]{0,100}intent = 'playback'[\s\S]{0,100}this\.input\.isWanted\(\)/, 'controller gives active playback priority over recording'],
+  ['entry/src/main/ets/services/BackgroundAudioTaskOwner.ets', /background action=/, 'background mode generation logging'],
   ['entry/src/main/module.json5', /"backgroundModes": \["audioPlayback", "audioRecording"\]/, 'manifest declares playback and recording modes']
 ];
 
@@ -267,13 +279,16 @@ const AUDIO_INPUT_ROUTE_CHECKS = [
   ['entry/src/main/ets/services/CommunicationAudioSession.ets', /AUDIO_SESSION_SCENE_VOICE_COMMUNICATION/, 'communication audio session scene'],
   ['entry/src/main/ets/services/CommunicationAudioSession.ets', /CONCURRENCY_MIX_WITH_OTHERS/, 'system TTS-compatible communication session'],
   ['entry/src/main/ets/services/CommunicationAudioSession.ets', /activateAudioSession\(strategy\)/, 'communication audio session activation'],
-  ['entry/src/main/ets/services/CommunicationAudioSession.ets', /audio\.DeviceType\.SPEAKER : audio\.DeviceType\.EARPIECE/, 'earpiece and speakerphone fallback selection'],
-  ['entry/src/main/ets/services/CommunicationAudioSession.ets', /setDefaultOutputDevice\(device\)/, 'communication fallback application'],
+  ['entry/src/main/ets/services/CommunicationAudioSession.ets', /const speakerActive = this\.speakerphoneEnabled/, 'explicit speaker override remains available with a headset'],
+  ['entry/src/main/ets/services/CommunicationAudioSession.ets', /setCommunicationDevice\([\s\S]{0,100}speakerActive/, 'native earpiece and speakerphone switching'],
   ['entry/src/main/ets/services/CommunicationAudioSession.ets', /on\([\s\S]{0,80}'audioSessionDeactivated'/, 'communication session deactivation recovery'],
   ['entry/src/main/ets/services/PcmCapture.ets', /getPreferredInputDeviceForCapturerInfoSync/, 'preferred input device inspection'],
   ['entry/src/main/ets/services/PcmCapture.ets', /getCurrentInputDevices\(\)/, 'active input device verification'],
   ['entry/src/main/ets/services/PcmCapture.ets', /on\('inputDeviceChange'/, 'system-managed input route observation'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /onMicrophoneRouteChanged\(label\)/, 'live microphone route UI update'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /toggleSpeakerphone\(\): void \{[\s\S]{0,220}showCommunicationOutputPicker\(context\)/, 'phone output opens the native communication picker'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /toggleSpeakerphoneFallback\(\): void \{[\s\S]{0,160}this\.snapshot\.audioOutputRoute !== 'speaker'/, 'phone output keeps a direct fallback from the actual route'],
+  ['entry/src/main/ets/services/CommunicationAudioSession.ets', /AVCastPickerHelper\(context\)[\s\S]{0,160}sessionType: 'voice_call'/, 'native output picker uses the voice-call device list'],
   ['entry/src/main/ets/services/AudioCuePlayer.ets', /new PcmPlayer\(false\)/, 'audio cues do not acquire the communication route']
 ];
 
@@ -328,12 +343,37 @@ const SYSTEM_ASR_SESSION_CHECKS = [
 ];
 
 const AUDIO_PLAYBACK_RECOVERY_CHECKS = [
-  ['entry/src/main/ets/services/CommunicationAudioSession.ets', /!this\.speakerphoneEnabled && this\.hasHeadsetOutput\(available\)/, 'headset output remains system-managed'],
+  ['entry/src/main/ets/services/CommunicationAudioSession.ets', /speakerActive \? 'speaker' : 'system-preferred'/, 'disabled speaker override returns output to system routing'],
+  ['entry/src/main/ets/services/CommunicationAudioSession.ets', /lastHeadsetAvailable !== headsetAvailable[\s\S]{0,180}this\.speakerphoneEnabled = false/, 'device topology changes restore system-preferred output'],
   ['entry/src/main/ets/services/PcmPlayer.ets', /PCM_RENDERER_WATCHDOG_MS = 1200/, 'queued PCM renderer watchdog'],
+  ['entry/src/main/ets/services/PcmPlayer.ets', /getAudioTimestampInfoSync\(\)\.framePos/, 'renderer watchdog follows hardware playback progress'],
+  ['entry/src/main/ets/services/PcmPlayer.ets', /const drain = renderer\.drain\(\)/, 'playback completion waits for the system renderer to drain'],
+  ['entry/src/main/ets/services/PcmPlayer.ets', /restoreUnconfirmedRendererTail\(\): void \{[\s\S]{0,160}this\.queue\.unshift\(this\.rendererReplayTail\)/, 'renderer reconstruction replays its last unconfirmed PCM buffer'],
+  ['entry/src/main/ets/services/PcmPlayer.ets', /STATE_STOPPED[\s\S]{0,160}this\.requestPlayback\(true\)/, 'terminal renderer states reconstruct with the unconfirmed PCM checkpoint'],
   ['entry/src/main/ets/services/PcmPlayer.ets', /scheduleRendererRecovery\(\): void/, 'bounded PCM renderer retry'],
-  ['entry/src/main/ets/services/PcmPlayer.ets', /onCommunicationSessionRecovered\(\): void/, 'renderer recovery after communication-session recovery'],
+  ['entry/src/main/ets/services/PcmPlayer.ets', /onCommunicationSessionRecovered\(\): void \{[\s\S]{0,180}this\.requestPlayback\(\);/, 'communication-session recovery preserves the current renderer buffer'],
   ['entry/src/main/ets/services/PcmPlayer.ets', /renderer\.on\('audioInterrupt'/, 'renderer interruption observation'],
+  ['entry/src/main/ets/services/PcmPlayer.ets', /channels: this\.channelForRenderer\(channelCount\)/, 'PCM renderer follows the source channel count'],
+  ['entry/src/main/ets/services/PcmPlayer.ets', /channelCount === 2[\s\S]{0,100}audio\.AudioChannel\.CHANNEL_2/, 'stereo PCM uses a two-channel renderer'],
   ['entry/src/main/ets/services/PcmPlayer.ets', /this\.cancelRendererRecovery\(\);[\s\S]{0,180}this\.queue = \[\]/, 'explicit stop cancels renderer recovery']
+];
+
+const AUDIO_CAPTURE_RECOVERY_CHECKS = [
+  ['entry/src/main/ets/services/PcmCapture.ets', /capturer\.on\('stateChange'/, 'capturer state observation'],
+  ['entry/src/main/ets/services/PcmCapture.ets', /capturer\.on\('audioInterrupt'/, 'capturer interruption observation'],
+  ['entry/src/main/ets/services/PcmCapture.ets', /generation !== this\.captureGeneration \|\| this\.capturer !== capturer/, 'stale capturer callback isolation'],
+  ['entry/src/main/ets/services/CaptureSupervisor.ets', /CAPTURE_NO_PCM_TIMEOUT_MS = 2000/, 'no-PCM capture watchdog'],
+  ['entry/src/main/ets/services/CaptureSupervisor.ets', /CAPTURE_RECOVERY_DELAYS_MS: number\[\] = \[100, 500, 1500\]/, 'bounded capture recovery delays'],
+  ['entry/src/main/ets/services/CaptureSupervisor.ets', /this\.recoveryTask !== undefined/, 'serialized capture reconstruction'],
+  ['entry/src/main/ets/services/CaptureSupervisor.ets', /await this\.capture\.stop\(\)\.catch\(\(\) => undefined\)[\s\S]{0,180}await this\.startCapture\(generation\)/, 'old capturer released before reconstruction'],
+  ['entry/src/main/ets/services/CaptureSupervisor.ets', /this\.recovery\.observePcm\(generation\)/, 'healthy PCM restores capture retry budget'],
+  ['entry/src/main/ets/services/CaptureRecoveryState.ets', /if \(this\.phase === 'recovering'\) \{[\s\S]{0,80}return 0;/, 'one capture recovery at a time'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /private capture: CaptureSupervisor/, 'remote ASR uses supervised capture'],
+  ['entry/src/main/ets/services/SystemSpeechService.ets', /private capture: CaptureSupervisor/, 'system ASR uses supervised capture'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /远端 ASR：音频采集正在恢复/, 'remote capture recovery reaches UI state'],
+  ['entry/src/main/ets/services/SystemSpeechService.ets', /reportRecognitionStartupPhase\('音频采集正在恢复'\)/, 'system capture recovery reaches UI state'],
+  ['entry/src/main/ets/pages/Index.ets', /statusDetail\.startsWith\('远端 ASR：'\)/, 'remote capture recovery state is visible'],
+  ['entry/src/main/ets/services/CaptureSupervisor.ets', /const cleanup = this\.cleanupTask;[\s\S]{0,100}await cleanup\.catch/, 'new capture waits for exhausted cleanup']
 ];
 
 const ASR_FINALIZATION_CHECKS = [
@@ -462,6 +502,7 @@ for (const [rel, pattern, label] of [
   ...SYSTEM_ASR_STARTUP_CHECKS,
   ...SYSTEM_ASR_SESSION_CHECKS,
   ...AUDIO_PLAYBACK_RECOVERY_CHECKS,
+  ...AUDIO_CAPTURE_RECOVERY_CHECKS,
   ...BACKGROUND_AUDIO_CHECKS,
   ...ASR_FINALIZATION_CHECKS,
   ...REMOTE_VOICE_RECOVERY_CHECKS,
@@ -528,10 +569,24 @@ const outputPreferenceStart = audioSessionSource.indexOf('private async applyOut
 const outputPreferenceEnd = audioSessionSource.indexOf('private communicationRendererInfo()', outputPreferenceStart);
 if (outputPreferenceStart >= 0 && outputPreferenceEnd > outputPreferenceStart) {
   const outputPreferenceSource = audioSessionSource.slice(outputPreferenceStart, outputPreferenceEnd);
-  const headsetGuard = outputPreferenceSource.indexOf('this.hasHeadsetOutput(available)');
-  const defaultOutput = outputPreferenceSource.indexOf('setDefaultOutputDevice(device)');
-  if (headsetGuard < 0 || defaultOutput < 0 || headsetGuard > defaultOutput) {
-    ERRORS.push('headset guard must run before applying the phone fallback output device');
+  const manualSpeakerOverride = outputPreferenceSource.indexOf('const speakerActive = this.speakerphoneEnabled');
+  const nativeRoute = outputPreferenceSource.indexOf('setCommunicationDevice(');
+  if (manualSpeakerOverride < 0 || nativeRoute < 0 || manualSpeakerOverride > nativeRoute) {
+    ERRORS.push('manual speaker override must be resolved before applying the native communication route');
+  }
+  if (outputPreferenceSource.includes('setDefaultOutputDevice(')) {
+    ERRORS.push('communication routing must not stack a global default-output override');
+  }
+}
+if (indexSource.includes('.enabled(!this.snapshot.headsetOutputAvailable)')) {
+  ERRORS.push('audio output selection must remain enabled when a headset is connected');
+}
+const toggleSpeakerStart = controllerSource.indexOf('toggleSpeakerphone(): void');
+const toggleSpeakerEnd = controllerSource.indexOf('private applySpeakerphonePreference()', toggleSpeakerStart);
+if (toggleSpeakerStart >= 0 && toggleSpeakerEnd > toggleSpeakerStart) {
+  const toggleSpeakerSource = controllerSource.slice(toggleSpeakerStart, toggleSpeakerEnd);
+  if (toggleSpeakerSource.includes('headsetOutputAvailable')) {
+    ERRORS.push('manual audio output selection must not be blocked by headset availability');
   }
 }
 for (const immediateAsrFinal of [
@@ -637,8 +692,8 @@ for (const file of jsons) {
 
 try {
   const appProfile = JSON.parse(fs.readFileSync(path.join(root, 'AppScope/app.json5'), 'utf8'));
-  if (appProfile.app.versionName !== '1.2.1' || appProfile.app.versionCode !== 1020001) {
-    ERRORS.push('HarmonyOS release version must be 1.2.1 (1020001)');
+  if (appProfile.app.versionName !== '1.2.6' || appProfile.app.versionCode !== 1020006) {
+    ERRORS.push('HarmonyOS release version must be 1.2.6 (1020006)');
   }
 } catch (error) {
   // The JSON parse error is reported by the validation loop above.

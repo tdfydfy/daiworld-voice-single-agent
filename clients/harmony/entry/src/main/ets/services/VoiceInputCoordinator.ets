@@ -3,7 +3,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { ChatMessage, SingleAgentSnapshot } from '../models/SingleAgentState';
 import { ClientConfig } from './AppSettingsStore';
-import { PcmCapture } from './PcmCapture';
+import { CaptureSupervisor, CaptureSupervisorCallbacks } from './CaptureSupervisor';
 import { AsrListener, StreamingAsrClient } from './StreamingAsrClient';
 import { SystemSpeechService } from './SystemSpeechService';
 import { VoiceOutputCoordinator } from './VoiceOutputCoordinator';
@@ -20,6 +20,7 @@ export class VoiceInputCallbacks {
   private configCallback: () => ClientConfig;
   private notifyCallback: () => void;
   private backgroundStateCallback: () => void;
+  private recordingReadyCallback: () => Promise<void>;
   private ensurePreviewCallback: () => ChatMessage;
   private currentPreviewCallback: () => ChatMessage | undefined;
   private discardPreviewCallback: () => void;
@@ -34,6 +35,7 @@ export class VoiceInputCallbacks {
     configCallback: () => ClientConfig,
     notifyCallback: () => void,
     backgroundStateCallback: () => void,
+    recordingReadyCallback: () => Promise<void>,
     ensurePreviewCallback: () => ChatMessage,
     currentPreviewCallback: () => ChatMessage | undefined,
     discardPreviewCallback: () => void,
@@ -47,6 +49,7 @@ export class VoiceInputCallbacks {
     this.configCallback = configCallback;
     this.notifyCallback = notifyCallback;
     this.backgroundStateCallback = backgroundStateCallback;
+    this.recordingReadyCallback = recordingReadyCallback;
     this.ensurePreviewCallback = ensurePreviewCallback;
     this.currentPreviewCallback = currentPreviewCallback;
     this.discardPreviewCallback = discardPreviewCallback;
@@ -68,6 +71,10 @@ export class VoiceInputCallbacks {
 
   syncBackgroundState(): void {
     this.backgroundStateCallback();
+  }
+
+  ensureRecordingReady(): Promise<void> {
+    return this.recordingReadyCallback();
   }
 
   ensurePreview(): ChatMessage {
@@ -139,11 +146,12 @@ export class VoiceInputCoordinator {
   private output: VoiceOutputCoordinator;
   private callbacks: VoiceInputCallbacks;
   private asr: StreamingAsrClient = new StreamingAsrClient();
-  private capture: PcmCapture = new PcmCapture();
+  private capture: CaptureSupervisor;
   private systemSpeech?: SystemSpeechService;
   private context?: common.UIAbilityContext;
   private wanted: boolean = false;
   private capturing: boolean = false;
+  private captureReady: boolean = false;
   private systemRecognitionStarting: boolean = false;
   private systemRecognitionRestart?: number;
   private systemRecognitionReadyTimeout?: number;
@@ -154,6 +162,7 @@ export class VoiceInputCoordinator {
   private asrLatestInterimText: string = '';
   private remoteAsrReconnectTimer?: number;
   private remoteAsrReconnectAttempt: number = 0;
+  private captureStartGeneration: number = 0;
 
   constructor(
     snapshot: SingleAgentSnapshot,
@@ -163,6 +172,10 @@ export class VoiceInputCoordinator {
     this.snapshot = snapshot;
     this.output = output;
     this.callbacks = callbacks;
+    this.capture = new CaptureSupervisor(new CaptureSupervisorCallbacks(
+      (state: string, reason: string): void => this.onRemoteCaptureState(state, reason),
+      (message: string): void => this.onRemoteCaptureExhausted(message)
+    ));
     this.asr.setListener(new CoordinatorAsrListener(this));
   }
 
@@ -179,6 +192,9 @@ export class VoiceInputCoordinator {
   }
 
   setWanted(wanted: boolean): void {
+    if (this.wanted !== wanted && !wanted) {
+      this.captureStartGeneration += 1;
+    }
     this.wanted = wanted;
     this.snapshot.voiceEnabled = wanted;
   }
@@ -246,18 +262,23 @@ export class VoiceInputCoordinator {
       }
     }, SYSTEM_ASR_STARTUP_TIMEOUT_MS);
     this.callbacks.notify();
-    speech.startRecognition().then(() => {
-      if (attempt !== this.systemRecognitionAttempt) {
+    this.callbacks.ensureRecordingReady().then((): Promise<void> => {
+      if (!this.isSystemRecognitionStartCurrent(attempt)) {
+        this.callbacks.syncBackgroundState();
+        return Promise.resolve();
+      }
+      return speech.startRecognition();
+    }).then(() => {
+      if (!this.isSystemRecognitionStartCurrent(attempt)) {
+        this.callbacks.syncBackgroundState();
         return;
       }
       this.systemRecognitionStarting = false;
-      if (!this.wanted || !this.output.isUsingSystemSpeech()) {
-        return;
-      }
       this.snapshot.microphoneRoute = speech.getInputRouteLabel();
       this.callbacks.notify();
     }).catch((error: BusinessError) => {
-      if (attempt !== this.systemRecognitionAttempt) {
+      if (!this.isSystemRecognitionStartCurrent(attempt)) {
+        this.callbacks.syncBackgroundState();
         return;
       }
       this.systemRecognitionStarting = false;
@@ -289,7 +310,21 @@ export class VoiceInputCoordinator {
   }
 
   onSystemRecognitionStartupPhase(phase: string): void {
-    if (!this.output.isUsingSystemSpeech() || !this.wanted || this.snapshot.asrState !== 'connecting') {
+    if (!this.output.isUsingSystemSpeech() || !this.wanted) {
+      return;
+    }
+    if (phase === '音频采集正在恢复') {
+      this.snapshot.asrState = 'connecting';
+      this.snapshot.statusDetail = '本地 ASR：音频采集正在恢复';
+      this.callbacks.notify();
+      return;
+    }
+    if (phase === '音频采集已恢复') {
+      this.snapshot.statusDetail = '本地 ASR：音频采集已恢复';
+      this.callbacks.notify();
+      return;
+    }
+    if (this.snapshot.asrState !== 'connecting') {
       return;
     }
     this.systemRecognitionStartupPhase = phase;
@@ -361,7 +396,10 @@ export class VoiceInputCoordinator {
 
   onRemoteReady(): void {
     this.cancelRemoteReconnect();
-    this.snapshot.asrState = 'listening';
+    this.snapshot.asrState = this.captureReady ? 'listening' : 'connecting';
+    if (!this.captureReady) {
+      this.snapshot.statusDetail = '远端 ASR：音频采集正在恢复';
+    }
     this.snapshot.error = '';
     this.callbacks.notify();
   }
@@ -388,6 +426,7 @@ export class VoiceInputCoordinator {
 
   stop(): void {
     this.wanted = false;
+    this.captureStartGeneration += 1;
     this.cancelRemoteReconnect();
     this.cancelFinalization();
     this.systemRecognitionAttempt += 1;
@@ -398,6 +437,7 @@ export class VoiceInputCoordinator {
     this.snapshot.asrTranscript = '';
     this.snapshot.asrUtteranceActive = false;
     this.snapshot.microphoneRoute = '';
+    this.captureReady = false;
     this.callbacks.discardPreview();
     if (this.systemRecognitionRestart !== undefined) {
       clearTimeout(this.systemRecognitionRestart);
@@ -427,6 +467,7 @@ export class VoiceInputCoordinator {
     }
     this.clearSystemRecognitionReadyTimeout();
     this.systemRecognitionAttempt += 1;
+    this.captureStartGeneration += 1;
     this.systemRecognitionStartupPhase = '';
     this.systemRecognitionStarting = false;
     this.cancelRemoteReconnect();
@@ -440,6 +481,7 @@ export class VoiceInputCoordinator {
     this.asr.close();
     await this.capture.stop().catch(() => undefined);
     this.capturing = false;
+    this.captureReady = false;
     this.snapshot.asrState = 'stopped';
   }
 
@@ -468,45 +510,132 @@ export class VoiceInputCoordinator {
     if (this.capturing) {
       return;
     }
+    const generation = ++this.captureStartGeneration;
+    this.capturing = true;
     const context = this.context;
     if (!context) {
       this.snapshot.asrState = 'stopped';
       this.snapshot.error = '无法获取麦克风权限上下文';
+      this.capturing = false;
       this.callbacks.notify();
       return;
     }
     this.capture.requestPermission(context).then((granted: boolean) => {
+      if (!this.isRemoteCaptureStartCurrent(generation)) {
+        this.callbacks.syncBackgroundState();
+        return false;
+      }
       if (!granted) {
+        this.capturing = false;
         this.snapshot.error = '麦克风权限未授权';
         this.snapshot.asrState = 'stopped';
         this.callbacks.notify();
         return false;
       }
-      return this.capture.start((chunk: ArrayBuffer) => {
-        this.asr.sendPcm(chunk);
-      }, (label: string): void => {
-        this.onMicrophoneRouteChanged(label);
-      }).then((): boolean => true);
+      return this.callbacks.ensureRecordingReady().then((): Promise<void> => {
+        if (!this.isRemoteCaptureStartCurrent(generation)) {
+          this.callbacks.syncBackgroundState();
+          return Promise.resolve();
+        }
+        return this.capture.start((chunk: ArrayBuffer) => {
+          this.asr.sendPcm(chunk);
+        }, (label: string): void => {
+          this.onMicrophoneRouteChanged(label);
+        });
+      }).then((): boolean => {
+        if (!this.isRemoteCaptureStartCurrent(generation)) {
+          this.capture.stop().catch(() => undefined);
+          this.callbacks.syncBackgroundState();
+          return false;
+        }
+        return true;
+      });
     }).then((started: boolean) => {
+      if (generation !== this.captureStartGeneration) {
+        this.callbacks.syncBackgroundState();
+        return;
+      }
       if (!started) {
+        this.capturing = false;
         return;
       }
       if (!this.wanted) {
         this.capture.stop().catch(() => undefined);
         return;
       }
-      this.capturing = true;
       this.snapshot.microphoneRoute = this.capture.getInputRouteLabel();
-      this.snapshot.asrState = 'listening';
       this.callbacks.syncBackgroundState();
       this.callbacks.notify();
     }).catch((error: BusinessError) => {
+      if (!this.isRemoteCaptureStartCurrent(generation)) {
+        this.callbacks.syncBackgroundState();
+        return;
+      }
+      this.capturing = false;
+      this.captureReady = false;
       this.snapshot.asrState = 'stopped';
       this.snapshot.microphoneRoute = '';
       this.asr.close();
       this.snapshot.error = error.message;
       this.callbacks.notify();
     });
+  }
+
+  private onRemoteCaptureState(state: string, reason: string): void {
+    if (this.output.isUsingSystemSpeech()) {
+      return;
+    }
+    if (state === 'running') {
+      this.captureReady = true;
+      if (this.wanted) {
+        this.snapshot.microphoneRoute = this.capture.getInputRouteLabel();
+        this.snapshot.asrState = this.asr.isConnected() ? 'listening' : 'connecting';
+        this.snapshot.statusDetail = this.asr.isConnected()
+          ? '远端 ASR 监听中' : '远端 ASR 正在连接';
+        this.snapshot.error = '';
+      }
+      this.callbacks.notify();
+      return;
+    }
+    if (state === 'recovering') {
+      this.captureReady = false;
+      if (this.wanted) {
+        this.snapshot.asrState = 'connecting';
+        this.snapshot.statusDetail = '远端 ASR：音频采集正在恢复';
+        this.snapshot.error = '';
+        hilog.warn(
+          INPUT_LOG_DOMAIN,
+          INPUT_LOG_TAG,
+          'remote capture recovering reason=%{public}s',
+          reason
+        );
+        this.callbacks.notify();
+      }
+      return;
+    }
+    if (state === 'stopped' || state === 'failed') {
+      this.captureReady = false;
+    }
+  }
+
+  private onRemoteCaptureExhausted(message: string): void {
+    if (this.output.isUsingSystemSpeech() || !this.wanted) {
+      return;
+    }
+    this.finalizeAfterTermination();
+    this.wanted = false;
+    this.captureStartGeneration += 1;
+    this.capturing = false;
+    this.captureReady = false;
+    this.snapshot.voiceEnabled = false;
+    this.snapshot.asrState = 'stopped';
+    this.snapshot.microphoneRoute = '';
+    this.snapshot.statusDetail = '远端 ASR 已停止：音频采集恢复失败';
+    this.snapshot.error = message;
+    this.asr.stop();
+    this.asr.close();
+    this.callbacks.syncBackgroundState();
+    this.callbacks.notify();
   }
 
   private handleRemoteDisconnect(message: string): void {
@@ -737,6 +866,16 @@ export class VoiceInputCoordinator {
       return;
     }
     this.callbacks.notify();
+  }
+
+  private isSystemRecognitionStartCurrent(attempt: number): boolean {
+    return attempt === this.systemRecognitionAttempt && this.wanted &&
+      this.output.isUsingSystemSpeech();
+  }
+
+  private isRemoteCaptureStartCurrent(generation: number): boolean {
+    return generation === this.captureStartGeneration && this.wanted &&
+      !this.output.isUsingSystemSpeech();
   }
 
   private normalizeControlPhrase(text: string): string {

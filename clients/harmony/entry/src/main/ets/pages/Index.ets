@@ -488,6 +488,10 @@ struct Index {
         this.snapshot.statusDetail.startsWith('本地 ASR：')) {
         return this.snapshot.statusDetail.substring('本地 ASR：'.length);
       }
+      if (this.snapshot.asrBackend === 'remote' &&
+        this.snapshot.statusDetail.startsWith('远端 ASR：')) {
+        return this.snapshot.statusDetail.substring('远端 ASR：'.length);
+      }
       return this.snapshot.asrBackend === 'harmony_offline' ? '启动中' : '连接中';
     }
     if (this.snapshot.asrState === 'listening') {
@@ -1791,6 +1795,8 @@ struct Index {
           .backgroundColor(this.snapshot.voiceEnabled ? '#16362D' : COLOR_PANEL)
           .border({ width: 1, color: this.snapshot.voiceEnabled ? COLOR_SUCCESS : COLOR_LINE })
           .borderRadius(8)
+          .enabled(!this.snapshot.conversationLoading)
+          .opacity(this.snapshot.conversationLoading ? 0.55 : 1)
           .accessibilityText(this.snapshot.voiceEnabled ? '关闭麦克风' : '开启麦克风')
           .onClick(() => {
             this.toggleVoice();
@@ -1840,7 +1846,7 @@ struct Index {
             color: COLOR_ACCENT
           })
           .borderRadius(8)
-          .accessibilityText('当前使用' + this.outputRouteText() + '，点击切换输出')
+          .accessibilityText('当前使用' + this.outputRouteText() + '，点击选择音频输出')
           .onClick(() => {
             this.toggleSpeakerphone();
           })
@@ -1862,8 +1868,6 @@ struct Index {
     .width('100%')
     .padding({ left: 16, right: 16, top: 10, bottom: 16 })
     .border({ width: { top: 1 }, color: COLOR_LINE })
-    .enabled(!this.snapshot.conversationLoading)
-    .opacity(this.snapshot.conversationLoading ? 0.55 : 1)
   }
 
   build() {

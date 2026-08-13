@@ -55,11 +55,11 @@ CoreSpeechKit 当前使用离线短句识别。真机上单个识别 session 最
 
 远端语音 WebSocket 意外断开后，客户端按 `250 / 750 / 1500 / 3000 ms` 封顶退避重连，连接成功后重置退避。ASR 在断线和等待 Provider `ready` 期间保留最近 4 个 PCM 块（约 0.8 秒），普通转写在约 1.8 秒停顿窗口内合并连续 interim/final；连接从开始到 `ready` 超过 10 秒会主动进入下一轮恢复。TTS 的文本和 `done` 帧严格按队列顺序发送，失败帧保留到重连后继续；已收到的 PCM 会先排空。暂停收音、静音、切换到鸿蒙离线语音或主动断开会取消对应重连，`停止` 和显式关闭仍会清空待播任务。
 
-全双工音频统一声明为鸿蒙语音通信场景。PCM 采集固定使用 `SOURCE_TYPE_VOICE_COMMUNICATION`，应用自管的 PCM 播放使用 `STREAM_USAGE_VOICE_COMMUNICATION`，并共享 `AUDIO_SESSION_SCENE_VOICE_COMMUNICATION`。客户端无配件时默认 `EARPIECE`，耳机接入时回到系统默认的耳机路由；输出按钮可以显式切到 `SPEAKER`，再次点击则回到当前系统私密路由。界面监听系统首选输出，按实际路由显示听筒、扬声器或耳机。蓝牙 SCO、NearLink、有线和 USB 设备的实际选择及无输入设备时的手机麦克风回退仍由 HarmonyOS 管理。客户端不调用 `selectMediaInputDevice()`，不再根据输出设备推断输入设备，也不因正常插拔重建 `AudioCapturer`。`inputDeviceChange` 仅用于刷新手机或耳机麦克风标签和记录诊断日志。短提示音不持有通信 Session，避免麦克风关闭后反复切换 A2DP/SCO。STT 和 TTS 保持并行；用户开口后只停止旧播报，不停止或重建识别 session。客户端不叠加 RMS 声音阈值，以免截断轻声发言。外放回声消除和双讲识别的实际效果仍取决于设备系统实现。
+全双工音频统一声明为鸿蒙语音通信场景。PCM 采集固定使用 `SOURCE_TYPE_VOICE_COMMUNICATION`，远端 TTS 由应用的 `STREAM_USAGE_VOICE_COMMUNICATION` PCM renderer 播放；本地 CoreSpeech 使用平台内置播放器。输出按钮任何时候都可打开 HarmonyOS `voice_call` 原生设备面板，由用户自由选择当前可用的有线、蓝牙、USB、NearLink 耳机、听筒或扬声器；附件插拔时系统首选仍以耳机优先。系统面板失败时才通过 `setCommunicationDevice(SPEAKER, true/false)` 回退切换，应用不叠加全局 `setDefaultOutputDevice`。界面监听系统首选输出并按实际路由显示设备。麦克风设备和无输入设备时的手机麦克风回退同样由 HarmonyOS 管理。客户端不调用 `selectMediaInputDevice()`，不再根据输出设备推断输入设备，也不因正常插拔重建 `AudioCapturer`。`inputDeviceChange` 仅用于刷新手机或耳机麦克风标签和记录诊断日志。短提示音不持有通信 Session，避免麦克风关闭后反复切换 A2DP/SCO。STT 和 TTS 保持并行；用户开口后只停止旧播报，不停止或重建识别 session。客户端不叠加 RMS 声音阈值，以免截断轻声发言；外放回声消除和双讲识别的实际效果仍取决于设备系统实现。
 
-系统 TTS 的音频焦点冲突已做最小修正：CoreSpeech TTS 不再额外持有客户端通信 AudioSession，麦克风仍在使用的通信会话改为允许与系统 `VOICE_ASSISTANT` 播放器并发。静态校验、ArkTS 类型检查和 HAP 构建已通过；仍需真机确认自动播报恢复，并确认日志中不再出现 `ActivateAudioInterrupt Failed` / `6800301`。
+目标真机的 CoreSpeech 离线 TTS 不提供可用的 `SpeakListener.onData` PCM，即使显式请求 `audioType: pcm` 也只返回合成/播放状态。因此本地 TTS 使用平台 `engine.speak()` 和系统播放器，以 `onComplete(type=1)` 推进短段队列；应用 PCM renderer 只服务远端 TTS。重复停止会先清空当前 request ID，并将平台的重复停止异常按幂等结果处理。
 
-当前 `1.2.1` 的后台长时任务仍会按录音/播放活动在 `AUDIO_RECORDING` 和 `AUDIO_PLAYBACK` 之间切换，该机制已确认存在息屏可靠性回退，不再作为目标架构。修复方向是只要存在录音或播放需求，就持有一个同时声明两种能力的组合持续任务；首段 TTS 和 AudioCapturer 启动必须等待任务 ready，并以真实 PCM、平台状态和播放进度判断健康。系统 TTS 的新消息和历史重读继续共用句边界分段器：首段 20–48 字快速起播，后续段优先约 40–80 字且硬上限 96 字。亮屏、息屏不选择不同算法；完整策略和验收矩阵见 [`docs/HARMONYOS_AUDIO_STRATEGY.md`](../../docs/HARMONYOS_AUDIO_STRATEGY.md)。
+当前 `1.2.5` 恢复已在 `1.1.2/1.2.1` 真机验证过的专用后台模式：系统 TTS 排队、播放或系统回调确认发声时，先停止现有租约并等待 `AUDIO_PLAYBACK` ready，再调用 `engine.speak()`；播完或用户开口暂停后恢复 `AUDIO_RECORDING`。新消息和历史重读继续共用句边界分段器：首段 20–48 字快速起播，后续段优先约 40–80 字且硬上限 96 字。亮屏、息屏不选择不同算法；完整策略和验收矩阵见 [`docs/HARMONYOS_AUDIO_STRATEGY.md`](../../docs/HARMONYOS_AUDIO_STRATEGY.md)。
 
 ## 发布前检查
 
@@ -76,6 +76,6 @@ CoreSpeechKit 当前使用离线短句识别。真机上单个识别 session 最
 
 ## Voice control semantics
 
-Current `1.2.1` behavior: the microphone button and close-microphone phrases stop `AudioCapturer` and ASR. The `停止` button interrupts the current turn and clears local playback. This is legacy behavior and not the target contract.
+Current `1.2.5` behavior: the microphone button and close-microphone phrases stop `AudioCapturer` and ASR. The `停止` button interrupts the current turn and clears local playback. This is legacy behavior and not the target contract.
 
 Target contract: every cold app start requires one manual activation of the full capture/ASR chain. After that, `关闭话筒` keeps capture and ASR running but routes finals through a local command-only gate; only exact `停止任务`, `打开话筒`, and `退出软件` commands are actionable, while ordinary results never reach the Agent. `停止任务` has Hermes `/stop` semantics and cancels the active plus queued tasks. `退出软件` releases all local audio, background, and network resources and closes the app; it does not implicitly stop a remote task. These target behaviors are documented but not implemented yet.

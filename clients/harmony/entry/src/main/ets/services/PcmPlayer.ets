@@ -9,6 +9,8 @@ const AUDIO_LOG_DOMAIN = 0xD002;
 const AUDIO_LOG_TAG = 'SingleAgentAudio';
 const PCM_RENDERER_RECOVERY_DELAYS_MS: number[] = [100, 500, 1500, 3000];
 const PCM_RENDERER_WATCHDOG_MS = 1200;
+const PCM_RENDERER_STALL_LIMIT = 2;
+const PCM_DRAIN_RETRY_DELAYS_MS: number[] = [100, 500, 1500];
 
 export type DrainedListener = () => void;
 
@@ -20,16 +22,22 @@ export class PcmPlayer {
   private generation: number = 0;
   private paused: boolean = false;
   private pendingDrain: DrainedListener | undefined = undefined;
-  private drainTimer: number | undefined = undefined;
-  private lastBufferDurationMs: number = 0;
+  private drainTask?: Promise<void>;
+  private drainRetryTimer?: number;
+  private drainRetryAttempt: number = 0;
   private sampleRate: number = 24000;
+  private channelCount: number = 1;
+  private rendererSampleRate: number = 0;
+  private rendererChannelCount: number = 0;
   private session: CommunicationAudioSessionLease = new CommunicationAudioSessionLease();
   private communication: boolean;
   private rendererRecovery?: Promise<void>;
   private rendererRetryTimer?: number;
   private rendererRetryAttempt: number = 0;
   private rendererWatchdog?: number;
-  private lastRendererWriteAt: number = 0;
+  private rendererWatchdogFramePos?: number;
+  private rendererStallCount: number = 0;
+  private rendererReplayTail: Uint8Array = new Uint8Array(0);
 
   constructor(communication: boolean = true) {
     this.communication = communication;
@@ -42,13 +50,24 @@ export class PcmPlayer {
 
   private async ensureRenderer(): Promise<audio.AudioRenderer> {
     if (this.renderer) {
-      return this.renderer;
+      if (this.rendererSampleRate === this.sampleRate &&
+        this.rendererChannelCount === this.channelCount) {
+        return this.renderer;
+      }
+      const staleRenderer = this.renderer;
+      this.renderer = undefined;
+      this.rendererSampleRate = 0;
+      this.rendererChannelCount = 0;
+      await this.releaseRenderer(staleRenderer, false);
     }
     if (this.rendererCreating) {
-      return this.rendererCreating;
+      await this.rendererCreating;
+      return this.ensureRenderer();
     }
     const generation = this.generation;
-    const creation = this.createRenderer(generation);
+    const sampleRate = this.sampleRate;
+    const channelCount = this.channelCount;
+    const creation = this.createRenderer(generation, sampleRate, channelCount);
     this.rendererCreating = creation;
     try {
       return await creation;
@@ -59,11 +78,15 @@ export class PcmPlayer {
     }
   }
 
-  private async createRenderer(generation: number): Promise<audio.AudioRenderer> {
+  private async createRenderer(
+    generation: number,
+    sampleRate: number,
+    channelCount: number
+  ): Promise<audio.AudioRenderer> {
     const options: audio.AudioRendererOptions = {
       streamInfo: {
-        samplingRate: audio.AudioSamplingRate.SAMPLE_RATE_24000,
-        channels: audio.AudioChannel.CHANNEL_1,
+        samplingRate: this.samplingRateForRenderer(sampleRate),
+        channels: this.channelForRenderer(channelCount),
         sampleFormat: audio.AudioSampleFormat.SAMPLE_FORMAT_S16LE,
         encodingType: audio.AudioEncodingType.ENCODING_TYPE_RAW
       },
@@ -108,7 +131,8 @@ export class PcmPlayer {
       const businessError = error as BusinessError;
       throw new Error(businessError.message);
     }
-    if (generation !== this.generation) {
+    if (generation !== this.generation || sampleRate !== this.sampleRate ||
+      channelCount !== this.channelCount) {
       try {
         renderer.off('writeData');
         renderer.off('stateChange');
@@ -121,13 +145,55 @@ export class PcmPlayer {
       throw new Error('Playback was interrupted');
     }
     this.renderer = renderer;
+    this.rendererSampleRate = sampleRate;
+    this.rendererChannelCount = channelCount;
     return renderer;
   }
 
-  setSampleRate(rate: number): void {
-    if (rate > 0) {
-      this.sampleRate = rate;
+  private samplingRateForRenderer(sampleRate: number): audio.AudioSamplingRate {
+    switch (sampleRate) {
+      case 8000:
+        return audio.AudioSamplingRate.SAMPLE_RATE_8000;
+      case 11025:
+        return audio.AudioSamplingRate.SAMPLE_RATE_11025;
+      case 12000:
+        return audio.AudioSamplingRate.SAMPLE_RATE_12000;
+      case 16000:
+        return audio.AudioSamplingRate.SAMPLE_RATE_16000;
+      case 22050:
+        return audio.AudioSamplingRate.SAMPLE_RATE_22050;
+      case 32000:
+        return audio.AudioSamplingRate.SAMPLE_RATE_32000;
+      case 44100:
+        return audio.AudioSamplingRate.SAMPLE_RATE_44100;
+      case 48000:
+        return audio.AudioSamplingRate.SAMPLE_RATE_48000;
+      case 64000:
+        return audio.AudioSamplingRate.SAMPLE_RATE_64000;
+      case 88200:
+        return audio.AudioSamplingRate.SAMPLE_RATE_88200;
+      case 96000:
+        return audio.AudioSamplingRate.SAMPLE_RATE_96000;
+      default:
+        return audio.AudioSamplingRate.SAMPLE_RATE_24000;
     }
+  }
+
+  private channelForRenderer(channelCount: number): audio.AudioChannel {
+    return channelCount === 2
+      ? audio.AudioChannel.CHANNEL_2
+      : audio.AudioChannel.CHANNEL_1;
+  }
+
+  setAudioFormat(sampleRate: number, channelCount: number): void {
+    if (sampleRate > 0 && (channelCount === 1 || channelCount === 2)) {
+      this.sampleRate = sampleRate;
+      this.channelCount = channelCount;
+    }
+  }
+
+  setSampleRate(rate: number): void {
+    this.setAudioFormat(rate, this.channelCount);
   }
 
   getSampleRate(): number {
@@ -136,6 +202,8 @@ export class PcmPlayer {
 
   enqueue(buffer: ArrayBuffer): void {
     this.queue.push(new Uint8Array(buffer));
+    this.rendererStallCount = 0;
+    this.drainRetryAttempt = 0;
     if (!this.paused) {
       this.requestPlayback();
     }
@@ -169,11 +237,10 @@ export class PcmPlayer {
 
   // Fires when the queue has been fully consumed by the renderer.
   waitForDrain(listener: DrainedListener): void {
-    if (this.queue.length === 0) {
-      this.scheduleDrain(listener);
-      return;
-    }
     this.pendingDrain = listener;
+    if (this.queue.length === 0) {
+      this.deferRendererDrain();
+    }
   }
 
   async stop(): Promise<void> {
@@ -183,9 +250,12 @@ export class PcmPlayer {
     this.queueOffset = 0;
     this.paused = false;
     this.pendingDrain = undefined;
-    if (this.drainTimer !== undefined) {
-      clearTimeout(this.drainTimer);
-      this.drainTimer = undefined;
+    this.drainTask = undefined;
+    this.rendererReplayTail = new Uint8Array(0);
+    this.drainRetryAttempt = 0;
+    if (this.drainRetryTimer !== undefined) {
+      clearTimeout(this.drainRetryTimer);
+      this.drainRetryTimer = undefined;
     }
     const creating = this.rendererCreating;
     if (creating) {
@@ -197,6 +267,8 @@ export class PcmPlayer {
     }
     const renderer = this.renderer;
     this.renderer = undefined;
+    this.rendererSampleRate = 0;
+    this.rendererChannelCount = 0;
     if (!renderer) {
       return;
     }
@@ -212,8 +284,8 @@ export class PcmPlayer {
   }
 
   private fillPlaybackBuffer(buffer: ArrayBuffer): void {
-    this.lastRendererWriteAt = Date.now();
     this.rendererRetryAttempt = 0;
+    this.rendererStallCount = 0;
     const output = new Uint8Array(buffer);
     let outputOffset = 0;
     while (outputOffset < output.length && this.queue.length > 0) {
@@ -235,21 +307,19 @@ export class PcmPlayer {
     if (outputOffset < output.length) {
       output.fill(0, outputOffset);
     }
-    this.lastBufferDurationMs = Math.ceil(
-      (outputOffset / (Math.max(this.sampleRate, 1) * 2)) * 1000
-    );
+    if (outputOffset > 0) {
+      this.rendererReplayTail = output.slice(0, outputOffset);
+    }
     if (this.queue.length === 0 && this.pendingDrain) {
       this.cancelRendererWatchdog();
-      const listener = this.pendingDrain;
-      this.pendingDrain = undefined;
-      this.scheduleDrain(listener);
+      this.deferRendererDrain();
     } else if (this.queue.length > 0) {
       this.armRendererWatchdog();
     }
   }
 
   private requestPlayback(recreateRenderer: boolean = false): void {
-    if (this.paused || this.queue.length === 0 || this.rendererRecovery !== undefined) {
+    if (this.paused || (this.queue.length === 0 && !this.pendingDrain) || this.rendererRecovery !== undefined) {
       return;
     }
     if (this.rendererRetryTimer !== undefined) {
@@ -260,13 +330,19 @@ export class PcmPlayer {
     const recovery = this.ensurePlaybackRunning(generation, recreateRenderer);
     this.rendererRecovery = recovery;
     recovery.then((): void => {
-      if (generation !== this.generation || this.paused || this.queue.length === 0) {
+      if (generation !== this.generation || this.paused ||
+        (this.queue.length === 0 && !this.pendingDrain)) {
         return;
       }
       this.rendererRetryAttempt = 0;
-      this.armRendererWatchdog();
+      if (this.queue.length > 0) {
+        this.armRendererWatchdog();
+      } else {
+        this.deferRendererDrain();
+      }
     }).catch((error: BusinessError): void => {
-      if (generation !== this.generation || this.paused || this.queue.length === 0) {
+      if (generation !== this.generation || this.paused ||
+        (this.queue.length === 0 && !this.pendingDrain)) {
         return;
       }
       hilog.warn(
@@ -290,6 +366,7 @@ export class PcmPlayer {
     if (recreateRenderer && this.renderer) {
       const staleRenderer = this.renderer;
       this.renderer = undefined;
+      this.restoreUnconfirmedRendererTail();
       await this.releaseRenderer(staleRenderer, false);
     }
     let renderer = await this.ensureRenderer();
@@ -299,6 +376,7 @@ export class PcmPlayer {
     if (renderer.state === audio.AudioState.STATE_INVALID ||
       renderer.state === audio.AudioState.STATE_RELEASED) {
       this.renderer = undefined;
+      this.restoreUnconfirmedRendererTail();
       await this.releaseRenderer(renderer, false);
       renderer = await this.ensureRenderer();
     }
@@ -330,7 +408,8 @@ export class PcmPlayer {
   }
 
   private scheduleRendererRecovery(): void {
-    if (this.paused || this.queue.length === 0 || this.rendererRetryTimer !== undefined) {
+    if (this.paused || (this.queue.length === 0 && !this.pendingDrain) ||
+      this.rendererRetryTimer !== undefined) {
       return;
     }
     const index = Math.min(
@@ -353,17 +432,49 @@ export class PcmPlayer {
     if (this.paused || this.queue.length === 0) {
       return;
     }
-    const observedWriteAt = this.lastRendererWriteAt;
+    const renderer = this.renderer;
+    const generation = this.generation;
+    if (!renderer) {
+      this.scheduleRendererRecovery();
+      return;
+    }
     this.rendererWatchdog = setTimeout((): void => {
       this.rendererWatchdog = undefined;
-      if (this.paused || this.queue.length === 0 || observedWriteAt !== this.lastRendererWriteAt) {
+      if (this.paused || this.queue.length === 0 || generation !== this.generation ||
+        renderer !== this.renderer) {
+        return;
+      }
+      if (renderer.state !== audio.AudioState.STATE_RUNNING) {
+        this.requestPlayback(
+          renderer.state === audio.AudioState.STATE_INVALID ||
+          renderer.state === audio.AudioState.STATE_RELEASED
+        );
+        return;
+      }
+      let framePos: number;
+      try {
+        framePos = renderer.getAudioTimestampInfoSync().framePos;
+      } catch (error) {
+        this.armRendererWatchdog();
+        return;
+      }
+      if (this.rendererWatchdogFramePos === undefined || framePos > this.rendererWatchdogFramePos) {
+        this.rendererWatchdogFramePos = framePos;
+        this.rendererStallCount = 0;
+        this.armRendererWatchdog();
+        return;
+      }
+      this.rendererStallCount += 1;
+      if (this.rendererStallCount < PCM_RENDERER_STALL_LIMIT) {
+        this.armRendererWatchdog();
         return;
       }
       hilog.warn(
         AUDIO_LOG_DOMAIN,
         AUDIO_LOG_TAG,
-        'PCM renderer stalled with queued audio; recreating renderer'
+        'PCM renderer frame position stalled with queued audio; recreating renderer'
       );
+      this.rendererStallCount = 0;
       this.requestPlayback(true);
     }, PCM_RENDERER_WATCHDOG_MS);
   }
@@ -382,14 +493,16 @@ export class PcmPlayer {
     }
     this.cancelRendererWatchdog();
     this.rendererRetryAttempt = 0;
-    this.lastRendererWriteAt = 0;
+    this.rendererWatchdogFramePos = undefined;
+    this.rendererStallCount = 0;
   }
 
   private onCommunicationSessionRecovered(): void {
-    if (!this.communication || this.paused || this.queue.length === 0) {
+    if (!this.communication || this.paused ||
+      (this.queue.length === 0 && !this.pendingDrain)) {
       return;
     }
-    this.requestPlayback(true);
+    this.requestPlayback();
   }
 
   private onRendererStateChange(
@@ -398,12 +511,12 @@ export class PcmPlayer {
     state: audio.AudioState
   ): void {
     if (generation !== this.generation || this.renderer !== renderer || this.paused ||
-      this.queue.length === 0) {
+      (this.queue.length === 0 && !this.pendingDrain)) {
       return;
     }
     if (state === audio.AudioState.STATE_STOPPED || state === audio.AudioState.STATE_RELEASED ||
       state === audio.AudioState.STATE_INVALID) {
-      this.requestPlayback(state !== audio.AudioState.STATE_STOPPED);
+      this.requestPlayback(true);
     }
   }
 
@@ -413,7 +526,7 @@ export class PcmPlayer {
     event: audio.InterruptEvent
   ): void {
     if (generation !== this.generation || this.renderer !== renderer || this.paused ||
-      this.queue.length === 0) {
+      (this.queue.length === 0 && !this.pendingDrain)) {
       return;
     }
     if (event.eventType === audio.InterruptType.INTERRUPT_TYPE_END &&
@@ -422,14 +535,88 @@ export class PcmPlayer {
     }
   }
 
-  private scheduleDrain(listener: DrainedListener): void {
-    if (this.lastBufferDurationMs <= 0) {
+  private drainRenderer(): void {
+    if (!this.pendingDrain || this.queue.length > 0 || this.drainTask) {
+      return;
+    }
+    const renderer = this.renderer;
+    if (!renderer) {
+      if (this.rendererCreating || this.rendererRecovery) {
+        this.requestPlayback();
+        return;
+      }
+      const listener = this.pendingDrain;
+      this.pendingDrain = undefined;
+      this.rendererReplayTail = new Uint8Array(0);
+      this.drainRetryAttempt = 0;
       listener();
       return;
     }
-    this.drainTimer = setTimeout((): void => {
-      this.drainTimer = undefined;
+    const generation = this.generation;
+    const drain = renderer.drain();
+    let drainFailed = false;
+    this.drainTask = drain;
+    drain.then((): void => {
+      if (generation !== this.generation || renderer !== this.renderer || !this.pendingDrain) {
+        return;
+      }
+      if (this.queue.length > 0) {
+        this.requestPlayback();
+        return;
+      }
+      const listener = this.pendingDrain;
+      this.pendingDrain = undefined;
+      this.rendererReplayTail = new Uint8Array(0);
+      this.drainRetryAttempt = 0;
       listener();
-    }, this.lastBufferDurationMs);
+    }).catch((error: BusinessError): void => {
+      if (generation !== this.generation || !this.pendingDrain) {
+        return;
+      }
+      drainFailed = true;
+      hilog.warn(
+        AUDIO_LOG_DOMAIN,
+        AUDIO_LOG_TAG,
+        'PCM renderer drain failed: %{public}s',
+        error.message
+      );
+      if (renderer.state !== audio.AudioState.STATE_INVALID &&
+        renderer.state !== audio.AudioState.STATE_RELEASED &&
+        this.drainRetryAttempt < PCM_DRAIN_RETRY_DELAYS_MS.length) {
+        const delay = PCM_DRAIN_RETRY_DELAYS_MS[this.drainRetryAttempt];
+        this.drainRetryAttempt += 1;
+        this.drainRetryTimer = setTimeout((): void => {
+          this.drainRetryTimer = undefined;
+          if (generation === this.generation) {
+            this.drainRenderer();
+          }
+        }, delay);
+      } else {
+        this.scheduleRendererRecovery();
+      }
+    }).finally((): void => {
+      if (this.drainTask === drain) {
+        this.drainTask = undefined;
+      }
+      if ((!drainFailed || generation !== this.generation) &&
+        this.pendingDrain && this.queue.length === 0) {
+        this.drainRenderer();
+      }
+    });
+  }
+
+  private deferRendererDrain(): void {
+    setTimeout((): void => {
+      this.drainRenderer();
+    }, 0);
+  }
+
+  private restoreUnconfirmedRendererTail(): void {
+    if (this.rendererReplayTail.length === 0) {
+      return;
+    }
+    this.queue.unshift(this.rendererReplayTail);
+    this.queueOffset = 0;
+    this.rendererReplayTail = new Uint8Array(0);
   }
 }

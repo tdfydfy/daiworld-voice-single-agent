@@ -155,7 +155,7 @@ Web 当前实现：`web_native/`。HarmonyOS 后续使用 ArkTS 原生模块。
 
 ## 6. 正交状态
 
-HarmonyOS 音频的用户环节、控制语义和前后台业务规则以 [`HARMONYOS_AUDIO_USER_JOURNEY.md`](./HARMONYOS_AUDIO_USER_JOURNEY.md) 为准；平台资源和故障恢复再下钻到 [`HARMONYOS_AUDIO_STRATEGY.md`](./HARMONYOS_AUDIO_STRATEGY.md)。核心原则是屏幕状态只作为运行环境和诊断维度，不作为 ASR/TTS 业务分支；任一持续录音或播放需求使用同一个录播组合后台租约。
+HarmonyOS 音频的用户环节、控制语义和前后台业务规则以 [`HARMONYOS_AUDIO_USER_JOURNEY.md`](./HARMONYOS_AUDIO_USER_JOURNEY.md) 为准。核心原则是屏幕状态只作为运行环境和诊断维度，不作为 ASR/TTS 业务分支；当前平台资源按实际活动使用专用后台模式，系统 TTS 排队或播放时使用 `AUDIO_PLAYBACK`，其余持续收音窗口使用 `AUDIO_RECORDING`。
 
 ### 6.1 客户端状态
 

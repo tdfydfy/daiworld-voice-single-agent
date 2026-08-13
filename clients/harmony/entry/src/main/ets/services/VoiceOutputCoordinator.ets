@@ -16,6 +16,7 @@ export class VoiceOutputCallbacks {
   private configCallback: () => ClientConfig;
   private notifyCallback: () => void;
   private backgroundStateCallback: () => void;
+  private playbackReadyCallback: () => Promise<void>;
   private cancelRemoteReconnectCallback: () => void;
   private remoteDisconnectCallback: (message: string) => void;
   private remoteUrlCallback: () => string;
@@ -25,6 +26,7 @@ export class VoiceOutputCallbacks {
     configCallback: () => ClientConfig,
     notifyCallback: () => void,
     backgroundStateCallback: () => void,
+    playbackReadyCallback: () => Promise<void>,
     cancelRemoteReconnectCallback: () => void,
     remoteDisconnectCallback: (message: string) => void,
     remoteUrlCallback: () => string,
@@ -33,6 +35,7 @@ export class VoiceOutputCallbacks {
     this.configCallback = configCallback;
     this.notifyCallback = notifyCallback;
     this.backgroundStateCallback = backgroundStateCallback;
+    this.playbackReadyCallback = playbackReadyCallback;
     this.cancelRemoteReconnectCallback = cancelRemoteReconnectCallback;
     this.remoteDisconnectCallback = remoteDisconnectCallback;
     this.remoteUrlCallback = remoteUrlCallback;
@@ -49,6 +52,10 @@ export class VoiceOutputCallbacks {
 
   syncBackgroundState(): void {
     this.backgroundStateCallback();
+  }
+
+  ensurePlaybackReady(): Promise<void> {
+    return this.playbackReadyCallback();
   }
 
   cancelRemoteReconnect(): void {
@@ -719,8 +726,7 @@ export class VoiceOutputCoordinator {
     this.snapshot.playback = 'none';
     this.snapshot.ttsState = this.enabled ? 'ready' : 'stopped';
     if (this.useSystemSpeech) {
-      this.systemSpeech?.stopSpeaking();
-      const cleanup = Promise.resolve();
+      const cleanup = this.systemSpeech?.stopSpeaking() ?? Promise.resolve();
       this.replayCleanup = cleanup;
       return cleanup;
     }
@@ -868,15 +874,20 @@ export class VoiceOutputCoordinator {
       String(config.speechRate)
     );
     this.callbacks.notify();
-    this.audioCues.yieldForSpeech().then((): void => {
-      const latestConfig = this.callbacks.config();
-      if (generation !== this.systemSpeechStartGeneration || !this.useSystemSpeech ||
-        !this.enabled || latestConfig.muted || this.pausedForUser ||
-        this.systemSpeechQueue.active() !== text) {
+    this.audioCues.yieldForSpeech().then((): Promise<void> => {
+      if (!this.isSystemSpeechStartCurrent(generation, text)) {
+        return Promise.resolve();
+      }
+      return this.callbacks.ensurePlaybackReady();
+    }).then((): void => {
+      if (!this.isSystemSpeechStartCurrent(generation, text)) {
+        this.callbacks.syncBackgroundState();
         return;
       }
+      const latestConfig = this.callbacks.config();
       speech.speak(text, latestConfig.voicePerson, latestConfig.speechRate).catch((error: BusinessError) => {
         if (generation !== this.systemSpeechStartGeneration) {
+          this.callbacks.syncBackgroundState();
           return;
         }
         this.clearSystemSpeechQueue();
@@ -887,16 +898,24 @@ export class VoiceOutputCoordinator {
         this.callbacks.notify();
       });
     }).catch((error: BusinessError): void => {
-      if (generation !== this.systemSpeechStartGeneration) {
+      if (!this.isSystemSpeechStartCurrent(generation, text)) {
+        this.callbacks.syncBackgroundState();
         return;
       }
       this.clearSystemSpeechQueue();
       this.snapshot.ttsState = 'error';
       this.snapshot.playback = 'none';
-      this.snapshot.statusDetail = '提示音与本地 TTS 交接失败';
-      this.snapshot.error = this.errorMessage(error, '本地 TTS 输出准备失败');
+      this.snapshot.statusDetail = '本地 TTS 输出准备失败';
+      this.snapshot.error = this.errorMessage(error, '后台音频保持或提示音交接失败');
       this.callbacks.notify();
     });
+  }
+
+  private isSystemSpeechStartCurrent(generation: number, text: string): boolean {
+    const config = this.callbacks.config();
+    return generation === this.systemSpeechStartGeneration && this.useSystemSpeech &&
+      this.enabled && !config.muted && !this.pausedForUser &&
+      this.systemSpeechQueue.active() === text;
   }
 
   private errorMessage(error: BusinessError, fallback: string): string {

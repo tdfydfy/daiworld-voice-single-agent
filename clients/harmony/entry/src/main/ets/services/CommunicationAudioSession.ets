@@ -1,6 +1,8 @@
 // Shared HarmonyOS voice-communication audio session and output routing.
 
+import { common } from '@kit.AbilityKit';
 import { audio } from '@kit.AudioKit';
+import { avSession } from '@kit.AVSessionKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { AudioOutputRoute } from '../models/SingleAgentState';
@@ -22,12 +24,21 @@ class CommunicationAudioSession {
   private listenerInstalled: boolean = false;
   private routingListenersInstalled: boolean = false;
   private outputRouteListener?: OutputRouteListener;
+  private lastHeadsetAvailable?: boolean;
   private recoveryListeners: AudioSessionRecoveryListener[] = [];
   private preferredOutputListener = (devices: audio.AudioDeviceDescriptors): void => {
+    this.speakerphoneEnabled = this.outputRoute(devices) === 'speaker';
     this.publishOutputRoute(devices);
   };
   private availableOutputListener = (_action: audio.DeviceChangeAction): void => {
-    this.publishOutputRoute();
+    this.applyOutputPreference().catch((error: BusinessError): void => {
+      hilog.warn(
+        AUDIO_LOG_DOMAIN,
+        AUDIO_LOG_TAG,
+        'communication output refresh failed: %{public}s',
+        error.message
+      );
+    });
   };
   private sessionDeactivatedListener = (event: audio.AudioSessionDeactivatedEvent): void => {
     hilog.warn(
@@ -118,6 +129,14 @@ class CommunicationAudioSession {
       await this.ensureActivated();
     }
     await this.applyOutputPreference();
+  }
+
+  async showOutputPicker(context: common.UIAbilityContext): Promise<void> {
+    const picker = new avSession.AVCastPickerHelper(context);
+    await picker.select({
+      sessionType: 'voice_call'
+    });
+    hilog.info(AUDIO_LOG_DOMAIN, AUDIO_LOG_TAG, 'native communication output picker opened');
   }
 
   setOutputRouteListener(listener: OutputRouteListener): void {
@@ -218,20 +237,6 @@ class CommunicationAudioSession {
 
   private async applyOutputPreference(): Promise<void> {
     const routingManager = audio.getAudioManager().getRoutingManager();
-    try {
-      await routingManager.setCommunicationDevice(
-        audio.CommunicationDeviceType.SPEAKER,
-        this.speakerphoneEnabled
-      );
-    } catch (error) {
-      const businessError = error as BusinessError;
-      hilog.warn(
-        AUDIO_LOG_DOMAIN,
-        AUDIO_LOG_TAG,
-        'communication speaker selection failed: %{public}s',
-        businessError.message
-      );
-    }
     if (this.users <= 0) {
       this.publishOutputRoute();
       return;
@@ -241,31 +246,30 @@ class CommunicationAudioSession {
       available = routingManager.getDevicesSync(audio.DeviceFlag.OUTPUT_DEVICES_FLAG);
     } catch (error) {
     }
-    if (!this.speakerphoneEnabled && this.hasHeadsetOutput(available)) {
-      hilog.info(
-        AUDIO_LOG_DOMAIN,
-        AUDIO_LOG_TAG,
-        'communication output left system-managed because a headset is available'
-      );
-      this.publishOutputRoute();
-      return;
+    const headsetAvailable = this.hasHeadsetOutput(available);
+    if (this.lastHeadsetAvailable === undefined || this.lastHeadsetAvailable !== headsetAvailable) {
+      this.speakerphoneEnabled = false;
+      this.lastHeadsetAvailable = headsetAvailable;
     }
-    const sessionManager = audio.getAudioManager().getSessionManager();
-    const device = this.speakerphoneEnabled ? audio.DeviceType.SPEAKER : audio.DeviceType.EARPIECE;
+    const speakerActive = this.speakerphoneEnabled;
     try {
-      await sessionManager.setDefaultOutputDevice(device);
+      await routingManager.setCommunicationDevice(
+        audio.CommunicationDeviceType.SPEAKER,
+        speakerActive
+      );
       hilog.info(
         AUDIO_LOG_DOMAIN,
         AUDIO_LOG_TAG,
-        'communication fallback output=%{public}s',
-        this.speakerphoneEnabled ? 'speaker' : 'earpiece'
+        'communication route preference headset=%{public}s phone=%{public}s',
+        String(headsetAvailable),
+        speakerActive ? 'speaker' : 'system-preferred'
       );
     } catch (error) {
       const businessError = error as BusinessError;
       hilog.warn(
         AUDIO_LOG_DOMAIN,
         AUDIO_LOG_TAG,
-        'communication fallback output setup failed: %{public}s',
+        'communication speaker selection failed: %{public}s',
         businessError.message
       );
     }
@@ -393,6 +397,10 @@ const COMMUNICATION_AUDIO_SESSION = new CommunicationAudioSession();
 
 export function setCommunicationSpeakerphoneEnabled(enabled: boolean): Promise<void> {
   return COMMUNICATION_AUDIO_SESSION.setSpeakerphoneEnabled(enabled);
+}
+
+export function showCommunicationOutputPicker(context: common.UIAbilityContext): Promise<void> {
+  return COMMUNICATION_AUDIO_SESSION.showOutputPicker(context);
 }
 
 export function setCommunicationOutputRouteListener(listener: OutputRouteListener): void {

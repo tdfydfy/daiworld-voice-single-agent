@@ -2,7 +2,7 @@ import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { speechRecognizer, textToSpeech } from '@kit.CoreSpeechKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { PcmCapture } from './PcmCapture';
+import { CaptureSupervisor, CaptureSupervisorCallbacks } from './CaptureSupervisor';
 
 const SPEECH_FRAME_BYTES = 640;
 const SPEECH_PRE_ROLL_BYTES = 6400;
@@ -103,11 +103,12 @@ export class VoiceOption {
 export class SystemSpeechService {
   private context: common.UIAbilityContext;
   private callbacks: SystemSpeechCallbacks;
-  private capture: PcmCapture = new PcmCapture();
+  private capture: CaptureSupervisor;
   private recognizer?: speechRecognizer.SpeechRecognitionEngine;
   private tts?: textToSpeech.TextToSpeechEngine;
   private activeTtsRequestId: string = '';
   private ttsRequestGeneration: number = 0;
+  private requestSerial: number = 0;
   private recognitionSessionId: string = '';
   private recognitionSessionReady: boolean = false;
   private recognitionSessionAudioBytes: number = 0;
@@ -115,12 +116,17 @@ export class SystemSpeechService {
   private recognitionWanted: boolean = false;
   private microphonePermissionGranted: boolean = false;
   private captureRunning: boolean = false;
+  private captureRecovering: boolean = false;
   private captureStarting?: Promise<void>;
   private captureStopping?: Promise<void>;
   private ttsPerson: number = -1;
   constructor(context: common.UIAbilityContext, callbacks: SystemSpeechCallbacks) {
     this.context = context;
     this.callbacks = callbacks;
+    this.capture = new CaptureSupervisor(new CaptureSupervisorCallbacks(
+      (state: string, reason: string): void => this.onCaptureState(state, reason),
+      (message: string): void => this.callbacks.onError('STT', message)
+    ));
   }
 
   getCapabilities(): SystemSpeechCapabilities {
@@ -246,6 +252,9 @@ export class SystemSpeechService {
         extraParams: extraParams
       });
     } catch (error) {
+      if (this.activeTtsRequestId === requestId) {
+        this.activeTtsRequestId = '';
+      }
       hilog.error(
         SPEECH_LOG_DOMAIN,
         SPEECH_LOG_TAG,
@@ -257,29 +266,37 @@ export class SystemSpeechService {
     }
   }
 
-  stopSpeaking(): void {
+  stopSpeaking(): Promise<void> {
     this.ttsRequestGeneration += 1;
-    if (!this.tts) {
-      return;
+    const hasActiveRequest = this.activeTtsRequestId.length > 0;
+    this.activeTtsRequestId = '';
+    if (this.tts && hasActiveRequest) {
+      try {
+        hilog.info(SPEECH_LOG_DOMAIN, SPEECH_LOG_TAG, 'TTS stop requested');
+        this.tts.stop();
+      } catch (error) {
+        hilog.warn(
+          SPEECH_LOG_DOMAIN,
+          SPEECH_LOG_TAG,
+          'TTS stop treated as idempotent: %{public}s',
+          this.errorText(error as BusinessError)
+        );
+      }
     }
-    try {
-      hilog.info(SPEECH_LOG_DOMAIN, SPEECH_LOG_TAG, 'TTS stop requested');
-      this.tts.stop();
-    } catch (error) {
-      this.callbacks.onError('TTS', this.errorText(error as BusinessError));
-    }
+    this.callbacks.onSpeechState(false);
+    return Promise.resolve();
   }
 
   async release(): Promise<void> {
     this.ttsRequestGeneration += 1;
     await this.stopRecognition(false);
     this.releaseRecognizer();
+    this.activeTtsRequestId = '';
     if (this.tts) {
       this.tts.shutdown();
       this.tts = undefined;
       this.ttsPerson = -1;
     }
-    this.activeTtsRequestId = '';
     this.callbacks.onSpeechState(false);
   }
 
@@ -292,7 +309,11 @@ export class SystemSpeechService {
         this.recognitionSessionReady = true;
         this.recognitionSessionAudioBytes = 0;
         this.flushRecognitionAudio(sessionId);
-        this.callbacks.onRecognitionState(true);
+        if (this.captureRunning) {
+          this.callbacks.onRecognitionState(true);
+        } else {
+          this.reportRecognitionStartupPhase('音频采集正在恢复');
+        }
       },
       onEvent: (sessionId: string, eventCode: number, _eventMessage: string): void => {
         if (this.recognitionSessionId === sessionId && eventCode === 1) {
@@ -389,7 +410,6 @@ export class SystemSpeechService {
     this.captureStarting = startTask;
     try {
       await startTask;
-      this.captureRunning = true;
     } finally {
       if (this.captureStarting === startTask) {
         this.captureStarting = undefined;
@@ -527,6 +547,7 @@ export class SystemSpeechService {
           response.type
         );
         if (response.type === 1) {
+          this.activeTtsRequestId = '';
           this.callbacks.onSpeechState(false);
         }
       },
@@ -541,6 +562,7 @@ export class SystemSpeechService {
           requestId,
           response.type
         );
+        this.activeTtsRequestId = '';
         this.callbacks.onSpeechState(false);
       },
       onError: (requestId: string, errorCode: number, errorMessage: string): void => {
@@ -555,6 +577,7 @@ export class SystemSpeechService {
           errorCode,
           errorMessage
         );
+        this.activeTtsRequestId = '';
         this.callbacks.onSpeechState(false);
         this.callbacks.onError('TTS', `code=${errorCode} message=${errorMessage}`);
       }
@@ -579,8 +602,44 @@ export class SystemSpeechService {
     this.callbacks.onRecognitionStartupPhase(phase);
   }
 
+  private onCaptureState(state: string, reason: string): void {
+    if (state === 'running') {
+      const recovered = this.captureRecovering;
+      this.captureRunning = true;
+      this.captureRecovering = false;
+      if (recovered) {
+        this.reportRecognitionStartupPhase('音频采集已恢复');
+        if (this.recognitionWanted && this.recognitionSessionReady) {
+          this.callbacks.onRecognitionState(true);
+        }
+      }
+      return;
+    }
+    if (state === 'recovering') {
+      this.captureRunning = false;
+      this.captureRecovering = true;
+      if (this.recognitionWanted) {
+        this.reportRecognitionStartupPhase('音频采集正在恢复');
+      }
+      hilog.warn(
+        SPEECH_LOG_DOMAIN,
+        SPEECH_LOG_TAG,
+        'system ASR capture recovering reason=%{public}s',
+        reason
+      );
+      return;
+    }
+    if (state === 'starting' || state === 'stopped' || state === 'failed') {
+      this.captureRunning = false;
+      if (state !== 'starting') {
+        this.captureRecovering = false;
+      }
+    }
+  }
+
   private makeId(prefix: string): string {
-    return `${prefix}-${Date.now()}`;
+    this.requestSerial += 1;
+    return `${prefix}-${Date.now()}-${this.requestSerial}`;
   }
 
   private errorText(error: Error): string {

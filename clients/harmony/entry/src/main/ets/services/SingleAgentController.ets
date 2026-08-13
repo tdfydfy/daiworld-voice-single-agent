@@ -25,10 +25,12 @@ import {
 import { ConversationState, ConversationStateCallbacks } from './ConversationState';
 import { HermesRuntime, HermesRuntimeCallbacks } from './HermesRuntime';
 import { SpeechTextFilter } from './SpeechTextFilter';
-import { BackgroundAudioIntent, BackgroundAudioTaskOwner } from './BackgroundAudioTaskOwner';
+import { AudioContinuityCoordinator } from './AudioContinuityCoordinator';
+import { BackgroundAudioIntent } from './BackgroundAudioTaskOwner';
 import {
   setCommunicationOutputRouteListener,
-  setCommunicationSpeakerphoneEnabled
+  setCommunicationSpeakerphoneEnabled,
+  showCommunicationOutputPicker
 } from './CommunicationAudioSession';
 import {
   SystemSpeechCallbacks,
@@ -59,7 +61,7 @@ export class SnapshotListener {
 
 export class SingleAgentController {
   private runtime: HermesRuntime;
-  private backgroundAudioTask: BackgroundAudioTaskOwner = new BackgroundAudioTaskOwner();
+  private audioContinuity: AudioContinuityCoordinator = new AudioContinuityCoordinator();
   private systemSpeech?: SystemSpeechService;
   private listener?: SnapshotListener;
   private context?: common.UIAbilityContext;
@@ -71,7 +73,6 @@ export class SingleAgentController {
   private config: ClientConfig = AppSettingsStore.defaultConfig();
   private discardInterruptedTurnEvents: boolean = false;
   private replacementPromptSubmitted: boolean = false;
-  private outputRouteInitialized: boolean = false;
   private remoteTtsReconnectTimer?: number;
   private remoteTtsReconnectAttempt: number = 0;
 
@@ -100,6 +101,7 @@ export class SingleAgentController {
       (): ClientConfig => this.config,
       (): void => this.notify(),
       (): void => this.syncBackgroundVoiceTask(),
+      (): Promise<void> => this.audioContinuity.ensurePlaybackReady(),
       (): void => this.cancelRemoteTtsReconnect(),
       (message: string): void => this.handleRemoteTtsDisconnect(message),
       (): string => this.wsUrl('/api/audio/speak-stream', this.snapshot.selectedProfile),
@@ -109,6 +111,7 @@ export class SingleAgentController {
       (): ClientConfig => this.config,
       (): void => this.notify(),
       (): void => this.syncBackgroundVoiceTask(),
+      (): Promise<void> => this.audioContinuity.ensureRecordingReady(),
       (): ChatMessage => this.conversation.ensureAsrPreview(),
       (): ChatMessage | undefined => this.conversation.currentAsrMessage(),
       (): void => this.conversation.discardAsrPreview(),
@@ -128,7 +131,11 @@ export class SingleAgentController {
 
   async setContext(context: common.UIAbilityContext): Promise<void> {
     this.context = context;
-    this.backgroundAudioTask.setContext(context);
+    this.audioContinuity.setContext(context);
+    this.audioContinuity.setErrorListener((message: string): void => {
+      this.snapshot.error = message;
+      this.notify();
+    });
     this.input.setContext(context);
     this.systemSpeech = new SystemSpeechService(context, new SystemSpeechCallbacks(
       (active: boolean): void => {
@@ -380,6 +387,17 @@ export class SingleAgentController {
   }
 
   toggleSpeakerphone(): void {
+    const context = this.context;
+    if (context) {
+      showCommunicationOutputPicker(context).catch((): void => {
+        this.toggleSpeakerphoneFallback();
+      });
+      return;
+    }
+    this.toggleSpeakerphoneFallback();
+  }
+
+  private toggleSpeakerphoneFallback(): void {
     this.config.speakerphoneEnabled = this.snapshot.audioOutputRoute !== 'speaker';
     this.snapshot.speakerphoneEnabled = this.config.speakerphoneEnabled;
     this.persistConfig();
@@ -395,16 +413,14 @@ export class SingleAgentController {
   }
 
   private onOutputRouteChanged(route: AudioOutputRoute, headsetAvailable: boolean): void {
-    const headsetConnected = headsetAvailable &&
-      (!this.outputRouteInitialized || !this.snapshot.headsetOutputAvailable);
-    this.outputRouteInitialized = true;
+    const speakerphoneEnabled = route === 'speaker';
+    const preferenceChanged = this.config.speakerphoneEnabled !== speakerphoneEnabled;
+    this.config.speakerphoneEnabled = speakerphoneEnabled;
+    this.snapshot.speakerphoneEnabled = speakerphoneEnabled;
     this.snapshot.audioOutputRoute = route;
     this.snapshot.headsetOutputAvailable = headsetAvailable;
-    if (headsetConnected && this.config.speakerphoneEnabled) {
-      this.config.speakerphoneEnabled = false;
-      this.snapshot.speakerphoneEnabled = false;
+    if (preferenceChanged) {
       this.persistConfig();
-      this.applySpeakerphonePreference();
     }
     this.notify();
   }
@@ -604,10 +620,7 @@ export class SingleAgentController {
     } else if (this.output.hasBackgroundOutput()) {
       intent = 'playback';
     }
-    this.backgroundAudioTask.sync(intent, (message: string): void => {
-      this.snapshot.error = message;
-      this.notify();
-    });
+    this.audioContinuity.syncIntent(intent);
   }
 
   private onRuntimeReady(): void {

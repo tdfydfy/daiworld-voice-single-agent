@@ -2,19 +2,22 @@ import { common, wantAgent } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import {
+  AudioContinuityAction,
+  AudioContinuityState,
+  BackgroundAudioIntent
+} from './AudioContinuityState';
 
 const BACKGROUND_AUDIO_LOG_DOMAIN = 0xD005;
 const BACKGROUND_AUDIO_LOG_TAG = 'BackgroundAudio';
 
-export type BackgroundAudioIntent = 'none' | 'recording' | 'playback';
+export { BackgroundAudioIntent } from './AudioContinuityState';
 
 export class BackgroundAudioTaskOwner {
   private context?: common.UIAbilityContext;
-  private desiredIntent: BackgroundAudioIntent = 'none';
-  private runningIntent: BackgroundAudioIntent = 'none';
+  private state: AudioContinuityState = new AudioContinuityState();
+  private reconcileTask?: Promise<void>;
   private failedIntent: BackgroundAudioIntent = 'none';
-  private starting: boolean = false;
-  private stopping: boolean = false;
   private onError?: (message: string) => void;
 
   setContext(context: common.UIAbilityContext): void {
@@ -22,110 +25,132 @@ export class BackgroundAudioTaskOwner {
   }
 
   sync(intent: BackgroundAudioIntent, onError: (message: string) => void): void {
-    if (this.desiredIntent !== intent) {
-      hilog.info(
-        BACKGROUND_AUDIO_LOG_DOMAIN,
-        BACKGROUND_AUDIO_LOG_TAG,
-        'background intent desired=%{public}s running=%{public}s',
-        intent,
-        this.runningIntent
-      );
-      this.failedIntent = 'none';
-    }
-    this.desiredIntent = intent;
+    const changed = this.state.setDesiredIntent(intent);
     this.onError = onError;
+    if (changed) {
+      this.failedIntent = 'none';
+      this.logState('desired');
+    }
     if (intent === 'none') {
       this.failedIntent = 'none';
     }
-    this.advance();
+    if (intent === this.failedIntent) {
+      return;
+    }
+    this.ensureReconcile().catch(() => undefined);
   }
 
-  private advance(): void {
-    if (this.starting || this.stopping) {
-      return;
+  ensureReady(intent: BackgroundAudioIntent, onError: (message: string) => void): Promise<void> {
+    this.state.setDesiredIntent(intent);
+    this.failedIntent = 'none';
+    this.onError = onError;
+    this.logState('ensure');
+    return this.ensureReconcile().then((): void => {
+      if (!this.state.isReady(intent)) {
+        throw new Error(`后台音频${intent === 'playback' ? '播放' : '录音'}模式尚未就绪`);
+      }
+    });
+  }
+
+  release(onError: (message: string) => void): Promise<void> {
+    this.state.setDesiredIntent('none');
+    this.failedIntent = 'none';
+    this.onError = onError;
+    this.logState('release');
+    return this.ensureReconcile().then((): void => {
+      if (!this.state.isIdle()) {
+        throw new Error('后台音频任务尚未释放');
+      }
+    });
+  }
+
+  private ensureReconcile(): Promise<void> {
+    const existing = this.reconcileTask;
+    if (existing) {
+      return existing.then((): Promise<void> => {
+        if (this.state.nextAction() !== 'none' && this.state.desiredIntent !== this.failedIntent) {
+          return this.ensureReconcile();
+        }
+        return Promise.resolve();
+      });
     }
-    if (this.runningIntent !== 'none') {
-      if (this.runningIntent === this.desiredIntent) {
+    const task = this.reconcile();
+    this.reconcileTask = task;
+    return task.finally((): void => {
+      if (this.reconcileTask === task) {
+        this.reconcileTask = undefined;
+      }
+    });
+  }
+
+  private async reconcile(): Promise<void> {
+    while (true) {
+      const action = this.state.nextAction();
+      if (action === 'none' || this.state.desiredIntent === this.failedIntent) {
         return;
       }
-      this.stop();
-      return;
+      const generation = this.state.begin(action);
+      const transitionIntent = this.state.transitionIntent;
+      this.logTransition(action, transitionIntent, generation, 'begin');
+      try {
+        if (action === 'start') {
+          await this.start(transitionIntent);
+        } else {
+          await this.stop();
+        }
+      } catch (error) {
+        this.state.fail(action, generation);
+        if (action === 'start') {
+          this.failedIntent = transitionIntent;
+        }
+        const message = this.errorMessage(
+          error as BusinessError,
+          action === 'start' ? '后台音频保持启动失败' : '后台音频保持切换失败'
+        );
+        this.logTransition(action, transitionIntent, generation, 'failed');
+        this.onError?.(message);
+        throw new Error(message);
+      }
+      this.state.complete(action, generation);
+      this.failedIntent = 'none';
+      this.logTransition(action, transitionIntent, generation, 'complete');
     }
-    if (this.desiredIntent === 'none' || this.desiredIntent === this.failedIntent) {
-      return;
-    }
-    this.start(this.desiredIntent);
   }
 
   private async start(intent: BackgroundAudioIntent): Promise<void> {
     const context = this.context;
     if (!context || intent === 'none') {
-      return;
+      throw new Error('后台音频保持缺少 UIAbilityContext');
     }
-    this.starting = true;
-    try {
-      const agent = await wantAgent.getWantAgent({
-        wants: [{
-          bundleName: 'cc.daiworld.voice.singleagent',
-          abilityName: 'EntryAbility'
-        }],
-        actionType: wantAgent.OperationType.START_ABILITY,
-        requestCode: 1001,
-        actionFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
-      });
-      if (this.desiredIntent !== intent) {
-        return;
-      }
-      await backgroundTaskManager.startBackgroundRunning(context, this.mode(intent), agent);
-      this.runningIntent = intent;
-      this.failedIntent = 'none';
-      hilog.info(
-        BACKGROUND_AUDIO_LOG_DOMAIN,
-        BACKGROUND_AUDIO_LOG_TAG,
-        'background intent started=%{public}s',
-        intent
-      );
-    } catch (error) {
-      this.runningIntent = 'none';
-      this.failedIntent = intent;
-      if (this.desiredIntent === intent && this.onError) {
-        this.onError(this.errorMessage(error as BusinessError, '后台音频保持启动失败'));
-      }
-    } finally {
-      this.starting = false;
-      this.advance();
-    }
+    const agent = await wantAgent.getWantAgent({
+      wants: [{
+        bundleName: 'cc.daiworld.voice.singleagent',
+        abilityName: 'EntryAbility'
+      }],
+      actionType: wantAgent.OperationType.START_ABILITY,
+      requestCode: 1001,
+      actionFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
+    });
+    await backgroundTaskManager.startBackgroundRunning(context, this.mode(intent), agent);
   }
 
-  private stop(): void {
+  private async stop(): Promise<void> {
     const context = this.context;
-    if (!context || this.runningIntent === 'none') {
-      this.runningIntent = 'none';
-      this.advance();
+    if (!context) {
       return;
     }
-    this.stopping = true;
-    let stopFailed = false;
-    backgroundTaskManager.stopBackgroundRunning(context).then((): void => {
-      hilog.info(
+    try {
+      await backgroundTaskManager.stopBackgroundRunning(context);
+    } catch (error) {
+      if (!this.isTaskVerificationError(error as BusinessError)) {
+        throw new Error(this.errorMessage(error as BusinessError, '后台音频保持停止失败'));
+      }
+      hilog.warn(
         BACKGROUND_AUDIO_LOG_DOMAIN,
         BACKGROUND_AUDIO_LOG_TAG,
-        'background intent stopped=%{public}s next=%{public}s',
-        this.runningIntent,
-        this.desiredIntent
+        'background stop reported 9800005; treating the stale task as already stopped'
       );
-      this.runningIntent = 'none';
-    }).catch((error: BusinessError): void => {
-      stopFailed = true;
-      if (this.desiredIntent !== 'none' && this.onError) {
-        this.onError(this.errorMessage(error, '后台音频保持切换失败'));
-      }
-    }).finally((): void => {
-      this.stopping = false;
-      if (!stopFailed) {
-        this.advance();
-      }
-    });
+    }
   }
 
   private mode(intent: BackgroundAudioIntent): backgroundTaskManager.BackgroundMode {
@@ -134,8 +159,42 @@ export class BackgroundAudioTaskOwner {
       : backgroundTaskManager.BackgroundMode.AUDIO_PLAYBACK;
   }
 
+  private logState(reason: string): void {
+    hilog.info(
+      BACKGROUND_AUDIO_LOG_DOMAIN,
+      BACKGROUND_AUDIO_LOG_TAG,
+      'background state reason=%{public}s desired=%{public}s running=%{public}s phase=%{public}s',
+      reason,
+      this.state.desiredIntent,
+      this.state.runningIntent,
+      this.state.phase
+    );
+  }
+
+  private logTransition(
+    action: AudioContinuityAction,
+    intent: BackgroundAudioIntent,
+    generation: number,
+    result: string
+  ): void {
+    hilog.info(
+      BACKGROUND_AUDIO_LOG_DOMAIN,
+      BACKGROUND_AUDIO_LOG_TAG,
+      'background action=%{public}s intent=%{public}s result=%{public}s generation=%{public}d',
+      action,
+      intent,
+      result,
+      generation
+    );
+  }
+
   private errorMessage(error: BusinessError, fallback: string): string {
     return error && typeof error.message === 'string' && error.message.length > 0
       ? error.message : fallback;
+  }
+
+  private isTaskVerificationError(error: BusinessError): boolean {
+    return (error !== undefined && error.code === 9800005) ||
+      (error !== undefined && typeof error.message === 'string' && error.message.indexOf('9800005') >= 0);
   }
 }

@@ -11,17 +11,25 @@ const AUDIO_LOG_TAG = 'SingleAgentAudio';
 
 export type AudioChunkListener = (buffer: ArrayBuffer) => void;
 export type InputRouteListener = (label: string) => void;
+export type CaptureHealthListener = (reason: string, healthy: boolean) => void;
 
 export class PcmCapture {
   private capturer?: audio.AudioCapturer;
   private listener?: AudioChunkListener;
   private routeListener?: InputRouteListener;
+  private healthListener?: CaptureHealthListener;
   private lastReadAt: number = 0;
   private lastHealthLogAt: number = 0;
   private readCount: number = 0;
   private activeInputLabel: string = '';
   private captureGeneration: number = 0;
   private session: CommunicationAudioSessionLease = new CommunicationAudioSessionLease();
+
+  constructor() {
+    this.session.addRecoveryListener((): void => {
+      this.healthListener?.('communication-session-recovered', false);
+    });
+  }
 
   async requestPermission(context: common.UIAbilityContext): Promise<boolean> {
     const manager = abilityAccessCtrl.createAtManager();
@@ -35,14 +43,22 @@ export class PcmCapture {
     }
   }
 
-  async start(listener: AudioChunkListener, routeListener?: InputRouteListener): Promise<void> {
+  async start(
+    listener: AudioChunkListener,
+    routeListener?: InputRouteListener,
+    healthListener?: CaptureHealthListener
+  ): Promise<void> {
+    if (this.capturer) {
+      this.listener = listener;
+      this.routeListener = routeListener;
+      this.healthListener = healthListener;
+      return;
+    }
     const generation = this.captureGeneration + 1;
     this.captureGeneration = generation;
     this.listener = listener;
     this.routeListener = routeListener;
-    if (this.capturer) {
-      return;
-    }
+    this.healthListener = healthListener;
     this.activeInputLabel = '';
     const capturerInfo: audio.AudioCapturerInfo = {
       source: audio.SourceType.SOURCE_TYPE_VOICE_COMMUNICATION,
@@ -92,11 +108,43 @@ export class PcmCapture {
         }
         this.updateInputRoute('changed', devices);
       });
+      capturer.on('stateChange', (state: audio.AudioState): void => {
+        if (generation !== this.captureGeneration || this.capturer !== capturer) {
+          return;
+        }
+        hilog.info(
+          AUDIO_LOG_DOMAIN,
+          AUDIO_LOG_TAG,
+          'capture state=%{public}d generation=%{public}d',
+          state,
+          generation
+        );
+        if (state === audio.AudioState.STATE_STOPPED ||
+          state === audio.AudioState.STATE_RELEASED ||
+          state === audio.AudioState.STATE_INVALID) {
+          this.healthListener?.(`state-${state}`, false);
+        }
+      });
+      capturer.on('audioInterrupt', (event: audio.InterruptEvent): void => {
+        if (generation !== this.captureGeneration || this.capturer !== capturer) {
+          return;
+        }
+        hilog.warn(
+          AUDIO_LOG_DOMAIN,
+          AUDIO_LOG_TAG,
+          'capture interrupt event=%{public}d hint=%{public}d generation=%{public}d',
+          event.eventType,
+          event.hintType,
+          generation
+        );
+        this.healthListener?.(`interrupt-${event.eventType}-${event.hintType}`, false);
+      });
       await capturer.start();
       if (generation !== this.captureGeneration) {
         throw new Error('录音启动已取消');
       }
       this.updateInputRoute('started', this.getActiveInputDevices(capturer));
+      this.healthListener?.('started', true);
       hilog.info(
         AUDIO_LOG_DOMAIN,
         AUDIO_LOG_TAG,
@@ -110,6 +158,8 @@ export class PcmCapture {
         try {
           capturer.off('readData');
           capturer.off('inputDeviceChange');
+          capturer.off('stateChange');
+          capturer.off('audioInterrupt');
         } catch (offError) {
         }
         await capturer.stop().catch(() => undefined);
@@ -131,6 +181,7 @@ export class PcmCapture {
     this.readCount = 0;
     this.listener = undefined;
     this.routeListener = undefined;
+    this.healthListener = undefined;
     this.activeInputLabel = '';
     if (!capturer) {
       return;
@@ -138,6 +189,8 @@ export class PcmCapture {
     try {
       capturer.off('readData');
       capturer.off('inputDeviceChange');
+      capturer.off('stateChange');
+      capturer.off('audioInterrupt');
     } catch (error) {
       // A stopped capturer may already have removed the callback.
     }

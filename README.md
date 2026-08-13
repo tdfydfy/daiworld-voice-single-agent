@@ -1,7 +1,7 @@
 # Daiworld Voice — Single Agent Edition
 
 > 当前分支：`main`
-> 当前基线：Web v21 + HarmonyOS 1.2.1
+> 当前基线：Web v21 + HarmonyOS 1.2.5
 > 当前入口：<https://your-gateway.example/voice-native/>
 
 Daiworld Voice 有两种并存的产品形态，单 Agent 版不是主持人多 Agent 版的替代品。
@@ -122,16 +122,17 @@ Agent 显式返回 `MEDIA:<path>` 后：
 
 - 支持 HarmonyOS 6.1 / API 24，使用 ArkTS 和系统 `CoreSpeechKit`；
 - ASR/TTS 可分别选择鸿蒙离线能力或 Adapter 远端能力；
-- 本地 TTS 按短首段、长续段增量朗读，降低长回复的首句等待；
+- 本地 TTS 按短首段、长续段调用 CoreSpeech 系统播放器；远端 TTS 的 PCM 由通信 `AudioRenderer` 播放并以系统 `drain()` 确认真正播完；
 - Agent 回复支持单条重读和再次点击停止；重读不创建新会话或重复执行 Agent，并过滤代码、链接、文件路径和 `MEDIA:`；
 - Hermes 网关由 Adapter 每 25 秒下发应用层心跳；HarmonyOS 在收到首个心跳后启用 70 秒看门狗，自动重连时保留消息、语音输出开关和当前播放状态；
 - 麦克风持续监听，用户开口暂停当前播报，非停止指令完成后恢复播报并排队提交；
 - 精确整句“停止/stop”会中断任务与播放，并保留在对话上下文中；
-- 目标控制语义已收敛为“停止任务 / 关闭话筒 / 打开话筒 / 退出软件”：停止任务等价于 Hermes `/stop` 并清空排队任务；关闭话筒保持采集和ASR、只响应本地系统指令；退出软件释放本地音频与连接。当前 `1.2.1` 尚未实现这组新语义，详见音频用户旅程；
+- 目标控制语义已收敛为“停止任务 / 关闭话筒 / 打开话筒 / 退出软件”：停止任务等价于 Hermes `/stop` 并清空排队任务；关闭话筒保持采集和ASR、只响应本地系统指令；退出软件释放本地音频与连接。当前 `1.2.5` 尚未实现这组新语义，详见音频用户旅程；
 - 已有收到、思考呼吸、停止和错误四类提醒音；后续可靠性重构必须让提醒、新消息播报和历史重读进入同一输出仲裁，避免并发播放和破音；
 - 远端 ASR/TTS 意外断线后有界退避重连；ASR 保留短 PCM，并以约 1.8 秒停顿窗口合并连续 interim/final，TTS 保持待发帧顺序并先排空已收到的 PCM；
 - 纯符号 ASR final 在 Adapter 统一归一为空 final，HarmonyOS 使用相同的 Unicode 字母/数字规则防御性拦截，不创建 Hermes Prompt；
-- 使用录音/播放长时任务支持后台和息屏；当前 `1.2.1` 的录播模式切换已确认存在可靠性回退，正在收敛为同时声明录音与播放的单一持续任务，并以真实采集/播放健康而不是屏幕状态驱动恢复；实际持续时间仍受设备电源策略约束；
+- 后台任务按实际活动在专用 `AUDIO_PLAYBACK` 与 `AUDIO_RECORDING` 间切换：系统 TTS 排队或播放时优先保障播放，结束或用户开口后恢复录音；采集端仍按 Capturer 状态、中断和 PCM 心跳做三次有界恢复；
+- 输出设备默认由 HarmonyOS 通信路由管理，输出按钮任何时候都可打开系统原生通话设备面板供用户自由选择当前可用的耳机、听筒或扬声器；
 - 网关、Profile、语音后端、音色、语速和登录状态均持久化保存；
 - 历史按 20 条增量加载，恢复真实日期、模型、耗时、思考和工具过程；工具原始 JSON 不进入回复气泡或 TTS。
 
@@ -146,7 +147,7 @@ Agent 显式返回 `MEDIA:<path>` 后：
 | 语音输入 | Web：SeedASR-2.0 连续 PCM16/16k；HarmonyOS：CoreSpeechKit 离线识别或远端流式 ASR |
 | 语音输出 | Web：豆包流式 TTS + Edge fallback；HarmonyOS：系统离线 TTS 增量分段或远端 PCM24k |
 | 全双工 | Agent 思考/播报期间持续监听、真人语音暂停/恢复、补充排队 |
-| 控制 | 当前 `1.2.1`：精确“停止/stop”中断当前 turn；目标：停止任务 `/stop`、普通/仅系统指令路由、打开话筒和退出软件 |
+| 控制 | 当前 `1.2.5`：精确“停止/stop”中断当前 turn；目标：停止任务 `/stop`、普通/仅系统指令路由、打开话筒和退出软件 |
 | 审批 | HarmonyOS 对话气泡、文字/语音同意或取消、安全失败；Web 技术预览保留既有协议回归 |
 | 澄清 | HarmonyOS 将问题和编号选项放入对话，下一条回复直达 `clarify.respond` |
 | 文件 | MEDIA 图片预览、附件下载、短期令牌、历史附件恢复 |
@@ -270,7 +271,7 @@ hvigorw assembleHap --mode module -p product=default -p buildMode=debug
 ```bash
 python -m pytest -q -o 'addopts='
 node --check web_native/app.js
-node --test tests/voice_filters.test.js tests/media_speech_filter.test.js tests/mobile_ui.test.js
+node --test tests/audio_continuity.test.js tests/capture_recovery.test.js tests/voice_filters.test.js tests/media_speech_filter.test.js tests/mobile_ui.test.js
 node clients/harmony/scripts/verify.mjs
 ```
 
@@ -285,8 +286,8 @@ hvigorw assembleHap --mode module -p product=default -p buildMode=debug
 
 ```text
 Python：27 passed
-Node：19 passed
-HarmonyOS：28 个 ETS 文件静态校验通过，ArkTS/Hvigor 构建通过
+Node：27 passed
+HarmonyOS：32 个 ETS 文件静态校验通过，ArkTS/Hvigor 构建通过
 真机：网关登录、持续离线 ASR、增量离线 TTS、暂停/恢复、硬停止、后台任务、历史恢复已验证
 Native/HarmonyOS 专属代码：`app/native_main.py`、`app/artifacts.py`、`web_native/`、`clients/harmony/`
 桌面/移动端真实服务证据：见 `docs/NATIVE_TEST_MATRIX.md`
