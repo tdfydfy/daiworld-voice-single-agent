@@ -11,6 +11,7 @@ from app.native_main import (
     NativeSettings,
     create_native_app,
     has_semantic_content,
+    inject_session_profile,
     normalize_asr_transcript_frame,
 )
 
@@ -153,6 +154,20 @@ def test_agent_config_rejects_duplicate_ids_and_defaults(monkeypatch):
         NativeSettings()
 
 
+def test_hermes_token_file_takes_precedence_over_environment(monkeypatch, tmp_path):
+    token_file = tmp_path / "hermes.token"
+    token_file.write_text(
+        "HERMES_DASHBOARD_SESSION_TOKEN=dashboard-private-token\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "wrong-public-token")
+    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN_FILE", str(token_file))
+
+    settings = NativeSettings()
+
+    assert settings.hermes_token == "dashboard-private-token"
+
+
 def test_websocket_cookie_auth_and_transparent_relay(monkeypatch):
     upstream = FakeUpstream([json.dumps({"method": "event", "params": {"type": "gateway.ready"}})])
     seen = {}
@@ -240,8 +255,30 @@ def test_websocket_injects_voice_instructions_only_into_session_create(monkeypat
     sent = json.loads(upstream.sent[0])
     assert sent["params"] == {
         "cols": 100,
+        "profile": "writer",
         "instructions": "Keep the spoken answer short.",
     }
+
+
+@pytest.mark.parametrize("method", [
+    "session.create",
+    "session.list",
+    "session.resume",
+    "session.delete",
+])
+def test_profile_is_injected_into_profile_scoped_session_methods(method):
+    message = json.dumps({
+        "jsonrpc": "2.0",
+        "id": "1",
+        "method": method,
+        "params": {"limit": 20},
+    })
+
+    transformed = json.loads(inject_session_profile(message, "writer"))
+
+    assert transformed["params"]["profile"] == "writer"
+    assert transformed["params"]["limit"] == 20
+    assert inject_session_profile(message, "") == message
 
 
 def test_websocket_adds_configured_provider_label(monkeypatch):
@@ -354,6 +391,80 @@ class FakeHttpClient:
     async def post(self, url, **kwargs):
         self.requests.append(("POST", url, kwargs))
         return self.responses.pop(0) if self.responses else FakeResponse(502)
+
+
+def test_agent_catalog_fetches_once_then_only_refreshes_explicitly(monkeypatch):
+    monkeypatch.delenv("HERMES_AGENTS_JSON", raising=False)
+    monkeypatch.setenv("HERMES_GATEWAY_URL", "http://127.0.0.1:9120")
+    fake = FakeHttpClient([
+        FakeResponse(200, {
+            "profiles": ["default", "hexiaoma", "hexiaoxin", "new-profile"],
+        }),
+        FakeResponse(200, {
+            "profiles": ["default", "new-profile", "fifth"],
+        }),
+    ])
+    monkeypatch.setattr(native_main.httpx, "AsyncClient", lambda **kwargs: fake)
+    settings = NativeSettings()
+    settings.access_token = "voice-token"
+    settings.hermes_token = "hermes-token"
+    client = TestClient(create_native_app(settings))
+
+    first = client.get("/api/agents", headers={"X-Voice-Token": "voice-token"})
+    second = client.get("/api/agents", headers={"X-Voice-Token": "voice-token"})
+
+    assert first.status_code == 200
+    assert len(first.json()["agents"]) == 4
+    assert second.json() == first.json()
+    assert len(fake.requests) == 1
+    assert fake.requests[0] == (
+        "GET",
+        "http://127.0.0.1:9120/api/status",
+        {},
+    )
+    assert set(settings.backends.values()) == {"http://127.0.0.1:9120"}
+
+    refreshed = client.get(
+        "/api/agents?refresh=1",
+        headers={"X-Voice-Token": "voice-token"},
+    )
+
+    assert [agent["id"] for agent in refreshed.json()["agents"]] == [
+        "default", "new-profile", "fifth",
+    ]
+    assert len(fake.requests) == 2
+
+
+def test_agent_catalog_failure_keeps_cache_until_explicit_refresh(monkeypatch):
+    monkeypatch.delenv("HERMES_AGENTS_JSON", raising=False)
+    monkeypatch.setenv("HERMES_GATEWAY_URL", "http://127.0.0.1:9120")
+    fake = FakeHttpClient([
+        FakeResponse(503),
+        FakeResponse(200, {
+            "profiles": ["default", "recovered"],
+        }),
+    ])
+    monkeypatch.setattr(native_main.httpx, "AsyncClient", lambda **kwargs: fake)
+    settings = NativeSettings()
+    settings.access_token = "voice-token"
+    client = TestClient(create_native_app(settings))
+
+    fallback = client.get("/api/agents", headers={"X-Voice-Token": "voice-token"})
+    cached = client.get("/api/agents", headers={"X-Voice-Token": "voice-token"})
+
+    assert fallback.status_code == 200
+    assert cached.json() == fallback.json()
+    assert len(fake.requests) == 1
+    assert settings.catalog_error == "Hermes profile catalog HTTP 503"
+
+    recovered = client.get(
+        "/api/agents?refresh=true",
+        headers={"X-Voice-Token": "voice-token"},
+    )
+
+    assert [agent["id"] for agent in recovered.json()["agents"]] == ["default", "recovered"]
+    assert len(fake.requests) == 2
+    assert settings.catalog_error == ""
 
 
 def test_model_options_proxy_requires_voice_token_and_forwards_hermes_token(monkeypatch):

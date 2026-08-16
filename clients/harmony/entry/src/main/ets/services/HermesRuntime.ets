@@ -1,4 +1,5 @@
 import { BusinessError } from '@kit.BasicServicesKit';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import {
   AgentCatalog,
   ModelOptionInfo,
@@ -16,6 +17,8 @@ const GATEWAY_RECONNECT_DELAYS_MS: number[] = [500, 1500, 3000, 5000];
 const GATEWAY_RECONNECT_MAX_ATTEMPTS = 6;
 const GATEWAY_READY_TIMEOUT_MS = 10000;
 const MODEL_SWITCH_CONFIRM_TIMEOUT_MS = 10000;
+const RUNTIME_LOG_DOMAIN = 0xD004;
+const RUNTIME_LOG_TAG = 'HermesRuntime';
 
 export class HermesRuntimeCallbacks {
   private changedCallback: () => void;
@@ -88,6 +91,7 @@ export class HermesRuntime extends GatewayListener {
   private gatewayReconnectBlocked: boolean = false;
   private gatewayConnectGeneration: number = 0;
   private gatewayReadyTimeout?: number;
+  private agentCatalogSequence: number = 0;
 
   constructor(snapshot: SingleAgentSnapshot, callbacks: HermesRuntimeCallbacks) {
     super();
@@ -103,10 +107,88 @@ export class HermesRuntime extends GatewayListener {
     this.baseUrl = baseUrl;
     this.accessToken = accessToken;
     this.profile = profile;
+    if (accessToken.length === 0) {
+      this.snapshot.error = '请先保存访问口令';
+      this.callbacks.changed();
+      return;
+    }
+    if (this.agentCatalog.find(profile) === undefined) {
+      this.snapshot.agentsError = this.snapshot.agents.length > 0
+        ? '请选择可用 Agent' : '请先加载 Agent 目录';
+      this.snapshot.error = this.snapshot.agentsError;
+      this.callbacks.changed();
+      return;
+    }
     this.cancelGatewayReconnect();
     this.gatewayReconnectBlocked = false;
     const generation = ++this.gatewayConnectGeneration;
     await this.connectGateway(false, generation);
+  }
+
+  async prepareAgentCatalog(
+    baseUrl: string,
+    accessToken: string,
+    preferredProfile: string
+  ): Promise<boolean> {
+    this.baseUrl = baseUrl;
+    this.accessToken = accessToken;
+    this.profile = preferredProfile;
+    const sequence = ++this.agentCatalogSequence;
+    if (accessToken.length === 0) {
+      this.agentCatalog.agents = [];
+      this.snapshot.agents = [];
+      this.snapshot.agentsLoading = false;
+      this.snapshot.agentsError = '请先保存访问口令';
+      this.callbacks.changed();
+      return false;
+    }
+    this.snapshot.agentsLoading = true;
+    this.snapshot.agentsError = '';
+    this.callbacks.changed();
+    try {
+      const agents = await this.agentCatalogClient.fetch(baseUrl, accessToken);
+      if (sequence !== this.agentCatalogSequence) {
+        return false;
+      }
+      this.agentCatalog.agents = agents;
+      this.snapshot.agents = agents.slice();
+      this.snapshot.agentsLoading = false;
+      hilog.info(RUNTIME_LOG_DOMAIN, RUNTIME_LOG_TAG, 'Agent catalog loaded count=%{public}d', agents.length);
+      const fallback = this.agentCatalog.fallback();
+      if (fallback === undefined) {
+        this.snapshot.agentsError = '服务器暂未配置可用 Agent';
+        this.snapshot.error = this.snapshot.agentsError;
+        this.snapshot.statusTitle = '无可用 Agent';
+        this.snapshot.statusDetail = '';
+        this.callbacks.changed();
+        return false;
+      }
+      const selected = this.agentCatalog.find(preferredProfile);
+      if (selected === undefined) {
+        this.resetModelSelection();
+        this.profile = fallback.id;
+        this.snapshot.selectedProfile = fallback.id;
+        this.callbacks.profileSelected(fallback.id);
+      } else {
+        this.profile = selected.id;
+        this.snapshot.selectedProfile = selected.id;
+      }
+      this.snapshot.agentsError = '';
+      this.snapshot.error = '';
+      this.callbacks.changed();
+      return true;
+    } catch (error) {
+      if (sequence !== this.agentCatalogSequence) {
+        return false;
+      }
+      this.agentCatalog.agents = [];
+      this.snapshot.agents = [];
+      this.snapshot.agentsLoading = false;
+      this.snapshot.agentsError = this.errorMessage(error as BusinessError, 'Agent 目录加载失败');
+      this.snapshot.error = this.snapshot.agentsError;
+      this.callbacks.changed();
+      return false;
+    }
   }
 
   disconnect(): void {
@@ -361,8 +443,6 @@ export class HermesRuntime extends GatewayListener {
     this.snapshot.connection = 'connecting';
     this.snapshot.statusTitle = reconnecting ? '正在恢复连接' : '正在连接';
     this.snapshot.error = '';
-    this.snapshot.agentsLoading = true;
-    this.snapshot.agentsError = '';
     this.callbacks.changed();
     try {
       const authResult = await this.authenticate();
@@ -373,7 +453,6 @@ export class HermesRuntime extends GatewayListener {
       if (authResult.cookie.length === 0) {
         this.gatewayReconnectInFlight = false;
         this.snapshot.connection = 'offline';
-        this.snapshot.agentsLoading = false;
         this.snapshot.error = authResult.error.length > 0
           ? authResult.error : '鉴权失败，请检查网关地址和访问口令';
         if (authResult.unauthorized) {
@@ -388,14 +467,6 @@ export class HermesRuntime extends GatewayListener {
       }
       this.snapshot.credentialState = 'ready';
       this.snapshot.credentialError = '';
-      if (!await this.loadAgentCatalog(generation)) {
-        this.gatewayReconnectInFlight = false;
-        if (this.snapshot.agentsError.length > 0) {
-          this.scheduleGatewayReconnect(this.snapshot.error);
-          this.callbacks.changed();
-        }
-        return;
-      }
       if (!this.isActiveConnection(generation)) {
         this.gatewayReconnectInFlight = false;
         return;
@@ -405,7 +476,6 @@ export class HermesRuntime extends GatewayListener {
     } catch (error) {
       this.snapshot.connection = 'offline';
       this.snapshot.error = '连接失败';
-      this.snapshot.agentsLoading = false;
       this.gatewayReconnectInFlight = false;
       this.scheduleGatewayReconnect(this.snapshot.error);
       this.callbacks.changed();
@@ -418,48 +488,6 @@ export class HermesRuntime extends GatewayListener {
       this.cookie = result.cookie;
     }
     return result;
-  }
-
-  private async loadAgentCatalog(generation: number): Promise<boolean> {
-    try {
-      const agents = await this.agentCatalogClient.fetch(this.baseUrl, this.accessToken);
-      if (!this.isActiveConnection(generation)) {
-        return false;
-      }
-      this.agentCatalog.agents = agents;
-      this.snapshot.agents = agents.slice();
-      this.snapshot.agentsLoading = false;
-      this.snapshot.agentsError = '';
-      const selected = this.agentCatalog.find(this.profile);
-      const fallback = this.agentCatalog.fallback();
-      if (selected === undefined && fallback !== undefined) {
-        this.resetModelSelection();
-        this.profile = fallback.id;
-        this.snapshot.selectedProfile = fallback.id;
-        this.callbacks.profileSelected(fallback.id);
-      }
-      if (fallback === undefined) {
-        this.snapshot.connection = 'offline';
-        this.snapshot.error = '服务器暂未配置可用 Agent';
-        this.snapshot.statusTitle = '无可用 Agent';
-        this.snapshot.statusDetail = '';
-        this.callbacks.changed();
-        return false;
-      }
-      this.snapshot.error = '';
-      this.callbacks.changed();
-      return true;
-    } catch (error) {
-      if (!this.isActiveConnection(generation)) {
-        return false;
-      }
-      this.snapshot.agentsLoading = false;
-      this.snapshot.agentsError = 'Agent目录加载失败';
-      this.snapshot.connection = 'offline';
-      this.snapshot.error = this.errorMessage(error as BusinessError, 'Agent目录加载失败');
-      this.callbacks.changed();
-      return false;
-    }
   }
 
   private openGateway(): void {

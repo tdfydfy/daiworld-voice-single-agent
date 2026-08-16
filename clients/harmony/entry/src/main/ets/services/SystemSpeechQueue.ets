@@ -12,7 +12,6 @@ export class SystemSpeechQueue {
   private activeText: string = '';
   private pausedText: string = '';
   private queue: string[] = [];
-  private startedAt: number = 0;
   private pendingText: string = '';
   private receivedText: string = '';
   private firstChunkQueued: boolean = false;
@@ -51,11 +50,6 @@ export class SystemSpeechQueue {
 
   activate(text: string): void {
     this.activeText = text;
-    this.startedAt = 0;
-  }
-
-  markStarted(): void {
-    this.startedAt = Date.now();
   }
 
   active(): string {
@@ -81,19 +75,17 @@ export class SystemSpeechQueue {
 
   completeActive(): string {
     this.activeText = '';
-    this.startedAt = 0;
     return this.takeNext();
   }
 
-  pause(speechRate: number): void {
-    this.pausedText = this.remainingText(speechRate);
+  pause(_speechRate: number): void {
+    this.pausedText = this.activeText;
   }
 
   takeResumeText(): string {
     const remaining = this.pausedText;
     this.pausedText = '';
     this.activeText = '';
-    this.startedAt = 0;
     return remaining.length > 0 ? remaining : this.takeNext();
   }
 
@@ -105,7 +97,6 @@ export class SystemSpeechQueue {
     this.activeText = '';
     this.pausedText = '';
     this.queue = [];
-    this.startedAt = 0;
     this.beginStream();
   }
 
@@ -124,25 +115,6 @@ export class SystemSpeechQueue {
       }
     }
     return chunks;
-  }
-
-  private remainingText(speechRate: number): string {
-    const text = this.activeText;
-    if (text.length === 0 || this.startedAt <= 0) {
-      return text;
-    }
-    const elapsedSeconds = Math.max(0, Date.now() - this.startedAt) / 1000;
-    const estimatedIndex = Math.min(text.length, Math.floor(elapsedSeconds * 4.5 * speechRate));
-    if (estimatedIndex <= 1) {
-      return text;
-    }
-    const punctuation = '。！？；，,.!?;\n';
-    for (let index = estimatedIndex - 1; index >= 0; index -= 1) {
-      if (punctuation.includes(text[index])) {
-        return text.substring(index + 1).trim();
-      }
-    }
-    return text;
   }
 
   private trimLeading(text: string): string {

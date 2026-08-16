@@ -8,6 +8,8 @@ import {
   SingleAgentSnapshot
 } from '../models/SingleAgentState';
 
+const THINKING_ACTIVITY_MAX_CHARS = 180;
+
 export class ConversationStateCallbacks {
   private notifyCallback: () => void;
   private agentNameCallback: () => string;
@@ -113,6 +115,9 @@ export class ConversationState {
       if (text.length > 0 && message.firstTokenAt === 0) {
         message.firstTokenAt = Date.now();
       }
+      if (text.length > 0) {
+        this.completeTrailingProcessActivity(message);
+      }
       message.text += text;
       message.revision += 1;
       this.callbacks.notify();
@@ -167,6 +172,7 @@ export class ConversationState {
     const endedAt = Date.now();
     const activity = new MessageActivity();
     activity.id = 'error-' + String(message.activities.length);
+    activity.kind = 'error';
     activity.title = '执行失败';
     activity.detail = errorText;
     activity.state = 'error';
@@ -198,6 +204,7 @@ export class ConversationState {
     }
     const activity = new MessageActivity();
     activity.id = 'stopped-' + String(message.activities.length);
+    activity.kind = 'status';
     activity.title = '任务已停止';
     activity.detail = '已按用户要求停止当前任务';
     activity.state = 'completed';
@@ -237,6 +244,35 @@ export class ConversationState {
     const message = this.currentAssistantMessage();
     if (message && text.length > 0) {
       message.thinking += text;
+      let remaining = text;
+      while (remaining.length > 0) {
+        let activity: MessageActivity | undefined;
+        if (message.activities.length > 0) {
+          const lastActivity = message.activities[message.activities.length - 1];
+          if (lastActivity.kind === 'thinking' && lastActivity.state === 'running') {
+            activity = lastActivity;
+          }
+        }
+        if (!activity) {
+          activity = new MessageActivity();
+          activity.id = 'thinking-' + String(message.activities.length);
+          activity.kind = 'thinking';
+          activity.title = '思考';
+          activity.state = 'running';
+          message.activities.push(activity);
+        }
+        const capacity = THINKING_ACTIVITY_MAX_CHARS - activity.detail.length;
+        if (capacity <= 0) {
+          activity.state = 'completed';
+          continue;
+        }
+        const chunkLength = this.thinkingChunkLength(remaining, capacity);
+        activity.detail += remaining.substring(0, chunkLength);
+        remaining = remaining.substring(chunkLength);
+        if (remaining.length > 0) {
+          activity.state = 'completed';
+        }
+      }
       message.processExpanded = true;
       message.revision += 1;
     }
@@ -250,7 +286,7 @@ export class ConversationState {
     let previous: MessageActivity | undefined;
     if (message.activities.length > 0) {
       const lastActivity = message.activities[message.activities.length - 1];
-      if (lastActivity.id.startsWith('status-') && lastActivity.state === 'running') {
+      if (lastActivity.kind === 'status' && lastActivity.state === 'running') {
         previous = lastActivity;
       }
     }
@@ -258,8 +294,10 @@ export class ConversationState {
       if (previous) {
         previous.state = 'completed';
       }
+      this.completeTrailingProcessActivity(message);
       const activity = new MessageActivity();
       activity.id = 'status-' + String(message.activities.length);
+      activity.kind = 'status';
       activity.title = '状态';
       activity.detail = text;
       activity.state = 'running';
@@ -276,30 +314,36 @@ export class ConversationState {
     }
     const rawId = data !== undefined && data['tool_id'] !== undefined ? String(data['tool_id']) : name;
     const id = 'tool-' + rawId;
+    if (type === 'tool.start') {
+      this.completeTrailingProcessActivity(message);
+    }
     let activity = this.findActivity(message, id);
     if (!activity) {
       activity = new MessageActivity();
       activity.id = id;
-      activity.title = name;
+      activity.kind = 'tool';
+      activity.title = '调用 · ' + this.historyToolTitle(name);
       message.activities.push(activity);
     }
     if (type === 'tool.start') {
       const context = data !== undefined && data['context'] !== undefined
         ? String(data['context']) : data !== undefined && data['args_text'] !== undefined
           ? String(data['args_text']) : '';
-      activity.detail = context;
+      activity.detail = context.length > 0 ? '输入：' + this.activityExcerpt(context) : '已发起调用';
       activity.state = 'running';
       message.processExpanded = true;
     } else if (type === 'tool.progress') {
       const preview = data !== undefined && data['preview'] !== undefined ? String(data['preview']) : '';
       if (preview.length > 0) {
-        activity.detail = preview;
+        activity.detail = '进展：' + this.activityExcerpt(preview);
       }
       activity.state = 'running';
     } else {
       const summary = data !== undefined && data['summary'] !== undefined ? String(data['summary']) : '';
       const error = data !== undefined && data['error'] !== undefined ? String(data['error']) : '';
-      activity.detail = error.length > 0 ? error : summary;
+      activity.detail = error.length > 0
+        ? '失败：' + this.activityExcerpt(error)
+        : '结果：' + this.activityExcerpt(summary.length > 0 ? summary : '执行完成');
       activity.state = error.length > 0 ? 'error' : 'completed';
       if (data !== undefined && typeof data['duration_s'] === 'number') {
         activity.duration_s = data['duration_s'] as number;
@@ -472,7 +516,6 @@ export class ConversationState {
   restoreSessionMessages(messageItems: Object[], initialModel: string): void {
     this.clearMessages();
     let currentModel = initialModel;
-    let pendingThinking: string = '';
     let pendingActivities: MessageActivity[] = [];
     for (const item of messageItems) {
       const row = item as Record<string, Object>;
@@ -492,7 +535,7 @@ export class ConversationState {
         ? String(row['text']) : row['content'] !== undefined ? String(row['content']) : '';
       const artifacts = this.parseArtifacts(row['artifacts']);
       if (roleValue === 'assistant') {
-        pendingThinking = this.appendHistoryThinking(pendingThinking, row);
+        this.appendHistoryThinkingActivity(pendingActivities, row);
         this.restoreHistoryToolCalls(row, pendingActivities);
       }
       if (text.length === 0 && artifacts.length === 0) {
@@ -509,13 +552,11 @@ export class ConversationState {
       message.provider = this.callbacks.providerDisplay(row);
       message.timestamp = this.parseTimestamp(row['timestamp']);
       if (message.role === 'user') {
-        pendingThinking = '';
         pendingActivities = [];
       } else {
-        message.thinking = pendingThinking;
+        message.thinking = this.historyThinkingText(pendingActivities);
         message.activities = pendingActivities;
         message.processExpanded = false;
-        pendingThinking = '';
         pendingActivities = [];
       }
       this.snapshot.messages.push(message);
@@ -568,14 +609,28 @@ export class ConversationState {
     return metadata['model'] !== undefined ? String(metadata['model']) : fallback;
   }
 
-  private appendHistoryThinking(current: string, row: Record<string, Object>): string {
+  private appendHistoryThinkingActivity(activities: MessageActivity[], row: Record<string, Object>): void {
     const raw = row['reasoning_content'] !== undefined
       ? String(row['reasoning_content']) : row['reasoning'] !== undefined ? String(row['reasoning']) : '';
     const value = raw.trim();
-    if (value.length === 0 || current.includes(value)) {
-      return current;
+    if (value.length === 0) {
+      return;
     }
-    return current.length > 0 ? current + '\n\n' + value : value;
+    const lastActivity = activities.length > 0 ? activities[activities.length - 1] : undefined;
+    if (lastActivity !== undefined && lastActivity.kind === 'thinking' &&
+      lastActivity.state === 'completed') {
+      if (!lastActivity.detail.includes(value)) {
+        lastActivity.detail += (lastActivity.detail.length > 0 ? '\n\n' : '') + value;
+      }
+      return;
+    }
+    const activity = new MessageActivity();
+    activity.id = 'history-thinking-' + String(activities.length);
+    activity.kind = 'thinking';
+    activity.title = '思考';
+    activity.detail = value;
+    activity.state = 'completed';
+    activities.push(activity);
   }
 
   private restoreHistoryToolCalls(row: Record<string, Object>, activities: MessageActivity[]): void {
@@ -598,8 +653,12 @@ export class ConversationState {
       }
       const activity = new MessageActivity();
       activity.id = activityId;
-      activity.title = this.historyToolTitle(name);
-      activity.detail = '正在执行';
+      activity.kind = 'tool';
+      activity.title = '调用 · ' + this.historyToolTitle(name);
+      const rawArguments = toolFunction !== undefined ? toolFunction['arguments'] : undefined;
+      const argumentsText = rawArguments !== undefined ? String(rawArguments) : '';
+      activity.detail = argumentsText.length > 0
+        ? '输入：' + this.activityExcerpt(argumentsText) : '正在执行';
       activity.state = 'running';
       activities.push(activity);
     }
@@ -613,11 +672,14 @@ export class ConversationState {
     if (!activity) {
       activity = new MessageActivity();
       activity.id = activityId;
-      activity.title = this.historyToolTitle(name);
+      activity.kind = 'tool';
+      activity.title = '调用 · ' + this.historyToolTitle(name);
       activities.push(activity);
     }
     const result = this.historyToolResult(row['content']);
-    activity.detail = result.success ? this.historyToolSuccessText(name, result.message) : '执行失败';
+    activity.detail = result.success
+      ? '结果：' + this.historyToolSuccessText(name, result.message)
+      : '失败：' + (result.message.length > 0 ? this.activityExcerpt(result.message) : '执行失败');
     activity.state = result.success ? 'completed' : 'error';
   }
 
@@ -661,6 +723,57 @@ export class ConversationState {
       return normalized.includes('added') ? '已记录用户偏好' : '已更新用户偏好';
     }
     return '执行完成';
+  }
+
+  private historyThinkingText(activities: MessageActivity[]): string {
+    const parts: string[] = [];
+    for (const activity of activities) {
+      if (activity.kind === 'thinking' && activity.detail.length > 0) {
+        parts.push(activity.detail);
+      }
+    }
+    return parts.join('\n\n');
+  }
+
+  private activityExcerpt(value: string): string {
+    const normalized = value.replace(/\s+/g, ' ').trim();
+    if (normalized.length <= 240) {
+      return normalized;
+    }
+    return normalized.substring(0, 237) + '...';
+  }
+
+  private thinkingChunkLength(value: string, maxLength: number): number {
+    if (value.length <= maxLength) {
+      return value.length;
+    }
+    const boundaries = '。！？!?；;\n';
+    let boundary = -1;
+    for (let index = maxLength - 1; index >= 0; index -= 1) {
+      if (boundaries.includes(value[index])) {
+        boundary = index + 1;
+        break;
+      }
+    }
+    if (boundary >= 40) {
+      return boundary;
+    }
+    for (let index = maxLength - 1; index >= 40; index -= 1) {
+      if (/\s/.test(value[index])) {
+        return index + 1;
+      }
+    }
+    return maxLength;
+  }
+
+  private completeTrailingProcessActivity(message: ChatMessage): void {
+    if (message.activities.length === 0) {
+      return;
+    }
+    const activity = message.activities[message.activities.length - 1];
+    if ((activity.kind === 'thinking' || activity.kind === 'status') && activity.state === 'running') {
+      activity.state = 'completed';
+    }
   }
 
   private parseTimestamp(value: Object | undefined): number {

@@ -6,10 +6,12 @@ import { avSession } from '@kit.AVSessionKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { AudioOutputRoute } from '../models/SingleAgentState';
+import { RecoveryBudget } from './RecoveryBudget';
 
 const AUDIO_LOG_DOMAIN = 0xD002;
 const AUDIO_LOG_TAG = 'SingleAgentAudio';
 const AUDIO_SESSION_RECOVERY_DELAYS_MS: number[] = [100, 500, 1500];
+const AUDIO_SESSION_RECOVERY_WINDOW_MS = 60000;
 
 export type OutputRouteListener = (route: AudioOutputRoute, headsetAvailable: boolean) => void;
 export type AudioSessionRecoveryListener = () => void;
@@ -19,15 +21,19 @@ class CommunicationAudioSession {
   private activation?: Promise<void>;
   private deactivation?: Promise<void>;
   private speakerphoneEnabled: boolean = false;
-  private recoveryAttempt: number = 0;
+  private recoveryBudget: RecoveryBudget = new RecoveryBudget(
+    AUDIO_SESSION_RECOVERY_DELAYS_MS.length,
+    AUDIO_SESSION_RECOVERY_WINDOW_MS
+  );
   private recoveryTimer?: number;
+  private recoveryFailed: boolean = false;
   private listenerInstalled: boolean = false;
   private routingListenersInstalled: boolean = false;
   private outputRouteListener?: OutputRouteListener;
   private lastHeadsetAvailable?: boolean;
-  private recoveryListeners: AudioSessionRecoveryListener[] = [];
+  private listenerSerial: number = 0;
+  private recoveryListeners: Map<number, AudioSessionRecoveryListener> = new Map();
   private preferredOutputListener = (devices: audio.AudioDeviceDescriptors): void => {
-    this.speakerphoneEnabled = this.outputRoute(devices) === 'speaker';
     this.publishOutputRoute(devices);
   };
   private availableOutputListener = (_action: audio.DeviceChangeAction): void => {
@@ -48,6 +54,15 @@ class CommunicationAudioSession {
       event.reason,
       this.users
     );
+    if (event.reason === audio.AudioSessionDeactivatedReason.DEACTIVATED_TIMEOUT) {
+      hilog.info(
+        AUDIO_LOG_DOMAIN,
+        AUDIO_LOG_TAG,
+        'communication audio session timeout treated as normal expiry users=%{public}d',
+        this.users
+      );
+      return;
+    }
     if (this.users > 0) {
       this.scheduleRecovery();
     }
@@ -139,14 +154,23 @@ class CommunicationAudioSession {
     hilog.info(AUDIO_LOG_DOMAIN, AUDIO_LOG_TAG, 'native communication output picker opened');
   }
 
-  setOutputRouteListener(listener: OutputRouteListener): void {
+  setOutputRouteListener(listener?: OutputRouteListener): void {
     this.outputRouteListener = listener;
+    if (!listener) {
+      return;
+    }
     this.installRoutingListeners();
     this.publishOutputRoute();
   }
 
-  addRecoveryListener(listener: AudioSessionRecoveryListener): void {
-    this.recoveryListeners.push(listener);
+  addRecoveryListener(listener: AudioSessionRecoveryListener): number {
+    this.listenerSerial += 1;
+    this.recoveryListeners.set(this.listenerSerial, listener);
+    return this.listenerSerial;
+  }
+
+  removeRecoveryListener(listenerId: number): void {
+    this.recoveryListeners.delete(listenerId);
   }
 
   private installListener(): void {
@@ -248,7 +272,7 @@ class CommunicationAudioSession {
     }
     const headsetAvailable = this.hasHeadsetOutput(available);
     if (this.lastHeadsetAvailable === undefined || this.lastHeadsetAvailable !== headsetAvailable) {
-      this.speakerphoneEnabled = false;
+      this.speakerphoneEnabled = !headsetAvailable;
       this.lastHeadsetAvailable = headsetAvailable;
     }
     const speakerActive = this.speakerphoneEnabled;
@@ -343,33 +367,37 @@ class CommunicationAudioSession {
     if (this.users <= 0 || this.recoveryTimer !== undefined) {
       return;
     }
-    if (this.recoveryAttempt >= AUDIO_SESSION_RECOVERY_DELAYS_MS.length) {
+    const attempt = this.recoveryBudget.beginAttempt();
+    if (attempt <= 0) {
+      if (this.recoveryFailed) {
+        return;
+      }
+      this.recoveryFailed = true;
       hilog.error(
         AUDIO_LOG_DOMAIN,
         AUDIO_LOG_TAG,
         'communication audio session recovery exhausted users=%{public}d',
         this.users
       );
-      this.recoveryAttempt = 0;
       return;
     }
-    const delay = AUDIO_SESSION_RECOVERY_DELAYS_MS[this.recoveryAttempt];
-    this.recoveryAttempt += 1;
+    this.recoveryFailed = false;
+    const delay = AUDIO_SESSION_RECOVERY_DELAYS_MS[attempt - 1];
     this.recoveryTimer = setTimeout((): void => {
       this.recoveryTimer = undefined;
       if (this.users <= 0) {
-        this.recoveryAttempt = 0;
         return;
       }
       this.ensureActivated().then((): void => {
-        this.recoveryAttempt = 0;
+        this.recoveryBudget.reset();
+        this.recoveryFailed = false;
         hilog.info(
           AUDIO_LOG_DOMAIN,
           AUDIO_LOG_TAG,
           'communication audio session recovered users=%{public}d',
           this.users
         );
-        for (const listener of this.recoveryListeners) {
+        for (const listener of this.recoveryListeners.values()) {
           listener();
         }
       }).catch((error: BusinessError): void => {
@@ -389,7 +417,8 @@ class CommunicationAudioSession {
       clearTimeout(this.recoveryTimer);
       this.recoveryTimer = undefined;
     }
-    this.recoveryAttempt = 0;
+    this.recoveryBudget.reset();
+    this.recoveryFailed = false;
   }
 }
 
@@ -403,15 +432,20 @@ export function showCommunicationOutputPicker(context: common.UIAbilityContext):
   return COMMUNICATION_AUDIO_SESSION.showOutputPicker(context);
 }
 
-export function setCommunicationOutputRouteListener(listener: OutputRouteListener): void {
+export function setCommunicationOutputRouteListener(listener?: OutputRouteListener): void {
   COMMUNICATION_AUDIO_SESSION.setOutputRouteListener(listener);
 }
 
 export class CommunicationAudioSessionLease {
   private acquired: boolean = false;
+  private recoveryListener?: AudioSessionRecoveryListener;
+  private recoveryListenerId: number = 0;
 
-  addRecoveryListener(listener: AudioSessionRecoveryListener): void {
-    COMMUNICATION_AUDIO_SESSION.addRecoveryListener(listener);
+  setRecoveryListener(listener: AudioSessionRecoveryListener): void {
+    this.recoveryListener = listener;
+    if (this.acquired && this.recoveryListenerId === 0) {
+      this.recoveryListenerId = COMMUNICATION_AUDIO_SESSION.addRecoveryListener(listener);
+    }
   }
 
   async acquire(): Promise<void> {
@@ -420,6 +454,7 @@ export class CommunicationAudioSessionLease {
     }
     await COMMUNICATION_AUDIO_SESSION.acquire();
     this.acquired = true;
+    this.installListeners();
   }
 
   async release(): Promise<void> {
@@ -427,6 +462,20 @@ export class CommunicationAudioSessionLease {
       return;
     }
     this.acquired = false;
+    this.removeListeners();
     await COMMUNICATION_AUDIO_SESSION.release();
+  }
+
+  private installListeners(): void {
+    if (this.recoveryListener && this.recoveryListenerId === 0) {
+      this.recoveryListenerId = COMMUNICATION_AUDIO_SESSION.addRecoveryListener(this.recoveryListener);
+    }
+  }
+
+  private removeListeners(): void {
+    if (this.recoveryListenerId > 0) {
+      COMMUNICATION_AUDIO_SESSION.removeRecoveryListener(this.recoveryListenerId);
+      this.recoveryListenerId = 0;
+    }
   }
 }

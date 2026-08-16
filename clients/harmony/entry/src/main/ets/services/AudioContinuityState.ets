@@ -1,14 +1,37 @@
 export type BackgroundAudioIntent = 'none' | 'recording' | 'playback';
 export type AudioContinuityAction = 'none' | 'start' | 'stop';
 
+export class AudioDemand {
+  recording: boolean = false;
+  playback: boolean = false;
+
+  constructor(recording: boolean = false, playback: boolean = false) {
+    this.recording = recording;
+    this.playback = playback;
+  }
+}
+
+export class DedicatedModePolicy {
+  select(demand: AudioDemand): BackgroundAudioIntent {
+    if (demand.recording) {
+      return 'recording';
+    }
+    return demand.playback ? 'playback' : 'none';
+  }
+}
+
 export class AudioContinuityState {
+  demand: AudioDemand = new AudioDemand();
   desiredIntent: BackgroundAudioIntent = 'none';
   runningIntent: BackgroundAudioIntent = 'none';
   transitionIntent: BackgroundAudioIntent = 'none';
   phase: string = 'idle';
   generation: number = 0;
 
-  setDesiredIntent(intent: BackgroundAudioIntent): boolean {
+  setDemand(recording: boolean, playback: boolean): boolean {
+    this.demand.recording = recording;
+    this.demand.playback = playback;
+    const intent = new DedicatedModePolicy().select(this.demand);
     const changed = this.desiredIntent !== intent;
     this.desiredIntent = intent;
     return changed;
@@ -16,6 +39,10 @@ export class AudioContinuityState {
 
   isReady(intent: BackgroundAudioIntent): boolean {
     return this.phase === 'ready' && this.runningIntent === intent;
+  }
+
+  isDemandReady(): boolean {
+    return this.desiredIntent === 'none' ? this.isIdle() : this.isReady(this.desiredIntent);
   }
 
   isIdle(): boolean {

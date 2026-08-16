@@ -7,10 +7,13 @@ import { PcmPlayer } from './PcmPlayer';
 import { SpeechTextFilter } from './SpeechTextFilter';
 import { StreamingTtsClient, TtsJobListener } from './StreamingTtsClient';
 import { SystemSpeechQueue } from './SystemSpeechQueue';
-import { SystemSpeechService } from './SystemSpeechService';
+import { SystemTtsPlayer } from './SystemTtsPlayer';
+import { SystemTtsPlaybackEvent } from './SystemTtsCompletionGate';
+import { PlaybackKind, PlaybackPriority, SpeechPlaybackQueue } from './SpeechPlaybackQueue';
 
 const OUTPUT_LOG_DOMAIN = 0xD004;
 const OUTPUT_LOG_TAG = 'VoiceOutput';
+const SYSTEM_TTS_INTERRUPTION_RETRY_DELAYS_MS: number[] = [300, 1200];
 
 export class VoiceOutputCallbacks {
   private configCallback: () => ClientConfig;
@@ -18,6 +21,7 @@ export class VoiceOutputCallbacks {
   private backgroundStateCallback: () => void;
   private playbackReadyCallback: () => Promise<void>;
   private cancelRemoteReconnectCallback: () => void;
+  private remoteReadyCallback: () => void;
   private remoteDisconnectCallback: (message: string) => void;
   private remoteUrlCallback: () => string;
   private cookieCallback: () => string;
@@ -28,6 +32,7 @@ export class VoiceOutputCallbacks {
     backgroundStateCallback: () => void,
     playbackReadyCallback: () => Promise<void>,
     cancelRemoteReconnectCallback: () => void,
+    remoteReadyCallback: () => void,
     remoteDisconnectCallback: (message: string) => void,
     remoteUrlCallback: () => string,
     cookieCallback: () => string
@@ -37,6 +42,7 @@ export class VoiceOutputCallbacks {
     this.backgroundStateCallback = backgroundStateCallback;
     this.playbackReadyCallback = playbackReadyCallback;
     this.cancelRemoteReconnectCallback = cancelRemoteReconnectCallback;
+    this.remoteReadyCallback = remoteReadyCallback;
     this.remoteDisconnectCallback = remoteDisconnectCallback;
     this.remoteUrlCallback = remoteUrlCallback;
     this.cookieCallback = cookieCallback;
@@ -62,6 +68,10 @@ export class VoiceOutputCallbacks {
     this.cancelRemoteReconnectCallback();
   }
 
+  onRemoteReady(): void {
+    this.remoteReadyCallback();
+  }
+
   onRemoteDisconnect(message: string): void {
     this.remoteDisconnectCallback(message);
   }
@@ -77,38 +87,42 @@ export class VoiceOutputCallbacks {
 
 class CoordinatorTtsListener extends TtsJobListener {
   private coordinator: VoiceOutputCoordinator;
+  private epoch: number;
+  private jobId: string;
 
-  constructor(coordinator: VoiceOutputCoordinator) {
+  constructor(coordinator: VoiceOutputCoordinator, epoch: number, jobId: string) {
     super();
     this.coordinator = coordinator;
+    this.epoch = epoch;
+    this.jobId = jobId;
   }
 
   onReady(): void {
-    this.coordinator.onRemoteReady();
+    this.coordinator.onRemoteReady(this.epoch, this.jobId);
   }
 
   onJobStarted(sampleRate: number): void {
-    this.coordinator.onRemoteJobStarted(sampleRate);
+    this.coordinator.onRemoteJobStarted(this.epoch, this.jobId, sampleRate);
   }
 
   onJobPcm(pcm: ArrayBuffer): void {
-    this.coordinator.onRemoteJobPcm(pcm);
+    this.coordinator.onRemoteJobPcm(this.epoch, this.jobId, pcm);
   }
 
   onJobEnded(): void {
-    this.coordinator.onRemoteJobEnded();
+    this.coordinator.onRemoteJobEnded(this.epoch, this.jobId);
   }
 
   onJobFallback(): void {
-    this.coordinator.onRemoteJobFallback();
+    this.coordinator.onRemoteJobFallback(this.epoch, this.jobId);
   }
 
   onError(message: string): void {
-    this.coordinator.onRemoteError(message);
+    this.coordinator.onRemoteError(this.epoch, this.jobId, message);
   }
 
   onClosed(): void {
-    this.coordinator.onRemoteClosed();
+    this.coordinator.onRemoteClosed(this.epoch, this.jobId);
   }
 }
 
@@ -121,7 +135,11 @@ export class VoiceOutputCoordinator {
   private player: PcmPlayer = new PcmPlayer();
   private audioCues: AudioCuePlayer = new AudioCuePlayer();
   private systemSpeechQueue: SystemSpeechQueue = new SystemSpeechQueue();
-  private systemSpeech?: SystemSpeechService;
+  private systemTts?: SystemTtsPlayer;
+  private playbackQueue: SpeechPlaybackQueue = new SpeechPlaybackQueue();
+  private playbackEpoch: number = 0;
+  private activePlaybackJobId: string = '';
+  private activeCueJobId: string = '';
   private enabled: boolean = true;
   private pausedForUser: boolean = false;
   private ttsTextSent: string = '';
@@ -132,6 +150,10 @@ export class VoiceOutputCoordinator {
   private replayCleanupActive: boolean = false;
   private useSystemSpeech: boolean = false;
   private systemSpeechStartGeneration: number = 0;
+  private systemSpeechToken: string = '';
+  private systemSpeechRetryCount: number = 0;
+  private systemSpeechRetryTimer?: number;
+  private systemSpeechSuspended: boolean = false;
   private speechTextFilter: SpeechTextFilter = new SpeechTextFilter();
   private lastCueError: string = '';
   // Explicit Agent-turn boundary for the thinking pulse.  Do not infer the
@@ -140,18 +162,39 @@ export class VoiceOutputCoordinator {
   private agentTurnActive: boolean = false;
   private lastThinkingCueActive: boolean = false;
   private remoteTtsDrainPending: boolean = false;
+  private pendingErrorCue: boolean = false;
 
   constructor(snapshot: SingleAgentSnapshot, callbacks: VoiceOutputCallbacks) {
     this.snapshot = snapshot;
     this.callbacks = callbacks;
-    this.tts.setListener(new CoordinatorTtsListener(this));
+    this.playbackQueue.bindEpoch(this.playbackEpoch);
+    this.tts.setListener(new CoordinatorTtsListener(this, this.playbackEpoch, ''));
     this.audioCues.setStateListener((): void => {
+      if (this.activeCueJobId.length > 0 && !this.audioCues.isRunning()) {
+        this.completePlaybackJob(this.activeCueJobId);
+        this.activeCueJobId = '';
+      }
       this.callbacks.syncBackgroundState();
+    });
+    this.audioCues.setPlaybackReadyListener((): Promise<void> => {
+      return this.callbacks.ensurePlaybackReady();
+    });
+    this.player.setFailureListener((message: string): void => {
+      this.onPcmPlaybackFailure(message);
     });
   }
 
-  setSystemSpeech(systemSpeech: SystemSpeechService): void {
-    this.systemSpeech = systemSpeech;
+  setSystemTts(systemTts: SystemTtsPlayer): void {
+    this.systemTts = systemTts;
+  }
+
+  bindEpoch(epoch: number): void {
+    this.playbackEpoch = epoch;
+    this.playbackQueue.bindEpoch(epoch);
+    this.activePlaybackJobId = '';
+    this.activeCueJobId = '';
+    this.systemSpeechStartGeneration += 1;
+    this.systemSpeechToken = '';
   }
 
   isEnabled(): boolean {
@@ -192,13 +235,13 @@ export class VoiceOutputCoordinator {
   }
 
   connectRemote(url: string, cookie: string): void {
-    this.tts.setListener(new CoordinatorTtsListener(this));
+    this.tts.setListener(new CoordinatorTtsListener(this, this.playbackEpoch, this.activePlaybackJobId));
     this.tts.connect(url, cookie);
   }
 
   reconnectRemote(url: string, cookie: string): void {
-    this.tts.setListener(new CoordinatorTtsListener(this));
-    this.tts.reconnect(url, cookie);
+    this.tts.setListener(new CoordinatorTtsListener(this, this.playbackEpoch, this.activePlaybackJobId));
+    this.tts.connect(url, cookie);
   }
 
   closeRemote(): void {
@@ -334,21 +377,22 @@ export class VoiceOutputCoordinator {
     const speechDelta = suppliedSpeechText.length > 0
       ? SpeechTextFilter.clean(suppliedSpeechText)
       : this.speechTextFilter.push(text);
-    hilog.info(
-      OUTPUT_LOG_DOMAIN,
-      OUTPUT_LOG_TAG,
-      'assistant TTS delta length=%{public}d output=%{public}s muted=%{public}s system=%{public}s',
-      text.length,
-      String(this.enabled),
-      String(this.callbacks.config().muted),
-      String(this.useSystemSpeech)
-    );
     if (speechDelta.length === 0 || !this.enabled || this.callbacks.config().muted) {
       return;
     }
+    hilog.info(
+      OUTPUT_LOG_DOMAIN,
+      OUTPUT_LOG_TAG,
+      'assistant TTS speech delta length=%{public}d system=%{public}s',
+      speechDelta.length,
+      String(this.useSystemSpeech)
+    );
     if (this.useSystemSpeech) {
       this.appendSystemSpeechStream(speechDelta);
     } else {
+      if (!this.ensureAssistantPlaybackJob()) {
+        return;
+      }
       this.tts.sendText(speechDelta);
       this.ttsTextSent += speechDelta;
     }
@@ -380,9 +424,17 @@ export class VoiceOutputCoordinator {
       return;
     }
     if (finalText.length > 0 && this.ttsTextSent.length === 0) {
+      if (!this.ensureAssistantPlaybackJob()) {
+        this.callbacks.notify();
+        return;
+      }
       this.tts.sendText(speechText);
     }
-    this.tts.sendDone();
+    if (this.activePlaybackJobId.length > 0) {
+      this.tts.sendDone();
+    } else {
+      this.callbacks.notify();
+    }
   }
 
   speakProtocolPrompt(text: string): void {
@@ -390,13 +442,15 @@ export class VoiceOutputCoordinator {
     if (value.length === 0 || !this.enabled || this.callbacks.config().muted) {
       return;
     }
+    this.activePlaybackJobId = this.beginPlaybackJob('protocol', 20, value);
+    if (this.activePlaybackJobId.length === 0) {
+      return;
+    }
     if (this.useSystemSpeech) {
       this.speakWithSystem(value);
       return;
     }
-    if (!this.tts.isConnected() && !this.tts.isConnecting()) {
-      this.tts.reconnect(this.callbacks.remoteUrl(), this.callbacks.cookie());
-    }
+    this.openRemoteForActiveJob();
     this.tts.sendText(value);
     this.tts.sendDone();
   }
@@ -405,9 +459,10 @@ export class VoiceOutputCoordinator {
     this.agentTurnActive = false;
     this.pausedForUser = false;
     this.tts.sendStop();
-    this.systemSpeech?.stopSpeaking();
+    this.systemTts?.stop();
     this.player.stop().catch(() => undefined);
     this.clearSystemSpeechQueue();
+    this.cancelPlaybackJobs();
     this.snapshot.playback = 'none';
     this.snapshot.ttsState = this.enabled ? 'ready' : 'stopped';
   }
@@ -429,7 +484,7 @@ export class VoiceOutputCoordinator {
     if (this.useSystemSpeech) {
       this.systemSpeechQueue.pause(this.callbacks.config().speechRate);
       this.systemSpeechStartGeneration += 1;
-      this.systemSpeech?.stopSpeaking();
+      this.systemTts?.stop();
     } else {
       this.player.pause().catch(() => undefined);
     }
@@ -466,37 +521,61 @@ export class VoiceOutputCoordinator {
     this.callbacks.cancelRemoteReconnect();
     this.agentTurnActive = false;
     this.tts.sendStop();
-    this.systemSpeech?.stopSpeaking();
+    this.systemTts?.stop();
     this.player.stop().catch(() => undefined);
     this.clearSystemSpeechQueue();
+    this.cancelPlaybackJobs();
+    this.audioCues.silence();
     this.snapshot.playback = 'none';
   }
 
-  stopForConversationChange(): void {
+  async stopForConversationChange(): Promise<void> {
     this.agentTurnActive = false;
     this.pausedForUser = false;
-    this.tts.sendStop();
-    this.systemSpeech?.stopSpeaking();
-    this.player.stop().catch(() => undefined);
+    this.callbacks.cancelRemoteReconnect();
+    this.tts.close();
+    const systemStop = this.systemTts?.stop() ?? Promise.resolve();
+    const cueStop = this.audioCues.dispose();
     this.clearSystemSpeechQueue();
+    this.cancelPlaybackJobs();
+    await Promise.all([
+      cueStop.catch(() => undefined),
+      systemStop.catch(() => undefined),
+      this.player.stop().catch(() => undefined)
+    ]);
+    this.snapshot.playback = 'none';
+    this.snapshot.ttsState = this.enabled ? 'ready' : 'stopped';
   }
 
-  stopForInterrupt(): void {
+  async stopForInterrupt(): Promise<void> {
     this.agentTurnActive = false;
     this.pausedForUser = false;
-    this.tts.sendStop();
-    this.systemSpeech?.stopSpeaking();
-    this.player.stop().catch(() => undefined);
+    this.callbacks.cancelRemoteReconnect();
+    this.tts.close();
+    const systemStop = this.systemTts?.stop() ?? Promise.resolve();
+    const cueStop = this.audioCues.dispose();
     this.clearSystemSpeechQueue();
+    this.cancelPlaybackJobs();
     this.snapshot.playback = 'none';
+    await Promise.all([
+      cueStop.catch(() => undefined),
+      systemStop.catch(() => undefined),
+      this.player.stop().catch(() => undefined)
+    ]);
+    if (!this.useSystemSpeech && this.enabled && !this.callbacks.config().muted) {
+      this.tts.setListener(new CoordinatorTtsListener(this, this.playbackEpoch, ''));
+      this.tts.connect(this.callbacks.remoteUrl(), this.callbacks.cookie());
+    }
   }
 
   stopForVoiceClientRestart(): void {
     this.agentTurnActive = false;
     this.tts.sendStop();
-    this.systemSpeech?.stopSpeaking();
+    this.systemTts?.stop();
     this.player.stop().catch(() => undefined);
+    this.audioCues.silence();
     this.clearSystemSpeechQueue();
+    this.cancelPlaybackJobs();
   }
 
   disable(): void {
@@ -507,9 +586,30 @@ export class VoiceOutputCoordinator {
     this.pausedForUser = false;
     this.snapshot.ttsState = 'stopped';
     this.clearSystemSpeechQueue();
+    this.cancelPlaybackJobs();
     this.tts.sendStop();
-    this.systemSpeech?.stopSpeaking();
+    this.systemTts?.stop();
     this.player.stop().catch(() => undefined);
+  }
+
+  async dispose(): Promise<void> {
+    this.enabled = false;
+    this.agentTurnActive = false;
+    this.pausedForUser = false;
+    this.pendingErrorCue = false;
+    this.callbacks.cancelRemoteReconnect();
+    this.tts.close();
+    this.clearSystemSpeechQueue();
+    this.cancelPlaybackJobs();
+    const systemStop = this.systemTts?.stop() ?? Promise.resolve();
+    await Promise.all([
+      this.audioCues.dispose().catch(() => undefined),
+      systemStop.catch(() => undefined),
+      this.player.dispose().catch(() => undefined)
+    ]);
+    this.snapshot.playback = 'none';
+    this.snapshot.ttsState = 'stopped';
+    this.callbacks.syncBackgroundState();
   }
 
   prepareInterruptCue(): boolean {
@@ -519,10 +619,24 @@ export class VoiceOutputCoordinator {
   }
 
   playAcceptedCue(): void {
+    const jobId = this.beginPlaybackJob('cue', 10, '', 'accepted', true);
+    if (jobId.length === 0) {
+      return;
+    }
+    if (this.hasSpeechPlayback()) {
+      this.completePlaybackJob(jobId);
+      return;
+    }
+    this.activeCueJobId = jobId;
     this.audioCues.playAccepted();
   }
 
   playStopCue(): void {
+    const jobId = this.beginPlaybackJob('cue', 40, '', 'stop');
+    if (jobId.length === 0) {
+      return;
+    }
+    this.activeCueJobId = jobId;
     this.audioCues.playStop();
   }
 
@@ -531,10 +645,15 @@ export class VoiceOutputCoordinator {
     const cueEnabled = this.enabled && !this.callbacks.config().muted;
     const newError = error.length > 0 && error !== this.lastCueError;
     this.lastCueError = error;
+    if (cueEnabled && newError) {
+      this.pendingErrorCue = true;
+    }
+    const activeJob = this.playbackQueue.activeJob();
+    const thinkingOwnsQueue = activeJob?.kind === 'cue' && activeJob.cue === 'thinking';
     const running = cueEnabled && error.length === 0 && this.agentTurnActive && this.snapshot.agentBusy &&
       !this.snapshot.asrUtteranceActive && this.snapshot.playback === 'none' &&
       this.snapshot.ttsState !== 'speaking' && !this.snapshot.approvalPending &&
-      !this.snapshot.clarifyPending;
+      !this.snapshot.clarifyPending && (!this.playbackQueue.hasOutput() || thinkingOwnsQueue);
     if (running !== this.lastThinkingCueActive) {
       hilog.info(
         OUTPUT_LOG_DOMAIN,
@@ -547,16 +666,28 @@ export class VoiceOutputCoordinator {
         this.snapshot.ttsState
       );
       this.lastThinkingCueActive = running;
+      if (running) {
+        const thinkingJobId = this.beginPlaybackJob('cue', 10, '', 'thinking', true);
+        if (thinkingJobId.length > 0) {
+          this.activeCueJobId = thinkingJobId;
+        }
+      }
     }
     this.audioCues.setRunning(running);
-    if (cueEnabled && newError) {
-      this.audioCues.playError();
+    if (cueEnabled && this.pendingErrorCue && !this.hasSpeechPlayback()) {
+      this.pendingErrorCue = false;
+      const errorJobId = this.beginPlaybackJob('cue', 40, '', 'error');
+      if (errorJobId.length > 0) {
+        this.activeCueJobId = errorJobId;
+        this.audioCues.playError();
+      }
     }
   }
 
   hasBackgroundOutput(): boolean {
     return this.audioCues.isRunning() || this.snapshot.playback !== 'none' ||
-      this.snapshot.ttsState === 'speaking' || this.systemSpeechQueue.hasPendingOutput();
+      this.snapshot.ttsState === 'speaking' || this.systemSpeechQueue.hasPendingOutput() ||
+      this.playbackQueue.hasOutput();
   }
 
   prefersBackgroundPlayback(): boolean {
@@ -567,17 +698,27 @@ export class VoiceOutputCoordinator {
       this.snapshot.ttsState === 'speaking';
   }
 
-  onSystemSpeechState(active: boolean): void {
+  hasActivePlaybackJob(): boolean {
+    return this.activePlaybackJobId.length > 0;
+  }
+
+  private hasSpeechPlayback(): boolean {
+    return this.snapshot.playback !== 'none' || this.snapshot.ttsState === 'speaking' ||
+      this.systemSpeechQueue.hasPendingOutput();
+  }
+
+  onSystemSpeechState(token: string, event: SystemTtsPlaybackEvent): void {
     hilog.info(
       OUTPUT_LOG_DOMAIN,
       OUTPUT_LOG_TAG,
-      'system TTS state active=%{public}s output=%{public}s paused=%{public}s queue=%{public}d',
-      String(active),
+      'system TTS state event=%{public}s output=%{public}s paused=%{public}s queue=%{public}d',
+      event,
       String(this.enabled),
       String(this.pausedForUser),
       this.systemSpeechQueue.queuedCount()
     );
-    if (!this.useSystemSpeech || this.replayCleanupActive) {
+    if (!this.useSystemSpeech || this.replayCleanupActive || token.length === 0 ||
+      token !== this.systemSpeechToken) {
       return;
     }
     if (!this.enabled) {
@@ -586,27 +727,33 @@ export class VoiceOutputCoordinator {
       this.clearActiveReplayState();
       return;
     }
-    if (!active && this.activeReplayMessageId.length > 0 && this.replayAwaitingSystemStart) {
-      this.snapshot.ttsState = 'connecting';
-      this.snapshot.playback = 'queued';
-      this.callbacks.notify();
-      return;
-    }
-    if (active && this.pausedForUser) {
-      this.systemSpeech?.stopSpeaking();
+    if (event === 'started' && this.pausedForUser) {
+      this.systemTts?.stop();
       this.snapshot.ttsState = 'ready';
       this.snapshot.playback = 'paused_for_user';
       this.callbacks.notify();
       return;
     }
-    if (active) {
+    if (event === 'started') {
       this.replayAwaitingSystemStart = false;
-      this.systemSpeechQueue.markStarted();
       this.snapshot.ttsState = 'speaking';
       this.snapshot.playback = 'playing';
       this.callbacks.notify();
       return;
     }
+    if (event === 'interrupted') {
+      if (this.pausedForUser) {
+        this.snapshot.ttsState = 'ready';
+        this.snapshot.playback = 'paused_for_user';
+        this.callbacks.notify();
+        return;
+      }
+      this.scheduleSystemSpeechRetry(token);
+      return;
+    }
+    this.cancelSystemSpeechRetry();
+    this.systemSpeechRetryCount = 0;
+    this.systemSpeechSuspended = false;
     this.snapshot.ttsState = 'ready';
     if (this.pausedForUser) {
       this.snapshot.playback = 'paused_for_user';
@@ -617,20 +764,26 @@ export class VoiceOutputCoordinator {
     if (next.length > 0) {
       this.startSystemSpeech(next);
     } else {
+      const completedJobId = this.activePlaybackJobId;
+      this.systemSpeechToken = '';
       this.snapshot.playback = 'none';
       if (this.activeReplayMessageId.length > 0) {
         this.clearActiveReplayState();
         this.snapshot.statusDetail = '';
       }
+      this.completePlaybackJob(completedJobId);
       this.callbacks.notify();
     }
   }
 
-  onSystemSpeechError(message: string): void {
-    if (!this.useSystemSpeech || this.replayCleanupActive) {
+  onSystemSpeechError(token: string, message: string): void {
+    if (!this.useSystemSpeech || this.replayCleanupActive || token.length === 0 ||
+      token !== this.systemSpeechToken) {
       return;
     }
     this.clearSystemSpeechQueue();
+    this.completePlaybackJob(this.activePlaybackJobId);
+    this.systemSpeechToken = '';
     this.snapshot.ttsState = 'error';
     this.snapshot.playback = 'none';
     this.snapshot.statusDetail = '本地 TTS 已停止';
@@ -638,18 +791,40 @@ export class VoiceOutputCoordinator {
     this.callbacks.notify();
   }
 
-  onRemoteReady(): void {
-    if (this.replayCleanupActive) {
+  resumeSuspendedSystemSpeech(): void {
+    if (!this.systemSpeechSuspended || !this.useSystemSpeech || !this.enabled ||
+      this.pausedForUser || this.callbacks.config().muted) {
       return;
     }
-    this.callbacks.cancelRemoteReconnect();
+    const text = this.systemSpeechQueue.active();
+    if (text.length === 0) {
+      this.systemSpeechSuspended = false;
+      return;
+    }
+    hilog.info(
+      OUTPUT_LOG_DOMAIN,
+      OUTPUT_LOG_TAG,
+      'system TTS resuming suspended segment length=%{public}d',
+      text.length
+    );
+    this.systemSpeechSuspended = false;
+    this.systemSpeechRetryCount = 0;
+    this.snapshot.statusDetail = '';
+    this.startSystemSpeech(text);
+  }
+
+  onRemoteReady(epoch: number, jobId: string): void {
+    if (!this.isRemoteEventCurrent(epoch, jobId) || this.replayCleanupActive) {
+      return;
+    }
+    this.callbacks.onRemoteReady();
     this.snapshot.ttsState = 'ready';
     this.snapshot.error = '';
     this.callbacks.notify();
   }
 
-  onRemoteJobStarted(sampleRate: number): void {
-    if (this.replayCleanupActive) {
+  onRemoteJobStarted(epoch: number, jobId: string, sampleRate: number): void {
+    if (!this.isRemoteEventCurrent(epoch, jobId) || this.replayCleanupActive) {
       return;
     }
     this.player.setSampleRate(sampleRate);
@@ -664,14 +839,14 @@ export class VoiceOutputCoordinator {
     this.callbacks.notify();
   }
 
-  onRemoteJobPcm(pcm: ArrayBuffer): void {
-    if (!this.replayCleanupActive) {
+  onRemoteJobPcm(epoch: number, jobId: string, pcm: ArrayBuffer): void {
+    if (this.isRemoteEventCurrent(epoch, jobId) && !this.replayCleanupActive) {
       this.player.enqueue(pcm);
     }
   }
 
-  onRemoteJobEnded(): void {
-    if (this.replayCleanupActive) {
+  onRemoteJobEnded(epoch: number, jobId: string): void {
+    if (!this.isRemoteEventCurrent(epoch, jobId) || this.replayCleanupActive) {
       return;
     }
     this.player.waitForDrain((): void => {
@@ -681,24 +856,28 @@ export class VoiceOutputCoordinator {
         this.clearActiveReplayState();
         this.snapshot.statusDetail = '';
       }
+      this.completePlaybackJob(jobId);
       this.callbacks.notify();
     });
   }
 
-  onRemoteJobFallback(): void {
+  onRemoteJobFallback(epoch: number, jobId: string): void {
+    if (!this.isRemoteEventCurrent(epoch, jobId)) {
+      return;
+    }
     this.snapshot.ttsState = 'fallback';
     this.snapshot.statusDetail = 'TTS已降级';
     this.callbacks.notify();
   }
 
-  onRemoteError(message: string): void {
-    if (!this.replayCleanupActive) {
+  onRemoteError(epoch: number, jobId: string, message: string): void {
+    if (this.isRemoteEventCurrent(epoch, jobId) && !this.replayCleanupActive) {
       this.callbacks.onRemoteDisconnect(message.length > 0 ? message : 'TTS 连接失败');
     }
   }
 
-  onRemoteClosed(): void {
-    if (!this.replayCleanupActive) {
+  onRemoteClosed(epoch: number, jobId: string): void {
+    if (this.isRemoteEventCurrent(epoch, jobId) && !this.replayCleanupActive) {
       this.callbacks.onRemoteDisconnect('TTS 连接已断开');
     }
   }
@@ -714,6 +893,7 @@ export class VoiceOutputCoordinator {
       if (this.activeReplayMessageId.length > 0) {
         this.clearActiveReplayState();
       }
+      this.completePlaybackJob(this.activePlaybackJobId);
       this.callbacks.notify();
     });
   }
@@ -722,11 +902,12 @@ export class VoiceOutputCoordinator {
     this.pausedForUser = false;
     this.replayCleanupActive = true;
     this.callbacks.cancelRemoteReconnect();
+    this.cancelPlaybackJobs();
     this.clearSystemSpeechQueue(false);
     this.snapshot.playback = 'none';
     this.snapshot.ttsState = this.enabled ? 'ready' : 'stopped';
     if (this.useSystemSpeech) {
-      const cleanup = this.systemSpeech?.stopSpeaking() ?? Promise.resolve();
+      const cleanup = this.systemTts?.stop() ?? Promise.resolve();
       this.replayCleanup = cleanup;
       return cleanup;
     }
@@ -751,6 +932,12 @@ export class VoiceOutputCoordinator {
       }
       return;
     }
+    this.activePlaybackJobId = this.beginPlaybackJob('replay', 20, text);
+    if (this.activePlaybackJobId.length === 0) {
+      this.replayCleanupActive = false;
+      this.clearActiveReplayState();
+      return;
+    }
     if (this.useSystemSpeech) {
       this.replayCleanupActive = false;
       this.replayAwaitingSystemStart = true;
@@ -762,14 +949,22 @@ export class VoiceOutputCoordinator {
     this.callbacks.cancelRemoteReconnect();
     this.tts.close();
     this.replayCleanupActive = false;
-    this.tts.setListener(new CoordinatorTtsListener(this));
+    this.tts.setListener(new CoordinatorTtsListener(
+      this,
+      this.playbackEpoch,
+      this.activePlaybackJobId
+    ));
     this.tts.connect(this.callbacks.remoteUrl(), this.callbacks.cookie());
     this.tts.sendText(text);
     this.tts.sendDone();
   }
 
   private clearSystemSpeechQueue(clearReplayState: boolean = true): void {
+    this.cancelSystemSpeechRetry();
+    this.systemSpeechRetryCount = 0;
+    this.systemSpeechSuspended = false;
     this.systemSpeechStartGeneration += 1;
+    this.systemSpeechToken = '';
     this.systemSpeechQueue.clear();
     if (clearReplayState) {
       this.clearActiveReplayState();
@@ -798,12 +993,20 @@ export class VoiceOutputCoordinator {
       finalText.length,
       this.systemSpeechQueue.receivedLength()
     );
-    this.speakSystemChunks(this.systemSpeechQueue.finishStream(finalText));
+    const chunks = this.systemSpeechQueue.finishStream(finalText);
+    this.speakSystemChunks(chunks);
+    if (chunks.length === 0 && !this.systemSpeechQueue.hasPendingOutput()) {
+      this.completePlaybackJob(this.activePlaybackJobId);
+      this.snapshot.playback = 'none';
+      this.snapshot.ttsState = this.enabled ? 'ready' : 'stopped';
+      this.callbacks.notify();
+    }
   }
 
   private startSystemReplay(text: string): void {
     const chunks = this.systemSpeechQueue.finishStream(text);
     if (chunks.length === 0) {
+      this.completePlaybackJob(this.activePlaybackJobId);
       this.clearActiveReplayState();
       this.snapshot.playback = 'none';
       this.snapshot.ttsState = this.enabled ? 'ready' : 'stopped';
@@ -831,7 +1034,7 @@ export class VoiceOutputCoordinator {
 
   private speakWithSystem(text: string): void {
     const value = text.trim();
-    if (value.length === 0 || !this.systemSpeech) {
+    if (value.length === 0 || !this.systemTts) {
       return;
     }
     if (this.systemSpeechQueue.hasActive() || this.pausedForUser ||
@@ -856,11 +1059,17 @@ export class VoiceOutputCoordinator {
   }
 
   private startSystemSpeech(text: string): void {
-    const speech = this.systemSpeech;
+    const speech = this.systemTts;
     if (!speech || text.length === 0) {
       return;
     }
+    if (!this.ensureAssistantPlaybackJob()) {
+      return;
+    }
     const generation = ++this.systemSpeechStartGeneration;
+    const jobId = this.activePlaybackJobId;
+    const token = `${this.playbackEpoch}:${jobId}:${generation}`;
+    this.systemSpeechToken = token;
     this.systemSpeechQueue.activate(text);
     this.snapshot.playback = 'queued';
     this.snapshot.ttsState = 'connecting';
@@ -885,12 +1094,14 @@ export class VoiceOutputCoordinator {
         return;
       }
       const latestConfig = this.callbacks.config();
-      speech.speak(text, latestConfig.voicePerson, latestConfig.speechRate).catch((error: BusinessError) => {
+      speech.speak(text, latestConfig.voicePerson, latestConfig.speechRate, token).catch((error: BusinessError) => {
         if (generation !== this.systemSpeechStartGeneration) {
           this.callbacks.syncBackgroundState();
           return;
         }
         this.clearSystemSpeechQueue();
+        this.completePlaybackJob(jobId);
+        this.systemSpeechToken = '';
         this.snapshot.ttsState = 'error';
         this.snapshot.playback = 'none';
         this.snapshot.statusDetail = '本地 TTS 启动失败';
@@ -903,6 +1114,8 @@ export class VoiceOutputCoordinator {
         return;
       }
       this.clearSystemSpeechQueue();
+      this.completePlaybackJob(jobId);
+      this.systemSpeechToken = '';
       this.snapshot.ttsState = 'error';
       this.snapshot.playback = 'none';
       this.snapshot.statusDetail = '本地 TTS 输出准备失败';
@@ -916,6 +1129,155 @@ export class VoiceOutputCoordinator {
     return generation === this.systemSpeechStartGeneration && this.useSystemSpeech &&
       this.enabled && !config.muted && !this.pausedForUser &&
       this.systemSpeechQueue.active() === text;
+  }
+
+  private scheduleSystemSpeechRetry(token: string): void {
+    if (token !== this.systemSpeechToken || this.systemSpeechRetryTimer !== undefined) {
+      return;
+    }
+    const text = this.systemSpeechQueue.active();
+    if (text.length === 0) {
+      return;
+    }
+    if (this.systemSpeechRetryCount >= SYSTEM_TTS_INTERRUPTION_RETRY_DELAYS_MS.length) {
+      this.systemSpeechSuspended = true;
+      this.snapshot.ttsState = 'ready';
+      this.snapshot.playback = 'queued';
+      this.snapshot.statusDetail = '系统暂停了本地播报，回到应用后继续';
+      this.callbacks.syncBackgroundState();
+      this.callbacks.notify();
+      hilog.warn(
+        OUTPUT_LOG_DOMAIN,
+        OUTPUT_LOG_TAG,
+        'system TTS segment suspended after interruptions length=%{public}d attempts=%{public}d',
+        text.length,
+        this.systemSpeechRetryCount
+      );
+      return;
+    }
+    const delay = SYSTEM_TTS_INTERRUPTION_RETRY_DELAYS_MS[this.systemSpeechRetryCount];
+    this.systemSpeechRetryCount += 1;
+    this.snapshot.ttsState = 'connecting';
+    this.snapshot.playback = 'queued';
+    this.callbacks.notify();
+    hilog.warn(
+      OUTPUT_LOG_DOMAIN,
+      OUTPUT_LOG_TAG,
+      'system TTS interrupted; retaining segment length=%{public}d retry=%{public}d delayMs=%{public}d',
+      text.length,
+      this.systemSpeechRetryCount,
+      delay
+    );
+    this.systemSpeechRetryTimer = setTimeout((): void => {
+      this.systemSpeechRetryTimer = undefined;
+      if (token !== this.systemSpeechToken || this.pausedForUser || !this.enabled ||
+        !this.useSystemSpeech || this.systemSpeechQueue.active() !== text) {
+        return;
+      }
+      this.startSystemSpeech(text);
+    }, delay);
+  }
+
+  private cancelSystemSpeechRetry(): void {
+    if (this.systemSpeechRetryTimer !== undefined) {
+      clearTimeout(this.systemSpeechRetryTimer);
+      this.systemSpeechRetryTimer = undefined;
+    }
+  }
+
+  private beginPlaybackJob(
+    kind: PlaybackKind,
+    priority: PlaybackPriority,
+    text: string = '',
+    cue: string = '',
+    skippable: boolean = false
+  ): string {
+    const jobId = this.playbackQueue.enqueue(
+      this.playbackEpoch,
+      kind,
+      priority,
+      text,
+      cue,
+      skippable
+    );
+    const active = this.playbackQueue.activeJob();
+    return active !== undefined && active.id === jobId ? jobId : '';
+  }
+
+  private ensureAssistantPlaybackJob(): boolean {
+    if (this.activePlaybackJobId.length > 0 &&
+      this.playbackQueue.isActive(this.playbackEpoch, this.activePlaybackJobId)) {
+      return true;
+    }
+    this.audioCues.silence();
+    const jobId = this.beginPlaybackJob('assistant', 20);
+    if (jobId.length === 0) {
+      return false;
+    }
+    this.activePlaybackJobId = jobId;
+    if (!this.useSystemSpeech) {
+      this.openRemoteForActiveJob();
+    }
+    return true;
+  }
+
+  private completePlaybackJob(jobId: string): void {
+    if (jobId.length === 0) {
+      return;
+    }
+    this.playbackQueue.complete(this.playbackEpoch, jobId);
+    if (this.activePlaybackJobId === jobId) {
+      this.activePlaybackJobId = '';
+    }
+  }
+
+  private cancelPlaybackJobs(): void {
+    this.playbackQueue.cancelAll(this.playbackEpoch);
+    this.activePlaybackJobId = '';
+    this.activeCueJobId = '';
+  }
+
+  private openRemoteForActiveJob(): void {
+    if (this.activePlaybackJobId.length === 0) {
+      return;
+    }
+    this.callbacks.cancelRemoteReconnect();
+    this.tts.close();
+    this.tts.setListener(new CoordinatorTtsListener(
+      this,
+      this.playbackEpoch,
+      this.activePlaybackJobId
+    ));
+    this.tts.connect(this.callbacks.remoteUrl(), this.callbacks.cookie());
+  }
+
+  private isRemoteEventCurrent(epoch: number, jobId: string): boolean {
+    if (epoch !== this.playbackEpoch) {
+      return false;
+    }
+    if (jobId.length === 0) {
+      return this.activePlaybackJobId.length === 0;
+    }
+    return this.playbackQueue.isActive(epoch, jobId);
+  }
+
+  private onPcmPlaybackFailure(message: string): void {
+    if (this.activePlaybackJobId.length === 0) {
+      return;
+    }
+    this.cancelPlaybackJobs();
+    this.tts.close();
+    this.player.stop().catch(() => undefined);
+    this.snapshot.playback = 'none';
+    this.snapshot.ttsState = 'error';
+    this.snapshot.statusDetail = '远端 TTS 播放器已停止';
+    this.snapshot.error = message;
+    this.callbacks.syncBackgroundState();
+    this.callbacks.notify();
+  }
+
+  failSystemSpeech(message: string): void {
+    this.onSystemSpeechError(this.systemSpeechToken, message);
   }
 
   private errorMessage(error: BusinessError, fallback: string): string {

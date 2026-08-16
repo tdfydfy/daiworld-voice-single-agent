@@ -4,6 +4,7 @@ import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import {
   AudioContinuityAction,
+  AudioDemand,
   AudioContinuityState,
   BackgroundAudioIntent
 } from './AudioContinuityState';
@@ -24,8 +25,9 @@ export class BackgroundAudioTaskOwner {
     this.context = context;
   }
 
-  sync(intent: BackgroundAudioIntent, onError: (message: string) => void): void {
-    const changed = this.state.setDesiredIntent(intent);
+  syncDemand(demand: AudioDemand, onError: (message: string) => void): void {
+    const changed = this.state.setDemand(demand.recording, demand.playback);
+    const intent = this.state.desiredIntent;
     this.onError = onError;
     if (changed) {
       this.failedIntent = 'none';
@@ -40,20 +42,24 @@ export class BackgroundAudioTaskOwner {
     this.ensureReconcile().catch(() => undefined);
   }
 
-  ensureReady(intent: BackgroundAudioIntent, onError: (message: string) => void): Promise<void> {
-    this.state.setDesiredIntent(intent);
+  ensureReady(
+    intent: BackgroundAudioIntent,
+    demand: AudioDemand,
+    onError: (message: string) => void
+  ): Promise<void> {
+    this.state.setDemand(demand.recording, demand.playback);
     this.failedIntent = 'none';
     this.onError = onError;
     this.logState('ensure');
     return this.ensureReconcile().then((): void => {
-      if (!this.state.isReady(intent)) {
+      if (!this.state.isDemandReady()) {
         throw new Error(`后台音频${intent === 'playback' ? '播放' : '录音'}模式尚未就绪`);
       }
     });
   }
 
   release(onError: (message: string) => void): Promise<void> {
-    this.state.setDesiredIntent('none');
+    this.state.setDemand(false, false);
     this.failedIntent = 'none';
     this.onError = onError;
     this.logState('release');

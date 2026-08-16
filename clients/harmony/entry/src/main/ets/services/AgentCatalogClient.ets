@@ -5,11 +5,15 @@ import { http } from '@kit.NetworkKit';
 import { AgentInfo } from '../models/SingleAgentState';
 
 export class AgentCatalogClient {
+  private hasFetched: boolean = false;
+
   async fetch(baseUrl: string, accessToken: string): Promise<AgentInfo[]> {
     const request = http.createHttp();
     const base = this.normalizeBaseUrl(baseUrl);
+    const path = this.hasFetched ? '/api/agents?refresh=1' : '/api/agents';
+    this.hasFetched = true;
     try {
-      const response = await request.request(base + '/api/agents', {
+      const response = await request.request(base + path, {
         method: http.RequestMethod.GET,
         header: {
           'X-Voice-Token': accessToken,

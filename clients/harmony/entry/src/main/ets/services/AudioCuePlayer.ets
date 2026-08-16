@@ -84,15 +84,22 @@ export class AudioCuePlayer {
   private cleanupTimer?: number;
   private running: boolean = false;
   private runningTimer?: number;
+  private playerCleanup?: Promise<void>;
   private speechYieldWaiters: Array<() => void> = [];
   private stateListener?: () => void;
+  private playbackReadyListener?: () => Promise<void>;
 
   isRunning(): boolean {
-    return this.running || this.activeCue.length > 0 || this.cueTimer !== undefined;
+    return this.running || this.activeCue.length > 0 || this.cueTimer !== undefined ||
+      this.playerCleanup !== undefined;
   }
 
   setStateListener(listener: () => void): void {
     this.stateListener = listener;
+  }
+
+  setPlaybackReadyListener(listener: () => Promise<void>): void {
+    this.playbackReadyListener = listener;
   }
 
   playAccepted(): void {
@@ -132,13 +139,41 @@ export class AudioCuePlayer {
     this.notifyStateChanged();
   }
 
+  async dispose(): Promise<void> {
+    this.running = false;
+    this.clearRunningTimer();
+    this.clearCueTimer();
+    if (this.cleanupTimer !== undefined) {
+      clearTimeout(this.cleanupTimer);
+      this.cleanupTimer = undefined;
+    }
+    const player = this.player;
+    this.player = undefined;
+    this.activeCue = '';
+    this.playbackGeneration += 1;
+    if (player) {
+      this.enqueuePlayerCleanup(player);
+    }
+    this.notifyStateChanged();
+    const cleanup = this.playerCleanup;
+    if (cleanup) {
+      await cleanup;
+    }
+    this.resolveSpeechYieldWaiters();
+  }
+
   yieldForSpeech(): Promise<void> {
     this.running = false;
     this.clearRunningTimer();
     this.clearCueTimer();
     this.notifyStateChanged();
+    if (this.activeCue.length > 0 && !this.player) {
+      this.activeCue = '';
+      this.playbackGeneration += 1;
+      this.notifyStateChanged();
+    }
     if (!this.player || this.activeCue.length === 0) {
-      return Promise.resolve();
+      return this.playerCleanup ?? Promise.resolve();
     }
     return new Promise<void>((resolve: () => void): void => {
       this.speechYieldWaiters.push(resolve);
@@ -158,7 +193,7 @@ export class AudioCuePlayer {
 
   private playCue(buffer: ArrayBuffer, kind: CueKind, delayMs: number = 0): void {
     this.clearCueTimer();
-    this.stopActiveCue();
+    this.stopActiveCue(false);
     if (delayMs > 0) {
       this.cueTimer = setTimeout((): void => {
         this.cueTimer = undefined;
@@ -173,24 +208,44 @@ export class AudioCuePlayer {
   private startCue(buffer: ArrayBuffer, kind: CueKind): void {
     const generation = this.playbackGeneration + 1;
     this.playbackGeneration = generation;
-    const player = new PcmPlayer(false);
-    player.setSampleRate(CUE_SAMPLE_RATE);
-    this.player = player;
     this.activeCue = kind;
     this.notifyStateChanged();
-    player.enqueue(buffer);
-    player.waitForDrain((): void => {
-      this.finishCue(player, generation);
+    const cleanup = this.playerCleanup ?? Promise.resolve();
+    cleanup.then((): Promise<void> => {
+      return this.playbackReadyListener?.() ?? Promise.resolve();
+    }).then((): void => {
+      if (generation !== this.playbackGeneration || this.activeCue !== kind) {
+        return;
+      }
+      const player = new PcmPlayer();
+      player.setFailureListener((): void => {
+        this.finishCue(player, generation);
+      });
+      player.setSampleRate(CUE_SAMPLE_RATE);
+      this.player = player;
+      player.enqueue(buffer);
+      player.waitForDrain((): void => {
+        this.finishCue(player, generation);
+      });
+      this.cleanupTimer = setTimeout((): void => {
+        this.cleanupTimer = undefined;
+        this.finishCue(player, generation);
+      }, CUE_CLEANUP_TIMEOUT_MS);
+    }).catch((): void => {
+      if (generation !== this.playbackGeneration) {
+        return;
+      }
+      this.player = undefined;
+      this.activeCue = '';
+      this.playbackGeneration += 1;
+      this.notifyStateChanged();
+      this.resolveSpeechYieldWaiters();
     });
-    this.cleanupTimer = setTimeout((): void => {
-      this.cleanupTimer = undefined;
-      this.finishCue(player, generation);
-    }, CUE_CLEANUP_TIMEOUT_MS);
   }
 
   private finishCue(player: PcmPlayer, generation: number): void {
     if (generation !== this.playbackGeneration) {
-      player.stop().catch(() => undefined);
+      this.enqueuePlayerCleanup(player);
       return;
     }
     if (this.cleanupTimer !== undefined) {
@@ -200,13 +255,11 @@ export class AudioCuePlayer {
     this.player = undefined;
     this.activeCue = '';
     this.playbackGeneration += 1;
+    this.enqueuePlayerCleanup(player);
     this.notifyStateChanged();
-    player.stop().catch(() => undefined).finally((): void => {
-      this.resolveSpeechYieldWaiters();
-    });
   }
 
-  private stopActiveCue(): void {
+  private stopActiveCue(notify: boolean = true): void {
     if (this.cleanupTimer !== undefined) {
       clearTimeout(this.cleanupTimer);
       this.cleanupTimer = undefined;
@@ -215,14 +268,33 @@ export class AudioCuePlayer {
     this.player = undefined;
     this.activeCue = '';
     this.playbackGeneration += 1;
-    this.notifyStateChanged();
+    if (notify) {
+      this.notifyStateChanged();
+    }
     if (!player) {
-      this.resolveSpeechYieldWaiters();
+      if (!this.playerCleanup) {
+        this.resolveSpeechYieldWaiters();
+      }
       return;
     }
-    player.stop().catch(() => undefined).finally((): void => {
+    this.enqueuePlayerCleanup(player);
+  }
+
+  private enqueuePlayerCleanup(player: PcmPlayer): Promise<void> {
+    const previous = this.playerCleanup ?? Promise.resolve();
+    const cleanup = previous.then((): Promise<void> => {
+      return player.dispose().catch(() => undefined);
+    });
+    this.playerCleanup = cleanup;
+    cleanup.finally((): void => {
+      if (this.playerCleanup !== cleanup) {
+        return;
+      }
+      this.playerCleanup = undefined;
+      this.notifyStateChanged();
       this.resolveSpeechYieldWaiters();
     });
+    return cleanup;
   }
 
   private resolveSpeechYieldWaiters(): void {

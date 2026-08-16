@@ -31,6 +31,7 @@ const REQUIRED_FILES = [
   'entry/src/main/ets/services/PcmCapture.ets',
   'entry/src/main/ets/services/CaptureRecoveryState.ets',
   'entry/src/main/ets/services/CaptureSupervisor.ets',
+  'entry/src/main/ets/services/RecoveryBudget.ets',
   'entry/src/main/ets/services/PcmPlayer.ets',
   'entry/src/main/ets/services/AudioCuePlayer.ets',
   'entry/src/main/ets/services/AudioContinuityState.ets',
@@ -39,12 +40,17 @@ const REQUIRED_FILES = [
   'entry/src/main/ets/services/HermesRuntime.ets',
   'entry/src/main/ets/services/RuntimeIdentitySync.ets',
   'entry/src/main/ets/services/SystemSpeechQueue.ets',
-  'entry/src/main/ets/services/SystemSpeechService.ets',
+  'entry/src/main/ets/services/SystemTtsCompletionGate.ets',
+  'entry/src/main/ets/services/SystemAsrEngine.ets',
+  'entry/src/main/ets/services/SystemTtsPlayer.ets',
+  'entry/src/main/ets/services/SpeechPlaybackQueue.ets',
+  'entry/src/main/ets/services/VoiceRuntimeState.ets',
+  'entry/src/main/ets/services/VoiceRuntime.ets',
   'entry/src/main/ets/services/VoiceInputCoordinator.ets',
   'entry/src/main/ets/services/VoiceOutputCoordinator.ets',
   'entry/src/main/ets/pages/Index.ets',
-  'AppScope/resources/base/media/app_icon.svg',
-  'entry/src/main/resources/base/media/app_icon.svg',
+  'AppScope/resources/base/media/app_icon_v2.svg',
+  'entry/src/main/resources/base/media/app_icon_v2.svg',
   'AppScope/app.json5',
   'build-profile.json5',
   'entry/build-profile.json5',
@@ -68,18 +74,20 @@ const REQUIRED_TOKENS = [
   ['startBackgroundRunning', 'continuous background voice task'],
   ['BackgroundMode.AUDIO_PLAYBACK', 'dedicated background playback mode'],
   ['BackgroundMode.AUDIO_RECORDING', 'dedicated background recording mode'],
-  ['recognitionWanted', 'persistent local speech capture state'],
-  ['ensureRecognitionCapture', 'persistent local speech capture startup'],
-  ['stopRecognitionCapture', 'explicit local speech capture cleanup'],
+  ['CaptureSupervisor', 'single supervised capture boundary'],
+  ['SpeechPlaybackQueue', 'single audible playback boundary'],
+  ['completeDispose', 'idempotent voice-runtime disposal'],
   ['stopBackgroundRunning', 'background task cleanup']
 ];
 
 const DYNAMIC_AGENT_CHECKS = [
   ['entry/src/main/ets/services/AgentCatalogClient.ets', /\/api\/agents/, 'dynamic Agent catalog route'],
-  ['entry/src/main/ets/services/HermesRuntime.ets', /loadAgentCatalog\(generation\)/, 'catalog loaded before gateway'],
+  ['entry/src/main/ets/services/HermesRuntime.ets', /prepareAgentCatalog\(/, 'catalog can load before gateway'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /await this\.refreshAgents\(\)/, 'startup prepares Agent catalog'],
   ['entry/src/main/ets/services/HermesRuntime.ets', /服务器暂未配置可用 Agent/, 'empty catalog state'],
   ['entry/src/main/ets/models/SingleAgentState.ets', /agentsLoading: boolean/, 'catalog loading state'],
   ['entry/src/main/ets/pages/Index.ets', /this\.snapshot\.agents\.map/, 'dynamic Agent selector'],
+  ['entry/src/main/ets/pages/Index.ets', /private AgentEntryPanel\(\)/, 'explicit Agent entry panel'],
   ['entry/src/main/ets/pages/Index.ets', /selectedAgentAvatar\(\)/, 'Agent avatar placeholder'],
   ['entry/src/main/ets/models/HermesProtocol.ets', /speech_text\?: string/, 'speech text compatibility field'],
   ['entry/src/main/ets/services/SpeechTextFilter.ets', /MEDIA:/, 'TTS media directive filtering']
@@ -87,7 +95,9 @@ const DYNAMIC_AGENT_CHECKS = [
 
 const THINKING_LINE_CHECKS = [
   ['entry/src/main/ets/pages/Index.ets', /private thinkingLines\(text: string\): string\[\]/, 'natural thinking line splitter'],
-  ['entry/src/main/ets/pages/Index.ets', /ForEach\(this\.thinkingLines\(message\.thinking\)/, 'line-based thinking rendering'],
+  ['entry/src/main/ets/models/SingleAgentState.ets', /ActivityKind = 'thinking' \| 'tool' \| 'status' \| 'error'/, 'ordered process activity kinds'],
+  ['entry/src/main/ets/services/ConversationState.ets', /activity\.kind = 'thinking'/, 'thinking enters the activity timeline'],
+  ['entry/src/main/ets/pages/Index.ets', /this\.thinkingLines\(activity\.detail\)/, 'line-based thinking activity rendering'],
   ['entry/src/main/ets/pages/Index.ets', /const boundaries = '。！？!\?；;'/, 'sentence boundary grouping']
 ];
 
@@ -103,15 +113,15 @@ const MESSAGE_REPLAY_CHECKS = [
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /private replayGeneration: number = 0/, 'replay generation guard'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /private replayCleanup: Promise<void> = Promise\.resolve\(\)/, 'serialized replay cleanup promise'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /startReplayAfterCleanup\(text, source\.id, replayGeneration, cleanup\)/, 'replay waits for cleanup before TTS start'],
-  ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /if \(this\.useSystemSpeech\) \{[\s\S]{0,180}this\.systemSpeech\?\.stopSpeaking\(\) \?\? Promise\.resolve\(\)/, 'system replay waits for local TTS cleanup'],
-  ['entry/src/main/ets/services/SystemSpeechService.ets', /private ttsRequestGeneration: number = 0/, 'system TTS cancellation generation'],
-  ['entry/src/main/ets/services/SystemSpeechService.ets', /const extraParams:[\s\S]{0,100}'speed': normalizedRate[\s\S]{0,100}engine\.speak/, 'system TTS uses platform playback without requiring PCM callbacks'],
-  ['entry/src/main/ets/services/SystemSpeechService.ets', /onComplete:[\s\S]{0,500}response\.type === 1[\s\S]{0,120}this\.activeTtsRequestId = ''/, 'system TTS completes after platform playback'],
-  ['entry/src/main/ets/services/SystemSpeechService.ets', /stopSpeaking\(\): Promise<void> \{[\s\S]{0,260}this\.activeTtsRequestId = ''/, 'system replay cleanup cannot stop an already completed request'],
+  ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /if \(this\.useSystemSpeech\) \{[\s\S]{0,220}const cleanup = this\.systemTts\?\.stop\(\) \?\? Promise\.resolve\(\)/, 'system replay waits for local TTS cleanup'],
+  ['entry/src/main/ets/services/SystemTtsPlayer.ets', /private requestGeneration: number = 0/, 'system TTS cancellation generation'],
+  ['entry/src/main/ets/services/SystemTtsPlayer.ets', /const extraParams:[\s\S]{0,180}'speed': normalizedRate[\s\S]{0,500}engine\.speak/, 'system TTS uses platform playback without requiring PCM callbacks'],
+  ['entry/src/main/ets/services/SystemTtsPlayer.ets', /onComplete:[\s\S]{0,500}response\.type === 1[\s\S]{0,500}classifyCompletion\(now\)[\s\S]{0,500}this\.activeRequestId = ''/, 'system TTS completion is verified before queue advancement'],
+  ['entry/src/main/ets/services/SystemTtsPlayer.ets', /stop\(\): Promise<void> \{[\s\S]{0,260}this\.activeRequestId = ''/, 'system replay cleanup cannot stop an already completed request'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /message replay requested/, 'replay button request logging'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /message replay state cleared/, 'replay cleanup logging'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /!source\.pending && !this\.snapshot\.agentBusy &&\s*this\.enabled/, 'continuous ASR does not disable replay'],
-  ['entry/src/main/ets/services/SingleAgentController.ets', /resumeSession\(storedId: string\): void[\s\S]{0,500}const restoreVoiceOutput = this\.output\.isEnabled\(\)[\s\S]{0,500}this\.output\.setEnabled\(restoreVoiceOutput\)/, 'history resume preserves replay output availability']
+  ['entry/src/main/ets/services/SingleAgentController.ets', /resumeSession\(storedId: string\): void[\s\S]{0,500}this\.output\.bindEpoch\(epoch\)[\s\S]{0,500}this\.output\.stopForConversationChange\(\)/, 'history resume preserves output intent while cancelling stale playback']
 ];
 
 const MODEL_SWITCH_CHECKS = [
@@ -141,7 +151,7 @@ const PROVIDER_IDENTITY_CHECKS = [
   ['entry/src/main/ets/services/RuntimeIdentitySync.ets', /resetCatalog\(\): void \{[\s\S]{0,100}this\.lastCatalog = undefined/, 'Agent changes clear stale provider catalog identity'],
   ['entry/src/main/ets/services/HermesRuntime.ets', /resetModelSelection\(\): void \{[\s\S]{0,160}this\.identity\.resetCatalog\(\)/, 'runtime reset clears provider identity cache'],
   ['entry/src/main/ets/services/HermesRuntime.ets', /resetModelSelection\(\): void \{[\s\S]{0,300}this\.snapshot\.runtimeModel = ''[\s\S]{0,100}this\.snapshot\.runtimeProvider = ''/, 'Agent changes clear unconfirmed runtime identity'],
-  ['entry/src/main/ets/services/HermesRuntime.ets', /if \(selected === undefined && fallback !== undefined\) \{[\s\S]{0,120}this\.resetModelSelection\(\)/, 'catalog fallback clears the previous Agent identity'],
+  ['entry/src/main/ets/services/HermesRuntime.ets', /if \(selected === undefined\) \{[\s\S]{0,120}this\.resetModelSelection\(\)/, 'catalog fallback clears the previous Agent identity'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /onSessionCreated\(result: Object\): void[\s\S]{0,700}this\.syncRuntimeIdentity\(info\)/, 'created and resumed sessions actively synchronize identity'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /completeSessionResume\(result: Object, detail\?: Object\): void[\s\S]{0,900}this\.onSessionCreated\(result\)/, 'history resume uses the common Session identity path'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /restoreSessionAfterReconnect\(storedId: string\): void[\s\S]{0,700}this\.onSessionCreated\(result\)/, 'gateway reconnect uses the common Session identity path'],
@@ -180,9 +190,9 @@ const GATEWAY_RECOVERY_CHECKS = [
   ['entry/src/main/ets/services/HermesRuntime.ets', /authResult\.unauthorized[\s\S]{0,100}gatewayReconnectBlocked = true/, 'invalid token stops automatic retries'],
   ['entry/src/main/ets/services/HermesRuntime.ets', /scheduleGatewayReconnect\('网关连接已断开'\)/, 'unexpected gateway close recovery'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /restoreSessionAfterReconnect\(this\.snapshot\.storedSessionId\)/, 'non-destructive stored session recovery after reconnect'],
-  ['entry/src/main/ets/services/HermesRuntime.ets', /loadAgentCatalog\(generation\)/, 'catalog load follows the active connection generation'],
-  ['entry/src/main/ets/services/HermesRuntime.ets', /generation === this\.gatewayConnectGeneration && !this\.gatewayReconnectBlocked/, 'stale authentication and catalog attempt guard'],
-  ['entry/src/main/ets/services/HermesRuntime.ets', /scheduleGatewayReconnect\(this\.snapshot\.error\);[\s\S]{0,100}this\.callbacks\.changed\(\)/, 'catalog retry state reaches the UI']
+  ['entry/src/main/ets/services/HermesRuntime.ets', /sequence !== this\.agentCatalogSequence/, 'stale Agent catalog request guard'],
+  ['entry/src/main/ets/services/HermesRuntime.ets', /generation === this\.gatewayConnectGeneration && !this\.gatewayReconnectBlocked/, 'stale authentication attempt guard'],
+  ['entry/src/main/ets/pages/Index.ets', /this\.controller\.refreshAgents\(\)/, 'catalog retry reaches the UI']
 ];
 
 // Host-only protocol remnants that must NOT appear in the single-agent client.
@@ -250,25 +260,30 @@ const SYSTEM_TTS_STREAM_CHECKS = [
   ['entry/src/main/ets/services/SystemSpeechQueue.ets', /NEXT_PREFERRED_MAX = 80/, 'common continuation target'],
   ['entry/src/main/ets/services/SystemSpeechQueue.ets', /HARD_MAX = 96/, 'common system TTS hard text limit'],
   ['entry/src/main/ets/services/SystemSpeechQueue.ets', /finalLimit = this\.firstChunkQueued \? NEXT_PREFERRED_MAX : FIRST_MAX/, 'all final tails obey the common short chunk limit'],
-  ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /beginAssistantStream\(\): void[\s\S]{0,100}this\.systemSpeechQueue\.beginStream\(\)/, 'live speech uses the common chunk mode'],
+  ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /beginAssistantStream\(\): void[\s\S]{0,400}this\.systemSpeechQueue\.beginStream\(\)/, 'live speech uses the common chunk mode'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /replayAwaitingSystemStart = true;[\s\S]{0,100}this\.systemSpeechQueue\.beginStream\(\)/, 'message replay uses the common chunk mode'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /appendSystemSpeechStream\(speechDelta\)/, 'delta-fed system TTS'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /finishSystemSpeechStream\(speechText\)/, 'final system TTS flush'],
   ['entry/src/main/ets/services/SystemSpeechQueue.ets', /private chunkEnd\(text: string, final: boolean\)/, 'punctuation-aware TTS chunking'],
+  ['entry/src/main/ets/services/SystemSpeechQueue.ets', /pause\(_speechRate: number\): void \{[\s\S]{0,100}this\.pausedText = this\.activeText/, 'system TTS resumes from a complete segment checkpoint'],
+  ['entry/src/main/ets/services/SystemTtsCompletionGate.ets', /classifyCompletion\(now: number\): SystemTtsPlaybackEvent[\s\S]{0,220}return 'interrupted'/, 'premature system TTS completion is an interruption'],
+  ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /event === 'interrupted'[\s\S]{0,400}scheduleSystemSpeechRetry\(token\)/, 'interrupted system TTS retains its active segment'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /const next = this\.systemSpeechQueue\.completeActive\(\)/, 'next chunk starts without restarting ASR']
 ];
 
 const BACKGROUND_AUDIO_CHECKS = [
+  ['entry/src/main/ets/services/AudioContinuityState.ets', /if \(demand\.recording\)[\s\S]{0,80}return 'recording'/, 'recording entitlement wins dual demand'],
   ['entry/src/main/ets/services/BackgroundAudioTaskOwner.ets', /BackgroundMode\.AUDIO_RECORDING[\s\S]{0,120}BackgroundMode\.AUDIO_PLAYBACK/, 'recording and playback use dedicated background modes'],
   ['entry/src/main/ets/services/AudioContinuityState.ets', /this\.runningIntent !== this\.desiredIntent[\s\S]{0,80}return 'stop'/, 'background mode changes stop the old task first'],
   ['entry/src/main/ets/services/AudioContinuityCoordinator.ets', /ensureRecordingReady\(\): Promise<void>/, 'capture waits for recording mode'],
   ['entry/src/main/ets/services/AudioContinuityCoordinator.ets', /ensurePlaybackReady\(\): Promise<void>/, 'playback waits for playback mode'],
   ['entry/src/main/ets/services/BackgroundAudioTaskOwner.ets', /stopBackgroundRunning\(context\)/, 'background cleanup uses the context-owned compatibility path'],
   ['entry/src/main/ets/services/BackgroundAudioTaskOwner.ets', /background stop reported 9800005; treating the stale task as already stopped/, 'stale background task stop is idempotent'],
-  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /this\.callbacks\.ensureRecordingReady\(\)[\s\S]{0,300}speech\.startRecognition\(\)/, 'system capture waits for lease readiness'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /this\.callbacks\.ensureRecordingReady\(\)[\s\S]{0,300}engine\.start\(epoch\)/, 'system capture waits for lease readiness'],
   ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /this\.callbacks\.ensureRecordingReady\(\)[\s\S]{0,300}this\.capture\.start/, 'remote capture waits for lease readiness'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /yieldForSpeech\(\)[\s\S]{0,180}ensurePlaybackReady\(\)[\s\S]{0,500}speech\.speak/, 'system TTS waits for lease readiness'],
-  ['entry/src/main/ets/services/SingleAgentController.ets', /if \(this\.output\.prefersBackgroundPlayback\(\)\)[\s\S]{0,100}intent = 'playback'[\s\S]{0,100}this\.input\.isWanted\(\)/, 'controller gives active playback priority over recording'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /const recordingDemand = this\.input\.isWanted\(\);[\s\S]{0,120}const playbackDemand = this\.output\.hasBackgroundOutput\(\);[\s\S]{0,220}syncDemand\(recordingDemand, playbackDemand\)/, 'controller preserves independent recording and playback demand'],
+  ['entry/src/main/ets/services/AudioContinuityCoordinator.ets', /this\.owner\.syncDemand\(this\.demand[\s\S]{0,800}this\.owner\.ensureReady\(intent, this\.demand/, 'continuity coordinator owns only background entitlement'],
   ['entry/src/main/ets/services/BackgroundAudioTaskOwner.ets', /background action=/, 'background mode generation logging'],
   ['entry/src/main/module.json5', /"backgroundModes": \["audioPlayback", "audioRecording"\]/, 'manifest declares playback and recording modes']
 ];
@@ -281,15 +296,15 @@ const AUDIO_INPUT_ROUTE_CHECKS = [
   ['entry/src/main/ets/services/CommunicationAudioSession.ets', /activateAudioSession\(strategy\)/, 'communication audio session activation'],
   ['entry/src/main/ets/services/CommunicationAudioSession.ets', /const speakerActive = this\.speakerphoneEnabled/, 'explicit speaker override remains available with a headset'],
   ['entry/src/main/ets/services/CommunicationAudioSession.ets', /setCommunicationDevice\([\s\S]{0,100}speakerActive/, 'native earpiece and speakerphone switching'],
-  ['entry/src/main/ets/services/CommunicationAudioSession.ets', /on\([\s\S]{0,80}'audioSessionDeactivated'/, 'communication session deactivation recovery'],
+  ['entry/src/main/ets/services/CommunicationAudioSession.ets', /DEACTIVATED_TIMEOUT[\s\S]{0,360}return;[\s\S]{0,160}this\.scheduleRecovery\(\)/, 'communication session timeout is a normal expiry'],
   ['entry/src/main/ets/services/PcmCapture.ets', /getPreferredInputDeviceForCapturerInfoSync/, 'preferred input device inspection'],
   ['entry/src/main/ets/services/PcmCapture.ets', /getCurrentInputDevices\(\)/, 'active input device verification'],
   ['entry/src/main/ets/services/PcmCapture.ets', /on\('inputDeviceChange'/, 'system-managed input route observation'],
-  ['entry/src/main/ets/services/SingleAgentController.ets', /onMicrophoneRouteChanged\(label\)/, 'live microphone route UI update'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /this\.onMicrophoneRouteChanged\(label\)/, 'live microphone route UI update'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /toggleSpeakerphone\(\): void \{[\s\S]{0,220}showCommunicationOutputPicker\(context\)/, 'phone output opens the native communication picker'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /toggleSpeakerphoneFallback\(\): void \{[\s\S]{0,160}this\.snapshot\.audioOutputRoute !== 'speaker'/, 'phone output keeps a direct fallback from the actual route'],
   ['entry/src/main/ets/services/CommunicationAudioSession.ets', /AVCastPickerHelper\(context\)[\s\S]{0,160}sessionType: 'voice_call'/, 'native output picker uses the voice-call device list'],
-  ['entry/src/main/ets/services/AudioCuePlayer.ets', /new PcmPlayer\(false\)/, 'audio cues do not acquire the communication route']
+  ['entry/src/main/ets/services/AudioCuePlayer.ets', /const player = new PcmPlayer\(\)/, 'audio cues use the communication route']
 ];
 
 const VOICE_CONTROL_CHECKS = [
@@ -327,35 +342,36 @@ const REACTIVE_UI_CHECKS = [
 ];
 
 const SYSTEM_ASR_STARTUP_CHECKS = [
-  ['entry/src/main/ets/services/SystemSpeechService.ets', /reportRecognitionStartupPhase\('创建本地识别引擎'\)/, 'system ASR engine-creation phase reporting'],
-  ['entry/src/main/ets/services/SystemSpeechService.ets', /reportRecognitionStartupPhase\('启动音频采集'\)/, 'system ASR capture phase reporting'],
-  ['entry/src/main/ets/services/SystemSpeechService.ets', /reportRecognitionStartupPhase\('等待识别引擎 ready'\)/, 'system ASR ready phase reporting'],
+  ['entry/src/main/ets/services/SystemAsrEngine.ets', /reportStartup\(epoch, '创建本地识别引擎'\)/, 'system ASR engine-creation phase reporting'],
+  ['entry/src/main/ets/services/SystemAsrEngine.ets', /reportStartup\(epoch, '启动识别会话'\)/, 'system ASR session phase reporting'],
+  ['entry/src/main/ets/services/SystemAsrEngine.ets', /reportStartup\(epoch, '等待识别引擎 ready'\)/, 'system ASR ready phase reporting'],
   ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /本地 ASR 启动超时，停在：/, 'stuck system ASR reports its startup phase'],
   ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /failSystemRecognition\(reason: string, phase: string\): void/, 'failed local ASR stops locally'],
   ['entry/src/main/ets/pages/Index.ets', /statusDetail\.startsWith\('本地 ASR：'\)/, 'current system ASR startup phase is visible']
 ];
 
 const SYSTEM_ASR_SESSION_CHECKS = [
-  ['entry/src/main/ets/services/SystemSpeechService.ets', /SPEECH_SESSION_MAX_AUDIO_BYTES = 16000 \* 2 \* 18/, 'bounded local recognition session audio budget'],
-  ['entry/src/main/ets/services/SystemSpeechService.ets', /recognitionSessionAudioBytes \+ SPEECH_FRAME_BYTES > SPEECH_SESSION_MAX_AUDIO_BYTES/, 'proactive recognition session length guard'],
-  ['entry/src/main/ets/services/SystemSpeechService.ets', /finishRecognitionSessionForRotation\(sessionId\)/, 'recognition session rotation without stopping capture'],
-  ['entry/src/main/ets/services/SystemSpeechService.ets', /this\.pendingAudio = audioBytes\.slice\(offset\)/, 'PCM carryover across recognition sessions']
+  ['entry/src/main/ets/services/SystemAsrEngine.ets', /SPEECH_SESSION_MAX_AUDIO_BYTES = 16000 \* 2 \* 18/, 'bounded local recognition session audio budget'],
+  ['entry/src/main/ets/services/SystemAsrEngine.ets', /this\.sessionAudioBytes \+ SPEECH_FRAME_BYTES > SPEECH_SESSION_MAX_AUDIO_BYTES/, 'proactive recognition session length guard'],
+  ['entry/src/main/ets/services/SystemAsrEngine.ets', /finishForRotation\(sessionId\)/, 'recognition session rotation without stopping capture'],
+  ['entry/src/main/ets/services/SystemAsrEngine.ets', /this\.pendingAudio = audioBytes\.slice\(offset\)/, 'PCM carryover across recognition sessions'],
+  ['entry/src/main/ets/services/SystemAsrEngine.ets', /rotating && this\.wanted[\s\S]{0,260}this\.startSession\(this\.recognizer, epoch, false\)/, 'recognition rotation preserves PCM carryover']
 ];
 
 const AUDIO_PLAYBACK_RECOVERY_CHECKS = [
   ['entry/src/main/ets/services/CommunicationAudioSession.ets', /speakerActive \? 'speaker' : 'system-preferred'/, 'disabled speaker override returns output to system routing'],
-  ['entry/src/main/ets/services/CommunicationAudioSession.ets', /lastHeadsetAvailable !== headsetAvailable[\s\S]{0,180}this\.speakerphoneEnabled = false/, 'device topology changes restore system-preferred output'],
+  ['entry/src/main/ets/services/CommunicationAudioSession.ets', /lastHeadsetAvailable !== headsetAvailable[\s\S]{0,180}this\.speakerphoneEnabled = !headsetAvailable/, 'device topology chooses headset or speaker deterministically'],
   ['entry/src/main/ets/services/PcmPlayer.ets', /PCM_RENDERER_WATCHDOG_MS = 1200/, 'queued PCM renderer watchdog'],
   ['entry/src/main/ets/services/PcmPlayer.ets', /getAudioTimestampInfoSync\(\)\.framePos/, 'renderer watchdog follows hardware playback progress'],
   ['entry/src/main/ets/services/PcmPlayer.ets', /const drain = renderer\.drain\(\)/, 'playback completion waits for the system renderer to drain'],
   ['entry/src/main/ets/services/PcmPlayer.ets', /restoreUnconfirmedRendererTail\(\): void \{[\s\S]{0,160}this\.queue\.unshift\(this\.rendererReplayTail\)/, 'renderer reconstruction replays its last unconfirmed PCM buffer'],
-  ['entry/src/main/ets/services/PcmPlayer.ets', /STATE_STOPPED[\s\S]{0,160}this\.requestPlayback\(true\)/, 'terminal renderer states reconstruct with the unconfirmed PCM checkpoint'],
-  ['entry/src/main/ets/services/PcmPlayer.ets', /scheduleRendererRecovery\(\): void/, 'bounded PCM renderer retry'],
+  ['entry/src/main/ets/services/PcmPlayer.ets', /STATE_STOPPED[\s\S]{0,180}this\.scheduleRendererRecovery\(`/, 'terminal renderer states enter the common recovery boundary'],
+  ['entry/src/main/ets/services/PcmPlayer.ets', /scheduleRendererRecovery\(reason: string\): void[\s\S]{0,500}this\.rendererRecoveryBudget\.beginAttempt\(\)/, 'bounded PCM renderer retry'],
   ['entry/src/main/ets/services/PcmPlayer.ets', /onCommunicationSessionRecovered\(\): void \{[\s\S]{0,180}this\.requestPlayback\(\);/, 'communication-session recovery preserves the current renderer buffer'],
   ['entry/src/main/ets/services/PcmPlayer.ets', /renderer\.on\('audioInterrupt'/, 'renderer interruption observation'],
   ['entry/src/main/ets/services/PcmPlayer.ets', /channels: this\.channelForRenderer\(channelCount\)/, 'PCM renderer follows the source channel count'],
   ['entry/src/main/ets/services/PcmPlayer.ets', /channelCount === 2[\s\S]{0,100}audio\.AudioChannel\.CHANNEL_2/, 'stereo PCM uses a two-channel renderer'],
-  ['entry/src/main/ets/services/PcmPlayer.ets', /this\.cancelRendererRecovery\(\);[\s\S]{0,180}this\.queue = \[\]/, 'explicit stop cancels renderer recovery']
+  ['entry/src/main/ets/services/PcmPlayer.ets', /async stop\(\): Promise<void> \{[\s\S]{0,180}this\.cancelRendererRecovery\(true\)[\s\S]{0,180}this\.queue = \[\]/, 'explicit stop cancels renderer recovery']
 ];
 
 const AUDIO_CAPTURE_RECOVERY_CHECKS = [
@@ -366,24 +382,24 @@ const AUDIO_CAPTURE_RECOVERY_CHECKS = [
   ['entry/src/main/ets/services/CaptureSupervisor.ets', /CAPTURE_RECOVERY_DELAYS_MS: number\[\] = \[100, 500, 1500\]/, 'bounded capture recovery delays'],
   ['entry/src/main/ets/services/CaptureSupervisor.ets', /this\.recoveryTask !== undefined/, 'serialized capture reconstruction'],
   ['entry/src/main/ets/services/CaptureSupervisor.ets', /await this\.capture\.stop\(\)\.catch\(\(\) => undefined\)[\s\S]{0,180}await this\.startCapture\(generation\)/, 'old capturer released before reconstruction'],
-  ['entry/src/main/ets/services/CaptureSupervisor.ets', /this\.recovery\.observePcm\(generation\)/, 'healthy PCM restores capture retry budget'],
+  ['entry/src/main/ets/services/CaptureSupervisor.ets', /this\.recovery\.observePcm\(generation\)[\s\S]{0,100}this\.markReady\(generation\)/, 'first healthy PCM completes capture readiness'],
   ['entry/src/main/ets/services/CaptureRecoveryState.ets', /if \(this\.phase === 'recovering'\) \{[\s\S]{0,80}return 0;/, 'one capture recovery at a time'],
-  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /private capture: CaptureSupervisor/, 'remote ASR uses supervised capture'],
-  ['entry/src/main/ets/services/SystemSpeechService.ets', /private capture: CaptureSupervisor/, 'system ASR uses supervised capture'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /private capture: CaptureSupervisor/, 'single input coordinator owns supervised capture'],
+  ['entry/src/main/ets/services/SystemAsrEngine.ets', /acceptPcm\(epoch: number, buffer: ArrayBuffer\)/, 'system ASR consumes shared PCM'],
   ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /远端 ASR：音频采集正在恢复/, 'remote capture recovery reaches UI state'],
-  ['entry/src/main/ets/services/SystemSpeechService.ets', /reportRecognitionStartupPhase\('音频采集正在恢复'\)/, 'system capture recovery reaches UI state'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /本地 ASR：音频采集正在恢复/, 'system capture recovery reaches UI state'],
   ['entry/src/main/ets/pages/Index.ets', /statusDetail\.startsWith\('远端 ASR：'\)/, 'remote capture recovery state is visible'],
   ['entry/src/main/ets/services/CaptureSupervisor.ets', /const cleanup = this\.cleanupTask;[\s\S]{0,100}await cleanup\.catch/, 'new capture waits for exhausted cleanup']
 ];
 
 const ASR_FINALIZATION_CHECKS = [
   ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /ASR_FINALIZATION_GRACE_MS = 1800/, 'ASR final grace window'],
-  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /queueFinal\(value, isLast\)/, 'system ASR final buffering'],
-  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /queueFinal\(value, false\)/, 'remote ASR final buffering'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /queueFinal\(epoch, value, isLast\)/, 'system ASR final buffering'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /queueFinal\(epoch, value, false\)/, 'remote ASR final buffering'],
   ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /this\.asrPendingFinalText = this\.mergeSegments/, 'consecutive ASR final accumulation'],
   ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /this\.snapshot\.asrState = 'finalizing'/, 'visible ASR finalizing state'],
-  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /private updateInterim\(text: string\): void[\s\S]{0,700}this\.scheduleFinalization\(\)/, 'ASR interim resets finalization window'],
-  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /private queueFinal\(text: string, isLast: boolean\): void[\s\S]{0,1400}this\.scheduleFinalization\(\)/, 'ASR final resets finalization window'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /private updateInterim\(epoch: number, text: string\): void[\s\S]{0,700}this\.scheduleFinalization\(epoch\)/, 'ASR interim resets finalization window'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /private queueFinal\(epoch: number, text: string, isLast: boolean\): void[\s\S]{0,1600}this\.scheduleFinalization\(epoch\)/, 'ASR final resets finalization window'],
   ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /shouldFinalizeImmediately\(text: string\): boolean[\s\S]{0,220}this\.isStopPhrase\(text\)[\s\S]{0,220}this\.isCloseMicPhrase\(text\)[\s\S]{0,220}this\.snapshot\.clarifyPending[\s\S]{0,220}this\.snapshot\.approvalPending/, 'immediate voice-control finalization'],
   ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /finalizeAfterTermination\(\): void/, 'meaningful ASR text flush on termination'],
   ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /!this\.hasSemanticContent\(value\)\)[\s\S]{0,100}this\.discardAndResumePlayback\(\)/, 'discarded ASR false positive resumes paused playback']
@@ -394,11 +410,13 @@ const REMOTE_VOICE_RECOVERY_CHECKS = [
   ['entry/src/main/ets/services/StreamingAsrClient.ets', /while \(this\.preReadyBuffer\.length >= 4\)/, 'ASR reconnect buffer remains bounded'],
   ['entry/src/main/ets/services/StreamingAsrClient.ets', /generation !== this\.connectionGeneration \|\| this\.socket !== socket/, 'ASR stale socket callback isolation'],
   ['entry/src/main/ets/services/StreamingAsrClient.ets', /failConnection\(socket, generation, 'ASR 连接超时'\)/, 'ASR connecting state has a timeout watchdog'],
-  ['entry/src/main/ets/services/StreamingTtsClient.ets', /reconnect\(url: string, cookie: string\): void[\s\S]{0,100}this\.open\(url, cookie, true\)/, 'TTS reconnect preserves pending frames'],
-  ['entry/src/main/ets/services/StreamingTtsClient.ets', /detachSocket\(!preservePendingFrames\)/, 'TTS explicit close and reconnect have separate buffer semantics'],
+  ['entry/src/main/ets/services/StreamingTtsClient.ets', /reconnect\(url: string, cookie: string\): void[\s\S]{0,100}this\.open\(url, cookie, false\)/, 'TTS reconnect drops stale job frames'],
+  ['entry/src/main/ets/services/StreamingTtsClient.ets', /failConnection\(socket: webSocket\.WebSocket[\s\S]{0,400}this\.detachSocket\(true\)/, 'TTS failure clears pending frames before a new connection'],
   ['entry/src/main/ets/services/StreamingTtsClient.ets', /sendNextPendingFrame\(socket, generation\)[\s\S]{0,1600}this\.pendingFrames\.shift\(\)/, 'TTS pending frames flush in wire order'],
   ['entry/src/main/ets/services/StreamingTtsClient.ets', /failConnection\(socket, generation, 'TTS 连接超时'\)/, 'TTS connecting state has a timeout watchdog'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /REMOTE_VOICE_RECONNECT_DELAYS_MS: number\[\] = \[250, 750, 1500, 3000\]/, 'bounded remote voice reconnect backoff'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /REMOTE_ASR_STABLE_RESET_MS = 10000/, 'remote ASR retry budget needs a stable connection before reset'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /REMOTE_VOICE_STABLE_RESET_MS = 10000/, 'remote TTS retry budget needs a stable connection before reset'],
   ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /scheduleRemoteReconnect\(\): void/, 'remote ASR reconnect scheduling'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /scheduleRemoteTtsReconnect\(\): void/, 'remote TTS reconnect scheduling'],
   ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /this\.wanted = false;[\s\S]{0,160}this\.cancelRemoteReconnect\(\)/, 'microphone shutdown cancels ASR reconnect'],
@@ -412,6 +430,36 @@ const AGENT_TERMINAL_STATE_CHECKS = [
   ['entry/src/main/ets/services/SingleAgentController.ets', /assistant message finalized/, 'assistant completion diagnostics']
 ];
 
+const VOICE_RUNTIME_ARCHITECTURE_CHECKS = [
+  ['entry/src/main/ets/services/AudioContinuityState.ets', /isDemandReady\(\): boolean[\s\S]{0,180}this\.isReady\(this\.desiredIntent\)/, 'background readiness follows the policy-selected intent'],
+  ['entry/src/main/ets/services/BackgroundAudioTaskOwner.ets', /ensureReady\([\s\S]{0,500}this\.state\.isDemandReady\(\)/, 'background owner validates aggregate demand readiness'],
+  ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /thinkingOwnsQueue[\s\S]{0,400}!this\.playbackQueue\.hasOutput\(\) \|\| thinkingOwnsQueue/, 'thinking cue may retain its own playback gate'],
+  ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /ensureAssistantPlaybackJob\(\): boolean[\s\S]{0,500}this\.audioCues\.silence\(\)[\s\S]{0,300}beginPlaybackJob\('assistant'/, 'assistant acquires playback only when speech is ready'],
+  ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /startSystemSpeech\(text: string\): void[\s\S]{0,300}ensureAssistantPlaybackJob\(\)[\s\S]{0,900}yieldForSpeech\(\)/, 'first system speech chunk owns cue handoff'],
+  ['entry/src/main/ets/services/PcmCapture.ets', /setRecoveryListener[\s\S]{0,240}'communication-session-recovered', true/, 'audio-session recovery preserves a healthy Capturer'],
+  ['entry/src/main/ets/services/CommunicationAudioSession.ets', /ensureActivated\(\)\.then[\s\S]{0,160}recoveryBudget\.reset\(\)/, 'successful audio-session recovery starts a fresh incident budget'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /type !== 'message\.delta'[\s\S]{0,160}type !== 'thinking\.delta'/, 'high-frequency gateway deltas do not evict lifecycle diagnostics'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /failSystemRecognition\(reason: string, phase: string\): void[\s\S]{0,900}this\.captureStartGeneration \+= 1[\s\S]{0,900}this\.capture\.stop\(\)/, 'failed local ASR releases the capture owner'],
+  ['entry/src/main/ets/services/CaptureSupervisor.ets', /const ready = this\.createReadyWaiter\(\)[\s\S]{0,400}await ready/, 'capture start resolves only through its readiness gate'],
+  ['entry/src/main/ets/services/CaptureSupervisor.ets', /markReady\(generation: number\): void[\s\S]{0,400}onState\('running', 'first-pcm'\)/, 'capture readiness requires first PCM'],
+  ['entry/src/main/ets/services/CommunicationAudioSession.ets', /communication audio session recovery exhausted users=/, 'audio-session recovery has a logged terminal boundary'],
+  ['entry/src/main/ets/services/PcmPlayer.ets', /failPlayback\(message: string\): void[\s\S]{0,900}this\.failureListener\?\.\(message\)/, 'renderer recovery exhaustion reaches its owner'],
+  ['entry/src/main/ets/services/PcmPlayer.ets', /async dispose\(\): Promise<void> \{[\s\S]{0,900}await this\.releaseRenderer\(renderer, true\)/, 'PCM dispose waits for renderer and audio-session release'],
+  ['entry/src/main/ets/services/SystemTtsPlayer.ets', /private activeToken: string = ''/, 'system TTS carries playback job identity'],
+  ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /token !== this\.systemSpeechToken/, 'stale system TTS callbacks are rejected'],
+  ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /private playbackQueue: SpeechPlaybackQueue/, 'all audible output shares one playback gate'],
+  ['entry/src/main/ets/services/AudioCuePlayer.ets', /playCue\(buffer: ArrayBuffer[\s\S]{0,180}this\.stopActiveCue\(false\)/, 'cue replacement does not publish a false idle boundary'],
+  ['entry/src/main/ets/services/AudioCuePlayer.ets', /isRunning\(\): boolean \{[\s\S]{0,180}this\.playerCleanup !== undefined/, 'cue playback demand includes pending player cleanup'],
+  ['entry/src/main/ets/services/AudioCuePlayer.ets', /yieldForSpeech\(\): Promise<void> \{[\s\S]{0,700}return this\.playerCleanup \?\? Promise\.resolve\(\)/, 'speech waits for a replaced cue player to release'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /scheduleRemoteReconnect\(\): void[\s\S]{0,600}remoteAsrRecoveryBudget\.beginAttempt\(\)[\s\S]{0,180}failRemoteRecovery/, 'remote ASR recovery has a terminal boundary'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /scheduleRemoteTtsReconnect\(\): void[\s\S]{0,700}remoteTtsRecoveryBudget\.beginAttempt\(\)[\s\S]{0,220}远端 TTS 已停止恢复/, 'remote TTS recovery has a terminal boundary'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /markRemoteReady\(epoch: number\): void[\s\S]{0,700}remoteAsrRecoveryBudget\.observeHealthy\(\)/, 'remote ASR readiness resets its budget only through stable health'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /markRemoteTtsReady\(\): void[\s\S]{0,700}remoteTtsRecoveryBudget\.observeHealthy\(\)/, 'remote TTS readiness resets its budget only through stable health'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /disposeResources\(epoch: number\): Promise<void>[\s\S]{0,900}this\.output\.dispose\(\)[\s\S]{0,300}this\.input\.stop\(\)[\s\S]{0,300}this\.audioContinuity\.release\(\)[\s\S]{0,400}this\.systemAsr\?\.release[\s\S]{0,400}this\.runtime\.disconnect\(\)/, 'dispose follows the resource ownership order'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /DISPOSE_STEP_TIMEOUT_MS = 3000[\s\S]{0,30000}waitForDisposeStep\(task: Promise<void>/, 'dispose cannot wait forever on a platform resource'],
+  ['entry/src/main/ets/pages/Index.ets', /aboutToDisappear\(\): void[\s\S]{0,300}this\.controller\.dispose\(\)/, 'page destruction invokes runtime disposal']
+];
+
 const ERRORS = [];
 const warnings = [];
 
@@ -421,18 +469,6 @@ function readRel(rel) {
     return '';
   }
   return fs.readFileSync(full, 'utf8');
-}
-
-const systemSpeechSource = readRel('entry/src/main/ets/services/SystemSpeechService.ets');
-for (const callback of ['onComplete', 'onError']) {
-  const callbackStart = systemSpeechSource.indexOf(`${callback}: (sessionId: string`);
-  const callbackEnd = callbackStart >= 0 ? systemSpeechSource.indexOf('\n      }', callbackStart) : -1;
-  const callbackSource = callbackStart >= 0 && callbackEnd > callbackStart
-    ? systemSpeechSource.slice(callbackStart, callbackEnd)
-    : '';
-  if (callbackSource.includes('capture.stop')) {
-    ERRORS.push(`system STT ${callback} must not stop persistent microphone capture`);
-  }
 }
 
 function scanDir(dir, out) {
@@ -459,6 +495,16 @@ for (const rel of REQUIRED_FILES) {
 const sources = [];
 scanDir(ETS, sources);
 const allSource = sources.map((f) => fs.readFileSync(f, 'utf8')).join('\n');
+const captureOwnerCount = sources
+  .map((file) => fs.readFileSync(file, 'utf8'))
+  .filter((source) => source.includes('new CaptureSupervisor('))
+  .length;
+if (captureOwnerCount !== 1) {
+  ERRORS.push(`voice runtime must have exactly one CaptureSupervisor owner (found ${captureOwnerCount})`);
+}
+if (allSource.includes('new PcmPlayer(false)')) {
+  ERRORS.push('audio cues and remote speech must share the communication playback route');
+}
 
 for (const [token, label] of REQUIRED_TOKENS) {
   if (!allSource.includes(token)) {
@@ -506,7 +552,8 @@ for (const [rel, pattern, label] of [
   ...BACKGROUND_AUDIO_CHECKS,
   ...ASR_FINALIZATION_CHECKS,
   ...REMOTE_VOICE_RECOVERY_CHECKS,
-  ...AGENT_TERMINAL_STATE_CHECKS
+  ...AGENT_TERMINAL_STATE_CHECKS,
+  ...VOICE_RUNTIME_ARCHITECTURE_CHECKS
 ]) {
   if (!pattern.test(readRel(rel))) {
     ERRORS.push(`missing restored history/TTS streaming behavior (${label})`);
@@ -534,6 +581,7 @@ const controllerSource = readRel('entry/src/main/ets/services/SingleAgentControl
 const voiceInputSource = readRel('entry/src/main/ets/services/VoiceInputCoordinator.ets');
 const indexSource = readRel('entry/src/main/ets/pages/Index.ets');
 const audioSessionSource = readRel('entry/src/main/ets/services/CommunicationAudioSession.ets');
+const audioContinuitySource = readRel('entry/src/main/ets/services/AudioContinuityCoordinator.ets');
 const pcmCaptureSource = readRel('entry/src/main/ets/services/PcmCapture.ets');
 const pcmPlayerSource = readRel('entry/src/main/ets/services/PcmPlayer.ets');
 const pcmAudioSource = audioSessionSource + '\n' + pcmCaptureSource + '\n' + pcmPlayerSource;
@@ -546,6 +594,28 @@ if (gatewayReconnectStart >= 0 && gatewayReconnectEnd > gatewayReconnectStart &&
 }
 if (pcmAudioSource.includes('selectMediaInputDevice(')) {
   ERRORS.push('headset capture must not be blocked by global explicit media-input selection');
+}
+if (audioContinuitySource.includes('CommunicationAudioSessionLease') ||
+  audioContinuitySource.includes('sessionWanted')) {
+  ERRORS.push('background continuity must not hold an empty communication audio session');
+}
+if (audioSessionSource.includes('AudioSessionFailureListener') ||
+  audioSessionSource.includes('addFailureListener(')) {
+  ERRORS.push('audio-session health must not expose a component-failure propagation path');
+}
+const pcmCaptureConstructorStart = pcmCaptureSource.indexOf('constructor()');
+const pcmCaptureConstructorEnd = pcmCaptureSource.indexOf('async requestPermission(', pcmCaptureConstructorStart);
+if (pcmCaptureConstructorStart >= 0 && pcmCaptureConstructorEnd > pcmCaptureConstructorStart &&
+  pcmCaptureSource.slice(pcmCaptureConstructorStart, pcmCaptureConstructorEnd)
+    .includes('session.setFailureListener')) {
+  ERRORS.push('audio-session failure must not tear down a healthy Capturer');
+}
+const pcmPlayerConstructorStart = pcmPlayerSource.indexOf('constructor(');
+const pcmPlayerConstructorEnd = pcmPlayerSource.indexOf('setFailureListener(', pcmPlayerConstructorStart);
+if (pcmPlayerConstructorStart >= 0 && pcmPlayerConstructorEnd > pcmPlayerConstructorStart &&
+  pcmPlayerSource.slice(pcmPlayerConstructorStart, pcmPlayerConstructorEnd)
+    .includes('session.setFailureListener')) {
+  ERRORS.push('audio-session failure must not terminate a healthy renderer');
 }
 for (const forbiddenRouteOverride of [
   'clearSelectedMediaInputDevice(',
@@ -589,6 +659,15 @@ if (toggleSpeakerStart >= 0 && toggleSpeakerEnd > toggleSpeakerStart) {
     ERRORS.push('manual audio output selection must not be blocked by headset availability');
   }
 }
+const outputRouteCallbackStart = controllerSource.indexOf('private onOutputRouteChanged(');
+const outputRouteCallbackEnd = controllerSource.indexOf('toggleMute()', outputRouteCallbackStart);
+if (outputRouteCallbackStart >= 0 && outputRouteCallbackEnd > outputRouteCallbackStart) {
+  const outputRouteCallback = controllerSource.slice(outputRouteCallbackStart, outputRouteCallbackEnd);
+  if (outputRouteCallback.includes('this.config.speakerphoneEnabled') ||
+    outputRouteCallback.includes('persistConfig()')) {
+    ERRORS.push('device route callbacks must not overwrite the persisted output preference');
+  }
+}
 for (const immediateAsrFinal of [
   'if (isFinal) {\n      this.onAsrFinal(value);',
   'if (final) {\n      this.onAsrFinal(value);'
@@ -614,7 +693,7 @@ if (openSettingsStart >= 0 && openSettingsEnd > openSettingsStart &&
   indexSource.slice(openSettingsStart, openSettingsEnd).includes('loadModelOptions')) {
   ERRORS.push('settings view must display shared runtime identity and must not trigger identity refresh');
 }
-const systemSpeechStateStart = controllerSource.indexOf('onSystemSpeechState(active: boolean): void');
+const systemSpeechStateStart = controllerSource.indexOf('onSystemSpeechState(');
 const systemSpeechStateEnd = controllerSource.indexOf('onSystemSpeechError(', systemSpeechStateStart);
 if (systemSpeechStateStart >= 0 && systemSpeechStateEnd > systemSpeechStateStart &&
   controllerSource.slice(systemSpeechStateStart, systemSpeechStateEnd).includes('startSystemRecognition()')) {
@@ -692,8 +771,8 @@ for (const file of jsons) {
 
 try {
   const appProfile = JSON.parse(fs.readFileSync(path.join(root, 'AppScope/app.json5'), 'utf8'));
-  if (appProfile.app.versionName !== '1.2.6' || appProfile.app.versionCode !== 1020006) {
-    ERRORS.push('HarmonyOS release version must be 1.2.6 (1020006)');
+  if (appProfile.app.versionName !== '1.2.10' || appProfile.app.versionCode !== 1020010) {
+    ERRORS.push('HarmonyOS release version must be 1.2.10 (1020010)');
   }
 } catch (error) {
   // The JSON parse error is reported by the validation loop above.

@@ -23,8 +23,11 @@ export type MessageRole = 'user' | 'assistant' | 'system';
 
 export type ActivityState = 'running' | 'completed' | 'error';
 
+export type ActivityKind = 'thinking' | 'tool' | 'status' | 'error';
+
 export class MessageActivity {
   id: string = '';
+  kind: ActivityKind = 'status';
   title: string = '';
   detail: string = '';
   state: ActivityState = 'running';

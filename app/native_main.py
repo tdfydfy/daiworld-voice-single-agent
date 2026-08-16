@@ -178,6 +178,100 @@ def _load_agents() -> list[AgentDefinition]:
     return agents
 
 
+def _load_hermes_token() -> str:
+    token_file = os.getenv("HERMES_DASHBOARD_SESSION_TOKEN_FILE", "").strip()
+    if not token_file:
+        return os.getenv("HERMES_DASHBOARD_SESSION_TOKEN", "")
+    try:
+        token = Path(token_file).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError("cannot read HERMES_DASHBOARD_SESSION_TOKEN_FILE") from exc
+    prefix = "HERMES_DASHBOARD_SESSION_TOKEN="
+    if token.startswith(prefix):
+        token = token[len(prefix):].strip()
+    if not token:
+        raise ValueError("HERMES_DASHBOARD_SESSION_TOKEN_FILE is empty")
+    return token
+
+
+def _hermes_profile_agents(payload: object, backend_url: str) -> list[AgentDefinition]:
+    """Convert Hermes' public status profile list into the Adapter catalog."""
+    rows: object = payload.get("profiles") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        raise ValueError("Hermes profile catalog must contain a profiles array")
+
+    agents: list[AgentDefinition] = []
+    seen_ids: set[str] = set()
+    default_count = 0
+    for row in rows:
+        if isinstance(row, str):
+            profile = {"name": row}
+        elif isinstance(row, dict):
+            profile = row
+        else:
+            continue
+        agent_id = str(profile.get("name") or profile.get("id") or "").strip()
+        if not AGENT_ID_PATTERN.fullmatch(agent_id) or agent_id in seen_ids:
+            continue
+        display_name = str(
+            profile.get("display_name") or profile.get("label") or agent_id
+        ).strip()
+        if not display_name:
+            display_name = agent_id
+        is_default = profile.get("is_default") is True or agent_id == "default"
+        default_count += int(is_default)
+        seen_ids.add(agent_id)
+        agents.append(AgentDefinition(
+            id=agent_id,
+            name=display_name,
+            url=backend_url.rstrip("/"),
+            is_default=is_default,
+            avatar_url=str(profile.get("avatar_url") or "").strip(),
+            provider_label=str(
+                profile.get("provider") or profile.get("provider_label") or ""
+            ).strip(),
+        ))
+    if default_count > 1:
+        # Older Hermes responses may mark both the name and flag as default.
+        first_default = next((agent.id for agent in agents if agent.is_default), "")
+        agents = [
+            AgentDefinition(
+                id=agent.id,
+                name=agent.name,
+                url=agent.url,
+                is_default=agent.id == first_default,
+                avatar_url=agent.avatar_url,
+                provider_label=agent.provider_label,
+                instructions=agent.instructions,
+            )
+            for agent in agents
+        ]
+    if agents and not any(agent.is_default for agent in agents):
+        first = agents[0]
+        agents[0] = AgentDefinition(
+            id=first.id,
+            name=first.name,
+            url=first.url,
+            is_default=True,
+            avatar_url=first.avatar_url,
+            provider_label=first.provider_label,
+            instructions=first.instructions,
+        )
+    if not agents:
+        raise ValueError("Hermes profile catalog is empty or invalid")
+    return agents
+
+
+async def fetch_hermes_profiles(
+    client: httpx.AsyncClient,
+    backend_url: str,
+) -> list[AgentDefinition]:
+    response = await client.get(f"{backend_url.rstrip('/')}/api/status")
+    if response.status_code != 200:
+        raise RuntimeError(f"Hermes profile catalog HTTP {response.status_code}")
+    return _hermes_profile_agents(response.json(), backend_url)
+
+
 def inject_session_instructions(message: str, instructions: str) -> str:
     if not instructions:
         return message
@@ -191,6 +285,33 @@ def inject_session_instructions(message: str, instructions: str) -> str:
     if not isinstance(params, dict) or params.get("instructions"):
         return message
     params["instructions"] = instructions
+    return json.dumps(frame, ensure_ascii=False, separators=(",", ":"))
+
+
+PROFILE_SCOPED_SESSION_METHODS = {
+    "session.create",
+    "session.list",
+    "session.resume",
+    "session.delete",
+}
+
+
+def inject_session_profile(message: str, profile: str) -> str:
+    if not profile:
+        return message
+    try:
+        frame = json.loads(message)
+    except (json.JSONDecodeError, TypeError):
+        return message
+    if not isinstance(frame, dict) or frame.get("method") not in PROFILE_SCOPED_SESSION_METHODS:
+        return message
+    params = frame.get("params")
+    if params is None:
+        params = {}
+        frame["params"] = params
+    if not isinstance(params, dict) or params.get("profile"):
+        return message
+    params["profile"] = profile
     return json.dumps(frame, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -268,12 +389,22 @@ async def fetch_hermes_session_detail(
     backend_url: str,
     hermes_token: str,
     session_id: str,
+    profile: str = "",
 ) -> dict:
     encoded = quote(str(session_id), safe="")
     headers = {"X-Hermes-Session-Token": hermes_token}
+    params = {"profile": profile} if profile else None
     session_response, messages_response = await asyncio.gather(
-        client.get(f"{backend_url.rstrip('/')}/api/sessions/{encoded}", headers=headers),
-        client.get(f"{backend_url.rstrip('/')}/api/sessions/{encoded}/messages", headers=headers),
+        client.get(
+            f"{backend_url.rstrip('/')}/api/sessions/{encoded}",
+            headers=headers,
+            params=params,
+        ),
+        client.get(
+            f"{backend_url.rstrip('/')}/api/sessions/{encoded}/messages",
+            headers=headers,
+            params=params,
+        ),
     )
     session_response.raise_for_status()
     messages_response.raise_for_status()
@@ -289,20 +420,37 @@ async def fetch_hermes_session_detail(
 class NativeSettings:
     def __init__(self) -> None:
         self.access_token = os.getenv("VOICE_ACCESS_TOKEN", "")
-        self.hermes_token = os.getenv("HERMES_DASHBOARD_SESSION_TOKEN", "")
+        self.hermes_token = _load_hermes_token()
         self.cookie_secure = os.getenv("VOICE_COOKIE_SECURE", "").lower() in {"1", "true", "yes"}
         self.backend_on_demand = os.getenv("HERMES_BACKEND_ON_DEMAND", "").lower() in {
             "1", "true", "yes"
         }
+        self.profile_catalog_enabled = os.getenv("HERMES_PROFILE_CATALOG_ENABLED", "true").lower() in {
+            "1", "true", "yes"
+        } and os.getenv("HERMES_AGENTS_JSON") is None
+        self.catalog_base_url = (
+            os.getenv("HERMES_GATEWAY_URL")
+            or "http://127.0.0.1:9119"
+        ).strip().rstrip("/")
+        self.catalog_lock = asyncio.Lock()
+        self.catalog_attempted = not self.profile_catalog_enabled
+        self.catalog_error = ""
         self.agents = _load_agents()
         self.backends = {agent.id: agent.url for agent in self.agents}
         self.provider_labels = {agent.id: agent.provider_label for agent in self.agents}
         self.instructions = {agent.id: agent.instructions for agent in self.agents}
 
+    def replace_agents(self, agents: list[AgentDefinition]) -> None:
+        self.agents = agents
+        self.backends = {agent.id: agent.url for agent in agents}
+        self.provider_labels = {agent.id: agent.provider_label for agent in agents}
+        self.instructions = {agent.id: agent.instructions for agent in agents}
+
 
 def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
     settings = settings or NativeSettings()
     app = FastAPI(title="Daiworld Native Hermes Web", version="0.2.0-native-open-source")
+    app.state.settings = settings
     artifact_roots = [
         item.strip()
         for item in os.getenv("VOICE_ARTIFACT_ROOTS", tempfile.gettempdir()).split(os.pathsep)
@@ -325,6 +473,42 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
 
     def websocket_token(ws: WebSocket, query_token: str) -> str:
         return query_token or ws.cookies.get("voice_session", "")
+
+    async def ensure_agent_catalog(force: bool = False) -> None:
+        if not settings.profile_catalog_enabled:
+            return
+        if settings.catalog_attempted and not force:
+            return
+        async with settings.catalog_lock:
+            if settings.catalog_attempted and not force:
+                return
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    agents = await fetch_hermes_profiles(
+                        client,
+                        settings.catalog_base_url,
+                    )
+                known_agents = {agent.id: agent for agent in settings.agents}
+                agents = [
+                    AgentDefinition(
+                        id=agent.id,
+                        name=known_agents.get(agent.id, agent).name,
+                        url=agent.url,
+                        is_default=agent.is_default,
+                        avatar_url=known_agents.get(agent.id, agent).avatar_url,
+                        provider_label=known_agents.get(agent.id, agent).provider_label,
+                        instructions=known_agents.get(agent.id, agent).instructions,
+                    )
+                    for agent in agents
+                ]
+                settings.replace_agents(agents)
+                settings.catalog_error = ""
+            except Exception as exc:
+                # Preserve the last usable catalog. A retry only happens through
+                # an explicit refresh request or after the Adapter restarts.
+                settings.catalog_error = str(exc)
+            finally:
+                settings.catalog_attempted = True
 
     @app.post("/api/auth/session")
     async def auth_session(request: Request, x_voice_token: str = Header(default="")) -> Response:
@@ -386,8 +570,12 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
         return {"status": "ok", "mode": "hermes-native", "profiles": states}
 
     @app.get("/api/agents")
-    async def agent_catalog(x_voice_token: str = Header(default="")) -> dict:
+    async def agent_catalog(
+        refresh: bool = False,
+        x_voice_token: str = Header(default=""),
+    ) -> dict:
         require_access(x_voice_token)
+        await ensure_agent_catalog(force=refresh)
         return {"agents": [agent.public_dict() for agent in settings.agents]}
 
     @app.post("/api/audio/transcribe")
@@ -449,6 +637,7 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.get(
                 f"{backend(profile)}/api/model/options",
+                params={"profile": profile},
                 headers={"X-Hermes-Session-Token": settings.hermes_token},
             )
             if response.status_code != 200:
@@ -472,6 +661,7 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
                 f"{backend(profile)}/api/model/set",
+                params={"profile": profile},
                 json=body,
                 headers={"X-Hermes-Session-Token": settings.hermes_token},
             )
@@ -496,6 +686,7 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
                     backend(profile),
                     settings.hermes_token,
                     session_id,
+                    profile,
                 )
         except httpx.HTTPStatusError as exc:
             status = 404 if exc.response.status_code == 404 else 502
@@ -592,7 +783,7 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
         except HTTPException:
             await ws.close(code=4401)
             return
-        query = urlencode({"token": settings.hermes_token})
+        query = urlencode({"token": settings.hermes_token, "profile": profile})
         await relay_ws(
             ws,
             f"{base}/api/ws?{query}",
@@ -602,7 +793,7 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
                 settings.provider_labels[profile],
             ),
             transform_client_text=lambda message: inject_session_instructions(
-                message,
+                inject_session_profile(message, profile),
                 settings.instructions[profile],
             ),
             heartbeat_interval=GATEWAY_HEARTBEAT_INTERVAL_SECONDS,

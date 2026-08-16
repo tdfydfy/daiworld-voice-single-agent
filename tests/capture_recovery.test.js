@@ -60,17 +60,33 @@ test('capture recovery stops after the bounded retry budget', async () => {
   assert.equal(state.recoveryAttempt, 3);
 });
 
-test('observed PCM restores the complete capture retry budget', async () => {
+test('one observed PCM does not restore the capture retry budget', async () => {
   const { CaptureRecoveryState } = await loadProductionState();
-  const state = new CaptureRecoveryState(3);
-  const startGeneration = state.beginStart();
-  state.markRunning(startGeneration);
-  const recoveryGeneration = state.beginRecovery();
-  state.markRunning(recoveryGeneration);
+  const state = new CaptureRecoveryState(3, 60000, 10000);
+  const startGeneration = state.beginStart(1000);
+  state.markRunning(startGeneration, 1000);
+  const recoveryGeneration = state.beginRecovery(2000);
+  state.markRunning(recoveryGeneration, 3000);
 
   assert.equal(state.recoveryAttempt, 1);
-  assert.equal(state.observePcm(recoveryGeneration), true);
+  assert.equal(state.observePcm(recoveryGeneration, 3001), true);
+  assert.equal(state.recoveryAttempt, 1);
+  assert.equal(state.observePcm(recoveryGeneration, 13000), true);
   assert.equal(state.recoveryAttempt, 0);
+});
+
+test('capture recovery budget resets after the time window expires', async () => {
+  const { CaptureRecoveryState } = await loadProductionState();
+  const state = new CaptureRecoveryState(1, 60000, 10000);
+  const startGeneration = state.beginStart(1000);
+  state.markRunning(startGeneration, 1000);
+  const recoveryGeneration = state.beginRecovery(2000);
+  state.markRunning(recoveryGeneration, 3000);
+
+  assert.equal(state.beginRecovery(4000), -1);
+  state.phase = 'running';
+  assert.ok(state.beginRecovery(62001) > 0);
+  assert.equal(state.recoveryAttempt, 1);
 });
 
 test('explicit stop cancels pending capture recovery generations', async () => {
@@ -86,4 +102,17 @@ test('explicit stop cancels pending capture recovery generations', async () => {
   assert.equal(state.recoveryAttempt, 0);
   assert.equal(state.markRunning(recoveryGeneration), false);
   assert.equal(state.failRecovery(recoveryGeneration), false);
+});
+
+test('communication session recovery does not tear down a healthy capturer', () => {
+  const source = fs.readFileSync(path.resolve(
+    __dirname,
+    '../clients/harmony/entry/src/main/ets/services/PcmCapture.ets',
+  ), 'utf8');
+  const constructorStart = source.indexOf('constructor()');
+  const constructorBody = source.slice(constructorStart, source.indexOf('async requestPermission(', constructorStart));
+
+  assert.match(constructorBody, /'communication-session-recovered', true/);
+  assert.doesNotMatch(constructorBody, /'communication-session-recovered', false/);
+  assert.doesNotMatch(constructorBody, /session\.setFailureListener/);
 });

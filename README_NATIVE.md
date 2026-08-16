@@ -9,7 +9,7 @@
 
 这是用户直接面对一个 Hermes Agent 的简化形态：
 
-- 用户手动选择 `default / hexiaoma / hexiaoxin`；
+- 用户从 Hermes Profile 目录中手动选择一个 Agent；
 - 每次只有一个当前 Profile；
 - 不包含主持人、多 Agent 编排、HOST协议或共享上下文；
 - 非精确停止的语音默认是下一轮输入；
@@ -27,10 +27,8 @@ Native Adapter :8844
   ├─ /api/hermes/sessions/{id}
   └─ /api/artifacts/{token}
   ↕
-Hermes serve --isolated
-  ├─ default   :9120
-  ├─ hexiaoma  :9121
-  └─ hexiaoxin :9122
+Hermes 官方 Dashboard/API :9119
+  └─ default / 全部命名 Profile（请求级隔离）
 ```
 
 ## 3. 本地启动
@@ -38,9 +36,7 @@ Hermes serve --isolated
 ```bash
 export HERMES_DASHBOARD_SESSION_TOKEN=CHANGE_ME_INTERNAL_TOKEN
 
-hermes -p default serve --isolated --host 127.0.0.1 --port 9120 --skip-build
-hermes -p hexiaoma serve --isolated --host 127.0.0.1 --port 9121 --skip-build
-hermes -p hexiaoxin serve --isolated --host 127.0.0.1 --port 9122 --skip-build
+hermes dashboard --host 127.0.0.1 --port 9119 --skip-build --no-open
 ```
 
 另开终端：
@@ -48,12 +44,15 @@ hermes -p hexiaoxin serve --isolated --host 127.0.0.1 --port 9122 --skip-build
 ```bash
 VOICE_ACCESS_TOKEN=CHANGE_ME_GATEWAY_TOKEN \
 HERMES_DASHBOARD_SESSION_TOKEN=CHANGE_ME_INTERNAL_TOKEN \
-HERMES_DEFAULT_URL=http://127.0.0.1:9120 \
-HERMES_HEXIAOMA_URL=http://127.0.0.1:9121 \
-HERMES_HEXIAOXIN_URL=http://127.0.0.1:9122 \
+HERMES_GATEWAY_URL=http://127.0.0.1:9119 \
+HERMES_PROFILE_CATALOG_ENABLED=true \
 python -m uvicorn app.native_main:app \
   --host 127.0.0.1 --port 8844
 ```
+
+首次鉴权后读取 `/api/agents` 时，Adapter 从 Hermes 公开的 `/api/status.profiles` 读取一次 Profile ID 并缓存结果。普通请求只读内存；用户点击“刷新列表”时客户端发送 `?refresh=1`，Adapter 才重新读取。Adapter 重启后在下一次目录请求重新建立缓存，不运行分钟级刷新任务。
+
+`HERMES_AGENTS_JSON` 和三个 `HERMES_*_URL` 仅用于旧 Hermes 或回滚，不再作为日常 Profile 注册方式。正式部署只复用 Hermes 已有的单个 Dashboard；旧的 `hermes-native-profile@.service` 和三个 socket 单元不得同时启用。
 
 打开：
 

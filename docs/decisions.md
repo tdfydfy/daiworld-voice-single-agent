@@ -1,6 +1,23 @@
 # 关键决策记录
 
-## 2026-08-13 - 恢复 CoreSpeech 原生播放与专用后台模式
+## 2026-08-16 修订 - AudioSession 超时与设备路由边界
+
+- 真机日志确认 `reason=1` 是 `DEACTIVATED_TIMEOUT`，属于通信会话自然过期，不代表 Capturer 或 Renderer 已损坏。
+- `AudioContinuityCoordinator` 只负责后台 `recording/playback` demand，不再持有空的通信 AudioSession；真实 Capturer 和 PCM Renderer 各自持有自己的租约。
+- 会话超时不触发自动恢复，也不向组件广播失败；只有低优先级失活才在仍有真实音频流时限次恢复，成功恢复后重新开始恢复预算。
+- 设备拓扑变化只更新当前实际路由：无耳机默认扬声器，有耳机交回系统耳机优先；路由回调不得改写持久化的用户偏好。
+- 本修订替代本文件中“连续性协调器持有共享通信 AudioSession”的当前结论；历史记录保留不改写。
+
+## 2026-08-16 - 双工会话固定录音后台租约，TTS 完成必须经过确认
+
+- 背景：`1.2.6` 真机确认普通前后台往返可持续录音，但长时间息屏后采集恢复报 `system error`；长播报在 `TTSStateObserver--OnPageHide` 后出现 2 ms 内的 `onComplete(type=1)`，客户端把系统中止误当自然完成并连续推进队列，造成跳字和断裂。开关麦克风时耳机音量明显变化，说明通信 AudioSession 的生命周期仍附着在 Capturer，而不是完整语音活动。
+- 决策：选择 S4 候选 B。只要录音 demand 存在，后台任务始终保持 `AUDIO_RECORDING`；播放 demand 不触发 stop/start，只有纯播放场景使用 `AUDIO_PLAYBACK`。`AudioContinuityCoordinator` 在任一录音或播放 demand 存在时持有共享通信 AudioSession，避免 Capturer/Renderer 交接改变路由和音量域。CoreSpeech 只有在收到 `onStart` 且经过与文本长度、语速相符的保守最短时长后，`onComplete(type=1)` 才能推进队列；快速完成按中断处理，保留完整活动段，有限重试后等待页面重新可见再恢复。
+- 依据：`bm dump` 在故障后显示 `runningResourcesApply=false`，证明后台任务已退出；专用模式 C 的 stop/start 切换会主动制造录音保障空窗。CoreSpeech 不在目标设备返回可用 PCM，因此客户端无法知道精确播放帧，只能选择“不吞字、允许完整短段重复”的保守边界，不能把页面隐藏后的毫秒级回调当成用户已经听完。
+- 影响：录音和播放 demand 仍独立保存，但平台策略录音优先；后台模式和通信 AudioSession 不再随每个提示音或 TTS 分段抖动。系统 TTS 若在息屏中持续拒绝新播放，只保证不丢文本并在回到应用后恢复；真正的息屏连续播报需要后续真机证明固定录音租约可保持 CoreSpeech，否则必须使用应用自管的远端 PCM 路径。
+- 重新评估条件：目标真机 D2/D3 证明固定 `AUDIO_RECORDING` 仍不能维持采集，或 CoreSpeech 在页面隐藏时无法继续任何新分段；前者比较会话级固定 `AUDIO_PLAYBACK`，后者不再修改系统 TTS 队列，而是把后台连续播报能力明确交给远端 PCM。
+- 长期约束：[HarmonyOS 音频用户旅程与业务逻辑](HARMONYOS_AUDIO_USER_JOURNEY.md)
+
+## 2026-08-13 - 恢复 CoreSpeech 原生播放与专用后台模式（已由 2026-08-16 决策取代）
 
 - 背景：`1.2.4` 已显式请求 `audioType: pcm`，但目标真机仍未产生任何 `SpeakListener.onData`；应用只能报“本地 TTS 未返回 PCM 音频流”。Git 历史同时证明 `1.1.2/1.2.1` 使用系统 `engine.speak()` 和播放优先的专用 `AUDIO_PLAYBACK` 时，用户曾确认息屏长文连续。
 - 决策：本地 CoreSpeech 恢复系统内置播放器，不再要求 PCM 回调；后台任务按当前活动在 `AUDIO_PLAYBACK` 与 `AUDIO_RECORDING` 间切换，系统 TTS 启动前必须等待播放模式 ready，播放结束或用户开口后恢复录音模式。远端 TTS 继续使用应用 PCM renderer。
@@ -213,3 +230,29 @@
 - 影响：旧口令“闭麦”、`be my`、`in my`、`be mine` 及带其他语义内容的句子不再触发；“停止”继续独立表示中断任务。
 - 假设：当前 ASR 主要服务中文连续对话，用户可以通过 UI 麦克风按钮重新开启收音。
 - 重新评估条件：真机持续出现新的稳定误识别且能证明不会与普通对话冲突，或产品改为多语言语音控制。
+# 当前有效决策
+
+## 2026-08-16 - Agent 目录预加载，用户确认后再连接
+
+- 背景：旧流程在页面显示后自动连接，并在鉴权流程内部加载 `/api/agents`。用户无法在首次连接前选择 Agent；目录刷新与网关连接耦合，也让部署中的 Agent 数量难以确认。
+- 决策：`HermesRuntime.prepareAgentCatalog()` 独立使用访问口令读取服务端目录，启动设置加载后完成预取；首屏只展示目录和选择器，用户点击“进入”后才获取 Session Cookie、打开 Gateway 并创建/恢复 Session。在线切换仍按现有会话重连路径执行，离线切换只更新配置和待连接身份。
+- 依据：`/api/agents` 是 Adapter 的唯一 Agent 权威来源，客户端不写死 Profile、不伪造缺失 Agent；目录加载和 Gateway 连接拥有不同的失败、重试和生命周期边界。
+- 影响：客户端列表会完整展示 Adapter 返回的所有有效 `id/name` 项，并显示当前数量；如果真机数量不正确，优先检查 Hermes `/api/status` 的 `profiles`、Adapter 目录缓存和手机实际指向的服务端，不能在客户端添加未知项。
+- 重新评估条件：Adapter 提供正式的目录版本/推送协议，或需要在无网络时使用有版本的本地 Agent 快照。
+
+## 2026-08-16 - 思考、工具与状态统一为有序过程时间线
+
+- 背景：思考文本和工具活动分属两个字段，UI 固定先渲染完整思考再渲染工具，因此无法呈现“思考 -> 工具 -> 思考”的真实顺序，工具也缺少输入和结果摘要。
+- 决策：`MessageActivity.kind` 统一表示 `thinking/tool/status/error`；连续思考 delta 合并到最后一个思考项，工具开始或状态变化结束当前思考段，工具完成只更新原工具项。历史恢复构造同一时间线；完整思考保留在 `ChatMessage.thinking` 作为兼容字段，但不再作为实时 UI 主来源。
+- 依据：事件到达顺序是客户端能可靠拥有的唯一过程顺序，工具结果可能晚于后续思考，必须通过稳定 `tool_id` 原地更新而不是重新追加。
+- 影响：UI 依次展示思考段、工具调用目的/输入、进展、结果或失败和耗时；摘要限制长度并清理空白，避免把完整参数直接泄露到界面。
+- 重新评估条件：Hermes 提供带明确时间戳和父子关系的过程 trace，届时可在不破坏旧消息的前提下增加服务端顺序校正。
+
+## 2026-08-16 - Hermes Profile Registry 是 Agent 目录唯一来源
+
+- 背景：Adapter 和 systemd 曾分别维护三个固定 Profile，新增 Profile 无法自动出现在客户端；Hermes 已有 Dashboard 和四个 `gateway run` Profile 进程时，我们仍为语音客户端额外启动 `hermes serve --isolated`，重复占用资源。
+- 决策：正式部署直接复用 Hermes 已有的官方 Dashboard/API，不再创建专用 Hermes runtime。Dashboard 只绑定 `127.0.0.1:9119`，使用现有 `VOICE_ACCESS_TOKEN` 作为内部 session token；Adapter 在首次鉴权目录请求时读取一次公开的 `/api/status.profiles` 并缓存，所有 Profile 共用同一上游 URL，由 HTTP 查询参数和 Session JSON-RPC `params.profile` 保持请求级隔离。
+- 刷新边界：Profile 增加是低频管理事件，不运行分钟级轮询或后台定时任务。普通 `/api/agents` 只读内存；用户点击“刷新列表”发送 `refresh=1`，或 Adapter 重启后的首次请求，才重新读取 Hermes。首次失败保留兼容目录且不自动重试。
+- 影响：新增 Profile 不再修改 Adapter JSON、端口映射或 systemd `case`；`HERMES_AGENTS_JSON`、三个静态 URL 和旧的 Profile/socket 单元只保留为旧 Hermes 兼容与回滚路径，正式环境停用这些额外进程。
+- 假设：部署中的 Hermes 官方 Dashboard 在 loopback 模式提供 `/api/status`、Session、模型和音频路由，并按 Profile 参数隔离；远端升级时必须先验证这些契约。
+- 重新评估条件：Hermes 提供带版本号的 Profile 变更推送，或官方 Dashboard 无法隔离现有 MCP 工具与凭据。

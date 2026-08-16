@@ -16,7 +16,7 @@ import {
   SnapshotListener
 } from '../services/SingleAgentController';
 import { DEFAULT_GATEWAY_URL } from '../services/AppSettingsStore';
-import { VoiceOption } from '../services/SystemSpeechService';
+import { VoiceOption } from '../services/SystemTtsPlayer';
 
 const COLOR_BG = '#08090A';
 const COLOR_PANEL = '#111315';
@@ -117,18 +117,14 @@ struct Index {
       clearInterval(this.clockTimer);
       this.clockTimer = undefined;
     }
+    this.controller.dispose().catch(() => undefined);
   }
 
   onPageShow(): void {
     if (!this.controllerReady) {
       return;
     }
-    const config = this.controller.getConfig();
-    if (!this.showSettings && config.accessToken.length > 0 && this.snapshot.connection === 'offline') {
-      setTimeout((): void => {
-        this.controller.connect();
-      }, 200);
-    }
+    this.controller.onPageVisible();
   }
 
   private openSettings(): void {
@@ -182,10 +178,11 @@ struct Index {
       this.hasSavedToken = token.length > 0;
       this.showSettings = false;
       if (reconnect) {
-        this.controller.disconnect();
-      }
-      if (reconnect || this.snapshot.connection === 'offline') {
-        this.controller.connect();
+        this.controller.disconnect().then((): void => {
+          this.controller.refreshAgents();
+        });
+      } else if (this.snapshot.connection === 'offline') {
+        this.controller.refreshAgents();
       }
     }).catch((): void => {
       this.settingsSaving = false;
@@ -210,11 +207,7 @@ struct Index {
       this.snapshot.credentialState === 'storage_error';
     if (this.showSettings) {
       this.loadVoiceOptions();
-      return;
     }
-    setTimeout((): void => {
-      this.controller.connect();
-    }, 0);
   }
 
   private loadVoiceOptions(): void {
@@ -423,6 +416,20 @@ struct Index {
   private switchAgent(profile: ProfileKey): void {
     this.selectedProfile = profile;
     this.controller.switchProfile(profile);
+  }
+
+  private showAgentEntry(): boolean {
+    return this.snapshot.connection !== 'online' &&
+      this.snapshot.runtimeSessionId.length === 0 &&
+      this.snapshot.messages.length === 0;
+  }
+
+  private connectSelectedAgent(): void {
+    if (this.snapshot.agentsLoading || this.snapshot.agents.length === 0 ||
+      this.snapshot.connection === 'connecting') {
+      return;
+    }
+    this.controller.connect();
   }
 
   private showHistoryPanel(): void {
@@ -730,23 +737,35 @@ struct Index {
 
       Column({ space: 5 }) {
         Row({ space: 6 }) {
-          Select(this.profileSelectItems())
-            .selected(this.profileIndex(this.snapshot.selectedProfile))
-            .value(this.selectedAgentName())
-            .font({ size: 12 })
-            .fontColor(COLOR_TEXT)
-            .backgroundColor(COLOR_BG)
-            .border({ width: 1, color: COLOR_LINE })
-            .borderRadius(7)
-            .layoutWeight(1)
-            .height(40)
-            .enabled(!this.snapshot.agentBusy && this.snapshot.connection === 'online' && this.snapshot.agents.length > 1)
-            .opacity(!this.snapshot.agentBusy && this.snapshot.connection === 'online' && this.snapshot.agents.length > 1 ? 1 : 0.55)
-            .onSelect((index: number, _value: string): void => {
-              if (index >= 0 && index < this.snapshot.agents.length) {
-                this.switchAgent(this.snapshot.agents[index].id);
-              }
-            })
+          if (this.showAgentEntry()) {
+            Text(this.selectedAgentName())
+              .fontSize(13)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(COLOR_TEXT)
+              .layoutWeight(1)
+              .height(40)
+              .textAlign(TextAlign.Start)
+          } else {
+            Select(this.profileSelectItems())
+              .selected(this.profileIndex(this.snapshot.selectedProfile))
+              .value(this.selectedAgentName())
+              .font({ size: 12 })
+              .fontColor(COLOR_TEXT)
+              .backgroundColor(COLOR_BG)
+              .border({ width: 1, color: COLOR_LINE })
+              .borderRadius(7)
+              .layoutWeight(1)
+              .height(40)
+              .enabled(!this.snapshot.agentBusy && !this.snapshot.agentsLoading &&
+                this.snapshot.connection !== 'connecting' && this.snapshot.agents.length > 1)
+              .opacity(!this.snapshot.agentBusy && !this.snapshot.agentsLoading &&
+                this.snapshot.connection !== 'connecting' && this.snapshot.agents.length > 1 ? 1 : 0.55)
+              .onSelect((index: number, _value: string): void => {
+                if (index >= 0 && index < this.snapshot.agents.length) {
+                  this.switchAgent(this.snapshot.agents[index].id);
+                }
+              })
+          }
         }
         .width('100%')
 
@@ -1383,6 +1402,115 @@ struct Index {
   }
 
   @Builder
+  private AgentEntryPanel() {
+    Column({ space: 14 }) {
+      Text('选择 Agent')
+        .fontSize(18)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(COLOR_TEXT)
+
+      if (this.snapshot.agentsLoading) {
+        LoadingProgress()
+          .width(28)
+          .height(28)
+          .color(COLOR_ACCENT)
+        Text('正在加载 Agent 列表')
+          .fontSize(12)
+          .fontColor(COLOR_MUTED)
+      } else if (this.snapshot.agents.length > 0) {
+        Select(this.profileSelectItems())
+          .selected(this.profileIndex(this.snapshot.selectedProfile))
+          .value(this.selectedAgentName())
+          .width('100%')
+          .height(48)
+          .font({ size: 14 })
+          .fontColor(COLOR_TEXT)
+          .backgroundColor(COLOR_PANEL)
+          .border({ width: 1, color: COLOR_LINE })
+          .borderRadius(8)
+          .enabled(this.snapshot.connection !== 'connecting')
+          .onSelect((index: number, _value: string): void => {
+            if (index >= 0 && index < this.snapshot.agents.length) {
+              this.switchAgent(this.snapshot.agents[index].id);
+            }
+          })
+
+        Text('当前可用 ' + String(this.snapshot.agents.length) + ' 个 Agent')
+          .fontSize(10)
+          .fontColor(COLOR_MUTED)
+
+        Button('进入 ' + this.selectedAgentName(), { type: ButtonType.Normal })
+          .width('100%')
+          .height(46)
+          .fontSize(13)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(COLOR_BG)
+          .backgroundColor(COLOR_ACCENT)
+          .borderRadius(8)
+          .enabled(this.snapshot.connection !== 'connecting')
+          .opacity(this.snapshot.connection === 'connecting' ? 0.55 : 1)
+          .onClick(() => {
+            this.connectSelectedAgent();
+          })
+      }
+
+      if (this.snapshot.connection === 'connecting') {
+        Row({ space: 7 }) {
+          LoadingProgress()
+            .width(16)
+            .height(16)
+            .color(COLOR_ACCENT)
+          Text('正在连接 ' + this.selectedAgentName())
+            .fontSize(11)
+            .fontColor(COLOR_ACCENT)
+        }
+      } else if (this.snapshot.agentsError.length > 0 ||
+        (this.snapshot.connection === 'offline' && this.snapshot.error.length > 0)) {
+        Text(this.snapshot.agentsError.length > 0 ? this.snapshot.agentsError : this.snapshot.error)
+          .width('100%')
+          .fontSize(11)
+          .lineHeight(17)
+          .fontColor(COLOR_DANGER)
+          .textAlign(TextAlign.Center)
+      }
+
+      if (!this.snapshot.agentsLoading && this.snapshot.connection !== 'connecting') {
+        Row({ space: 8 }) {
+          Button('刷新列表', { type: ButtonType.Normal })
+            .height(42)
+            .layoutWeight(1)
+            .fontSize(12)
+            .fontColor(COLOR_TEXT)
+            .backgroundColor(COLOR_PANEL)
+            .border({ width: 1, color: COLOR_LINE })
+            .borderRadius(8)
+            .onClick(() => {
+              this.controller.refreshAgents();
+            })
+          Button('连接设置', { type: ButtonType.Normal })
+            .height(42)
+            .layoutWeight(1)
+            .fontSize(12)
+            .fontColor(COLOR_TEXT)
+            .backgroundColor(COLOR_PANEL)
+            .border({ width: 1, color: COLOR_LINE })
+            .borderRadius(8)
+            .onClick(() => {
+              this.openSettings();
+            })
+        }
+        .width('100%')
+      }
+    }
+    .width('100%')
+    .constraintSize({ maxWidth: 360 })
+    .layoutWeight(1)
+    .padding({ left: 24, right: 24 })
+    .justifyContent(FlexAlign.Center)
+    .alignItems(HorizontalAlign.Center)
+  }
+
+  @Builder
   private EmptyState() {
     Column({ space: 8 }) {
       Text('•••')
@@ -1512,7 +1640,19 @@ struct Index {
           }
         }
         .width('100%')
-        if (activity.detail.length > 0) {
+        if (activity.kind === 'thinking' && activity.detail.length > 0) {
+          Column({ space: 3 }) {
+            ForEach(this.thinkingLines(activity.detail), (line: string) => {
+              Text(line)
+                .width('100%')
+                .fontSize(11)
+                .lineHeight(17)
+                .fontColor(COLOR_TEXT)
+            }, (line: string, index: number) => String(index) + '-' + line)
+          }
+          .width('100%')
+          .alignItems(HorizontalAlign.Start)
+        } else if (activity.detail.length > 0) {
           Text(activity.detail)
             .width('100%')
             .fontSize(10)
@@ -1557,29 +1697,7 @@ struct Index {
       })
 
       if (message.pending || message.processExpanded) {
-        if (message.thinking.length > 0) {
-          Column({ space: 4 }) {
-            Text('思考过程')
-              .width('100%')
-              .fontSize(10)
-              .fontWeight(FontWeight.Medium)
-              .fontColor(COLOR_MUTED)
-            ForEach(this.thinkingLines(message.thinking), (line: string) => {
-              Row({ space: 7 }) {
-                Circle({ width: 4, height: 4 })
-                  .fill(COLOR_ACCENT)
-                Text(line)
-                  .fontSize(11)
-                  .lineHeight(17)
-                  .fontColor(COLOR_TEXT)
-                  .layoutWeight(1)
-              }
-              .width('100%')
-              .alignItems(VerticalAlign.Top)
-            }, (line: string, index: number) => String(index) + '-' + line)
-          }
-          .width('100%')
-        } else if (message.pending && message.activities.length === 0) {
+        if (message.pending && message.activities.length === 0) {
           Text('正在分析请求')
             .width('100%')
             .fontSize(11)
@@ -1879,6 +1997,8 @@ struct Index {
         this.SettingsPanel()
       } else if (this.showHistory) {
         this.HistoryPanel()
+      } else if (this.showAgentEntry()) {
+        this.AgentEntryPanel()
       } else {
         if (this.snapshot.conversationLoading) {
           this.ConversationLoadingState()

@@ -28,7 +28,7 @@ flowchart LR
     U[用户]
     C[Web / HarmonyOS 单Agent客户端]
     A[Same-Origin Native Adapter]
-    H[Hermes Agent backends from catalog]
+    H[Hermes official Dashboard/API]
     DB[(各Profile state.db)]
     FS[(Agent默认文件权限)]
     ASR[Doubao SeedASR-2.0 Streaming Provider]
@@ -43,7 +43,7 @@ flowchart LR
     H --- TTS
 ```
 
-一次客户端连接只选择一个不透明 Agent ID。切换 Agent 等于切换到另一套隔离的 Hermes 后端和历史，不是主持人调度 Agent。目录由 Adapter 的 `/api/agents` 返回，客户端不写死 Profile。
+一次客户端连接只选择一个不透明 Agent ID。切换 Agent 等于切换 Hermes 官方 Dashboard/API 内请求级隔离的 Profile 和历史，不是主持人调度 Agent。Profile 权威目录来自 Hermes 公开的 `/api/status.profiles`，Adapter 只投影公开字段到 `/api/agents`，客户端不写死 Profile。
 
 ## 3. 分层与状态所有权
 
@@ -88,8 +88,8 @@ Provider Key 只在 Hermes 服务端，不进入 Adapter 静态文件、浏览�
 职责：
 
 1. 校验内部访问口令；
-2. 把 Agent Catalog 中的不透明 ID 映射到独立 Hermes `serve --isolated`；
-3. 转发 JSON-RPC、ASR WS 和 TTS WS，并在 JSON-RPC 下行链路每 25 秒发送 `gateway.heartbeat`；
+2. 首次目录请求从 Hermes `/api/status` 的 `profiles` 字段建立内存缓存，并把不透明 Agent ID 映射到 Hermes 已有的 Dashboard/API；
+3. 转发 JSON-RPC、ASR WS 和 TTS WS，为 Session/REST 请求补入目标 Profile，并在 JSON-RPC 下行链路每 25 秒发送 `gateway.heartbeat`；
 4. 聚合 Hermes Session REST 详情和消息时间；
 5. 把 Agent 显式选择的 `MEDIA:<path>` 换成 15 分钟随机令牌；
 6. 受控代理 Provider / 模型公开选项，不向客户端暴露密钥；
@@ -120,7 +120,7 @@ Web 当前实现：`web_native/`。HarmonyOS 后续使用 ArkTS 原生模块。
 
 | 路径 | 鉴权 | 用途 |
 |---|---|---|
-| `GET /api/agents` | `X-Voice-Token` | 动态 Agent 公开目录（不含 URL、凭据或 Provider 内部配置） |
+| `GET /api/agents[?refresh=1]` | `X-Voice-Token` | 动态 Agent 公开目录；`refresh=1` 仅供用户显式刷新（不含 URL、路径、凭据或 Provider 内部配置） |
 | `GET /api/health` | `X-Voice-Token` | Agent Catalog 后端状态 |
 | `GET /api/hermes/model/options?profile=...` | `X-Voice-Token` | 当前 Agent 可用的 Provider / 模型公开标识及可确认的 `active_provider_label` |
 | `POST /api/audio/transcribe` | `X-Voice-Token` | 文件式 ASR fallback |
@@ -138,6 +138,15 @@ Web 当前实现：`web_native/`。HarmonyOS 后续使用 ArkTS 原生模块。
 | `/api/audio/speak-stream?profile=&token=` | Hermes同名路由 | 文本流 → PCM16/24k TTS |
 
 `/api/hermes/ws` 的 Adapter 心跳是下行客户端的应用层保活事件，不转发给 Hermes。客户端收到首个心跳后才启用 70 秒看门狗，因此仍兼容尚未发送心跳的旧 Adapter；心跳事件由网关客户端内部消费，不进入业务事件流。
+
+### 4.3 Profile 目录生命周期
+
+1. Adapter 启动时不轮询 Hermes，也不创建定时任务；
+2. 进程内第一次通过鉴权的 `/api/agents` 请求调用一次 Hermes `/api/status`；
+3. 成功结果保存在进程内存，普通目录请求只读缓存；
+4. 首次失败保留现有兼容目录并记住失败，本进程不会自动反复请求；
+5. 只有用户显式请求 `refresh=1` 或 Adapter 重启后的首次请求才再次读取 Hermes；
+6. `HERMES_AGENTS_JSON` 会关闭自动发现，仅作为旧 Hermes 和紧急回滚入口。
 
 ## 5. Session 身份
 
@@ -335,12 +344,12 @@ Agent明确输出 MEDIA:/path
 ## 15. 部署
 
 ```text
-Hermes default   127.0.0.1:9120
-Hermes hexiaoma  127.0.0.1:9121
-Hermes hexiaoxin 127.0.0.1:9122
+Hermes Dashboard/API 127.0.0.1:9119
 Native Adapter   0.0.0.0:8844
 Public           /voice-native/
 ```
+
+Profile runtime 由 Hermes 自身管理。不要为 Native Adapter 再启用 `hermes-native-profile@.service`、`hermes-native-proxy@.service` 或三个固定端口 socket；它们只保留作旧版本回滚。
 
 反向代理必须：
 

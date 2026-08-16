@@ -26,8 +26,10 @@ export class PcmCapture {
   private session: CommunicationAudioSessionLease = new CommunicationAudioSessionLease();
 
   constructor() {
-    this.session.addRecoveryListener((): void => {
-      this.healthListener?.('communication-session-recovered', false);
+    this.session.setRecoveryListener((): void => {
+      // Session recovery is not a Capturer failure. State callbacks and the
+      // no-PCM watchdog decide whether the existing Capturer needs rebuilding.
+      this.healthListener?.('communication-session-recovered', true);
     });
   }
 

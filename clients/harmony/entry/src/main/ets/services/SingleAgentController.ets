@@ -26,24 +26,25 @@ import { ConversationState, ConversationStateCallbacks } from './ConversationSta
 import { HermesRuntime, HermesRuntimeCallbacks } from './HermesRuntime';
 import { SpeechTextFilter } from './SpeechTextFilter';
 import { AudioContinuityCoordinator } from './AudioContinuityCoordinator';
-import { BackgroundAudioIntent } from './BackgroundAudioTaskOwner';
 import {
   setCommunicationOutputRouteListener,
   setCommunicationSpeakerphoneEnabled,
   showCommunicationOutputPicker
 } from './CommunicationAudioSession';
-import {
-  SystemSpeechCallbacks,
-  SystemSpeechCapabilities,
-  SystemSpeechService,
-  VoiceOption
-} from './SystemSpeechService';
+import { SystemAsrCallbacks, SystemAsrEngine } from './SystemAsrEngine';
+import { SystemTtsCallbacks, SystemTtsPlayer, VoiceOption } from './SystemTtsPlayer';
+import { SystemTtsPlaybackEvent } from './SystemTtsCompletionGate';
 import { VoiceInputCallbacks, VoiceInputCoordinator } from './VoiceInputCoordinator';
 import { VoiceOutputCallbacks, VoiceOutputCoordinator } from './VoiceOutputCoordinator';
+import { VoiceRuntime } from './VoiceRuntime';
+import { VoiceFailure } from './VoiceRuntimeState';
+import { RecoveryBudget } from './RecoveryBudget';
 
 const APPROVAL_ALLOW_PHRASES: string[] = ['同意', '允许', '可以', '执行', '允许执行', '同意执行'];
 const APPROVAL_DENY_PHRASES: string[] = ['取消', '拒绝', '阻止', '不要', '拒绝执行', '阻止执行'];
 const REMOTE_VOICE_RECONNECT_DELAYS_MS: number[] = [250, 750, 1500, 3000];
+const REMOTE_VOICE_STABLE_RESET_MS = 10000;
+const DISPOSE_STEP_TIMEOUT_MS = 3000;
 const CONTROLLER_LOG_DOMAIN = 0xD004;
 const CONTROLLER_LOG_TAG = 'SingleAgentControl';
 
@@ -61,8 +62,10 @@ export class SnapshotListener {
 
 export class SingleAgentController {
   private runtime: HermesRuntime;
+  private voiceRuntime: VoiceRuntime = new VoiceRuntime();
   private audioContinuity: AudioContinuityCoordinator = new AudioContinuityCoordinator();
-  private systemSpeech?: SystemSpeechService;
+  private systemAsr?: SystemAsrEngine;
+  private systemTts?: SystemTtsPlayer;
   private listener?: SnapshotListener;
   private context?: common.UIAbilityContext;
   private appSettings: AppSettingsStore = new AppSettingsStore();
@@ -74,7 +77,13 @@ export class SingleAgentController {
   private discardInterruptedTurnEvents: boolean = false;
   private replacementPromptSubmitted: boolean = false;
   private remoteTtsReconnectTimer?: number;
-  private remoteTtsReconnectAttempt: number = 0;
+  private remoteTtsStableTimer?: number;
+  private remoteTtsRecoveryBudget: RecoveryBudget = new RecoveryBudget(
+    REMOTE_VOICE_RECONNECT_DELAYS_MS.length
+  );
+  private disconnectTask?: Promise<void>;
+  private disposeTask?: Promise<void>;
+  private disposed: boolean = false;
 
   constructor() {
     this.runtime = new HermesRuntime(this.snapshot, new HermesRuntimeCallbacks(
@@ -103,6 +112,7 @@ export class SingleAgentController {
       (): void => this.syncBackgroundVoiceTask(),
       (): Promise<void> => this.audioContinuity.ensurePlaybackReady(),
       (): void => this.cancelRemoteTtsReconnect(),
+      (): void => this.markRemoteTtsReady(),
       (message: string): void => this.handleRemoteTtsDisconnect(message),
       (): string => this.wsUrl('/api/audio/speak-stream', this.snapshot.selectedProfile),
       (): string => this.runtime.getCookie()
@@ -125,11 +135,17 @@ export class SingleAgentController {
   }
 
   setListener(listener: SnapshotListener): void {
+    if (this.disposed) {
+      return;
+    }
     this.listener = listener;
     this.notify();
   }
 
   async setContext(context: common.UIAbilityContext): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
     this.context = context;
     this.audioContinuity.setContext(context);
     this.audioContinuity.setErrorListener((message: string): void => {
@@ -137,31 +153,33 @@ export class SingleAgentController {
       this.notify();
     });
     this.input.setContext(context);
-    this.systemSpeech = new SystemSpeechService(context, new SystemSpeechCallbacks(
-      (active: boolean): void => {
-        this.input.onSystemRecognitionState(active);
+    this.systemAsr = new SystemAsrEngine(new SystemAsrCallbacks(
+      (epoch: number, active: boolean): void => {
+        this.input.onSystemRecognitionState(epoch, active);
       },
-      (text: string, isFinal: boolean, isLast: boolean): void => {
-        this.input.onSystemRecognitionResult(text, isFinal, isLast);
+      (epoch: number, text: string, isFinal: boolean, isLast: boolean): void => {
+        this.input.onSystemRecognitionResult(epoch, text, isFinal, isLast);
       },
-      (): void => {
-        this.input.onRecognitionAudioStart();
+      (epoch: number): void => {
+        this.input.onRecognitionAudioStart(epoch);
       },
-      (phase: string): void => {
-        this.input.onSystemRecognitionStartupPhase(phase);
+      (epoch: number, phase: string): void => {
+        this.input.onSystemRecognitionStartupPhase(epoch, phase);
       },
-      (label: string): void => {
-        this.input.onMicrophoneRouteChanged(label);
-      },
-      (active: boolean): void => {
-        this.output.onSystemSpeechState(active);
-      },
-      (channel: string, message: string): void => {
-        this.onSystemSpeechError(channel, message);
+      (epoch: number, message: string): void => {
+        this.input.onSystemSpeechError(epoch, message);
       }
     ));
-    this.output.setSystemSpeech(this.systemSpeech);
-    this.input.setSystemSpeech(this.systemSpeech);
+    this.systemTts = new SystemTtsPlayer(new SystemTtsCallbacks(
+      (token: string, event: SystemTtsPlaybackEvent): void => {
+        this.output.onSystemSpeechState(token, event);
+      },
+      (token: string, message: string): void => {
+        this.output.onSystemSpeechError(token, message);
+      }
+    ));
+    this.output.setSystemTts(this.systemTts);
+    this.input.setSystemAsr(this.systemAsr);
     try {
       const loaded: AppSettingsLoadResult = await this.appSettings.load(context);
       this.config = loaded.config;
@@ -176,6 +194,9 @@ export class SingleAgentController {
       this.snapshot.credentialError = '访问口令本地存储初始化失败，请重新输入并保存';
       this.snapshot.error = this.snapshot.credentialError;
     }
+    if (this.disposed) {
+      return;
+    }
     this.snapshot.asrBackend = this.config.speechBackend;
     this.snapshot.ttsBackend = this.config.speechBackend;
     this.snapshot.speakerphoneEnabled = this.config.speakerphoneEnabled;
@@ -185,6 +206,9 @@ export class SingleAgentController {
     });
     setCommunicationSpeakerphoneEnabled(this.config.speakerphoneEnabled).catch(() => undefined);
     this.notify();
+    if (this.config.accessToken.length > 0 && this.snapshot.credentialState === 'ready') {
+      await this.refreshAgents();
+    }
   }
 
   getConfig(): ClientConfig {
@@ -231,15 +255,26 @@ export class SingleAgentController {
   }
 
   listSystemVoices(): Promise<VoiceOption[]> {
-    if (!this.systemSpeech) {
+    if (!this.systemTts) {
       const voices: VoiceOption[] = [];
       return Promise.resolve(voices);
     }
-    return this.systemSpeech.listVoices();
+    return this.systemTts.listVoices();
   }
 
   waitForConfigPersistence(): Promise<void> {
     return this.appSettings.waitForPersistence();
+  }
+
+  refreshAgents(): Promise<boolean> {
+    if (this.disposed) {
+      return Promise.resolve(false);
+    }
+    return this.runtime.prepareAgentCatalog(
+      this.config.gatewayUrl,
+      this.config.accessToken,
+      this.config.profile
+    );
   }
 
   loadModelOptions(): void {
@@ -298,16 +333,33 @@ export class SingleAgentController {
       voicePerson: this.config.voicePerson,
       speechRate: this.config.speechRate
     });
+    if (this.snapshot.connection !== 'online') {
+      this.conversation.clearMessages();
+      this.snapshot.storedSessionId = '';
+      this.snapshot.runtimeSessionId = '';
+      this.snapshot.runtimeModel = '';
+      this.snapshot.runtimeProvider = '';
+      this.notify();
+      return;
+    }
     this.disconnect();
-    this.conversation.clearMessages();
-    this.snapshot.storedSessionId = '';
-    this.snapshot.runtimeSessionId = '';
-    this.snapshot.runtimeModel = '';
-    this.snapshot.runtimeProvider = '';
-    this.input.setWanted(restoreVoice);
-    this.output.setEnabled(restoreVoiceOutput);
-    this.notify();
-    this.connect();
+    const epoch = this.voiceRuntime.currentEpoch();
+    const cleanup = this.disconnectTask ?? Promise.resolve();
+    cleanup.then((): void => {
+      if (!this.voiceRuntime.isCurrent(epoch)) {
+        return;
+      }
+      this.conversation.clearMessages();
+      this.snapshot.storedSessionId = '';
+      this.snapshot.runtimeSessionId = '';
+      this.snapshot.runtimeModel = '';
+      this.snapshot.runtimeProvider = '';
+      this.input.setWanted(restoreVoice);
+      this.voiceRuntime.setInputIntent(restoreVoice ? 'conversation' : 'off');
+      this.output.setEnabled(restoreVoiceOutput);
+      this.notify();
+      this.connect();
+    });
   }
 
   // Text input path. Also used after ASR final.
@@ -354,13 +406,34 @@ export class SingleAgentController {
     this.output.beginAgentTurn();
     this.snapshot.statusDetail = queued ? '已排队，等待当前任务完成' : 'Agent 正在思考';
     this.notify();
+    hilog.info(
+      CONTROLLER_LOG_DOMAIN,
+      CONTROLLER_LOG_TAG,
+      'prompt submit queued=%{public}s length=%{public}d session=%{public}s',
+      String(queued),
+      value.length,
+      this.snapshot.runtimeSessionId
+    );
     this.runtime.submitPrompt(value, queued).then((result: Object) => {
-      // Prompt accepted; agent events drive the UI from here.
+      hilog.info(
+        CONTROLLER_LOG_DOMAIN,
+        CONTROLLER_LOG_TAG,
+        'prompt accepted queued=%{public}s session=%{public}s',
+        String(queued),
+        this.snapshot.runtimeSessionId
+      );
     }).catch((error: BusinessError) => {
       if (this.discardInterruptedTurnEvents) {
         this.replacementPromptSubmitted = false;
       }
       const errorText = this.errorMessage(error, '提交请求失败');
+      hilog.error(
+        CONTROLLER_LOG_DOMAIN,
+        CONTROLLER_LOG_TAG,
+        'prompt failed queued=%{public}s error=%{public}s',
+        String(queued),
+        errorText
+      );
       this.snapshot.agentBusy = false;
       this.output.endAgentTurn();
       this.snapshot.error = errorText;
@@ -379,6 +452,7 @@ export class SingleAgentController {
     }
     const outputWasEnabled = this.output.isEnabled();
     this.input.setWanted(true);
+    this.voiceRuntime.setInputIntent('conversation');
     this.output.setEnabled(true);
     if (!outputWasEnabled) {
       this.config.muted = false;
@@ -414,14 +488,9 @@ export class SingleAgentController {
 
   private onOutputRouteChanged(route: AudioOutputRoute, headsetAvailable: boolean): void {
     const speakerphoneEnabled = route === 'speaker';
-    const preferenceChanged = this.config.speakerphoneEnabled !== speakerphoneEnabled;
-    this.config.speakerphoneEnabled = speakerphoneEnabled;
     this.snapshot.speakerphoneEnabled = speakerphoneEnabled;
     this.snapshot.audioOutputRoute = route;
     this.snapshot.headsetOutputAvailable = headsetAvailable;
-    if (preferenceChanged) {
-      this.persistConfig();
-    }
     this.notify();
   }
 
@@ -436,9 +505,11 @@ export class SingleAgentController {
   }
 
   newConversation(): void {
-    this.input.cancelFinalization();
+    const epoch = this.voiceRuntime.begin('switching_session', 'new-conversation');
+    this.output.bindEpoch(epoch);
     this.resetInterruptedTurnGuard();
-    this.output.stopForConversationChange();
+    const inputBinding = this.input.bindEpoch(epoch);
+    const outputCleanup = this.output.stopForConversationChange();
     this.snapshot.asrTranscript = '';
     this.snapshot.asrUtteranceActive = false;
     this.conversation.clearMessages();
@@ -446,15 +517,41 @@ export class SingleAgentController {
     this.snapshot.runtimeSessionId = '';
     this.snapshot.conversationLoading = false;
     this.clearPendingProtocolRequests();
-    if (this.snapshot.connection === 'online') {
-      this.runtime.createSession(100).then((result: Object) => {
-        this.onSessionCreated(result);
-      }).catch(() => undefined);
-    }
     this.notify();
+    Promise.all([inputBinding.catch(() => undefined), outputCleanup.catch(() => undefined)]).then((): void => {
+      if (!this.voiceRuntime.isCurrent(epoch)) {
+        return;
+      }
+      if (this.snapshot.connection !== 'online') {
+        this.input.resumeEpoch(epoch);
+        this.voiceRuntime.complete(epoch, 'new-conversation-offline');
+        return;
+      }
+      this.runtime.createSession(100).then((result: Object) => {
+        if (!this.voiceRuntime.isCurrent(epoch)) {
+          return;
+        }
+        this.onSessionCreated(result);
+        this.commitVoiceRuntimeSession(epoch, result);
+        this.input.resumeEpoch(epoch);
+        this.voiceRuntime.complete(epoch, 'new-conversation');
+      }).catch((error: BusinessError): void => {
+        this.failSessionTransition(epoch, error, '新会话创建失败');
+      });
+    });
   }
 
   async connect(): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
+    const disconnecting = this.disconnectTask;
+    if (disconnecting) {
+      await disconnecting.catch(() => undefined);
+    }
+    if (this.disposed) {
+      return;
+    }
     if (this.snapshot.connection === 'connecting' || this.snapshot.connection === 'online') {
       return;
     }
@@ -466,17 +563,108 @@ export class SingleAgentController {
     );
   }
 
-  disconnect(): void {
+  disconnect(): Promise<void> {
+    if (this.disposed) {
+      return this.disposeTask ?? Promise.resolve();
+    }
+    const existing = this.disconnectTask;
+    if (existing) {
+      return existing;
+    }
+    const epoch = this.voiceRuntime.begin('reconfiguring', 'disconnect');
+    this.output.bindEpoch(epoch);
     this.resetInterruptedTurnGuard();
     this.cancelRemoteVoiceReconnects();
-    this.stopVoice();
+    this.voiceRuntime.setInputIntent('off');
+    this.output.setEnabled(false);
+    const task = Promise.all([
+      this.input.stop().catch(() => undefined),
+      this.output.stopForConversationChange().catch(() => undefined),
+      this.audioContinuity.release().catch(() => undefined)
+    ]).then((): void => {
+      if (!this.voiceRuntime.isCurrent(epoch)) {
+        return;
+      }
+      this.runtime.disconnect();
+      this.input.closeRemote();
+      this.output.closeRemote();
+      this.snapshot.runtimeSessionId = '';
+      this.snapshot.conversationLoading = false;
+      this.clearPendingProtocolRequests();
+      this.voiceRuntime.complete(epoch, 'disconnect');
+      this.notify();
+    });
+    this.disconnectTask = task;
+    task.finally((): void => {
+      if (this.disconnectTask === task) {
+        this.disconnectTask = undefined;
+      }
+    });
+    return task;
+  }
+
+  dispose(): Promise<void> {
+    const existing = this.disposeTask;
+    if (existing) {
+      return existing;
+    }
+    this.disposed = true;
+    this.listener = undefined;
+    setCommunicationOutputRouteListener(undefined);
+    const epoch = this.voiceRuntime.begin('disposing', 'dispose');
+    this.output.bindEpoch(epoch);
+    this.voiceRuntime.setInputIntent('off');
+    this.voiceRuntime.setPlaybackDemand(false);
+    this.cancelRemoteVoiceReconnects();
+    const task = this.disposeResources(epoch);
+    this.disposeTask = task;
+    return task;
+  }
+
+  private async disposeResources(epoch: number): Promise<void> {
+    await this.waitForDisposeStep(this.output.dispose(), 'output');
+    await this.waitForDisposeStep(this.input.stop(), 'input');
+    await this.waitForDisposeStep(this.audioContinuity.release(), 'continuity');
+    await this.waitForDisposeStep(this.systemAsr?.release(epoch) ?? Promise.resolve(), 'system-asr');
+    await this.waitForDisposeStep(this.systemTts?.release() ?? Promise.resolve(), 'system-tts');
     this.runtime.disconnect();
     this.input.closeRemote();
     this.output.closeRemote();
-    this.snapshot.runtimeSessionId = '';
-    this.snapshot.conversationLoading = false;
-    this.clearPendingProtocolRequests();
-    this.notify();
+    this.voiceRuntime.completeDispose(epoch);
+  }
+
+  private waitForDisposeStep(task: Promise<void>, label: string): Promise<void> {
+    return new Promise<void>((resolve: () => void): void => {
+      let settled = false;
+      const finish = (): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timeout);
+        resolve();
+      };
+      const timeout = setTimeout((): void => {
+        hilog.warn(
+          CONTROLLER_LOG_DOMAIN,
+          CONTROLLER_LOG_TAG,
+          'dispose step timed out label=%{public}s timeoutMs=%{public}d',
+          label,
+          DISPOSE_STEP_TIMEOUT_MS
+        );
+        finish();
+      }, DISPOSE_STEP_TIMEOUT_MS);
+      task.then(finish, (error: BusinessError): void => {
+        hilog.warn(
+          CONTROLLER_LOG_DOMAIN,
+          CONTROLLER_LOG_TAG,
+          'dispose step failed label=%{public}s message=%{public}s',
+          label,
+          this.errorMessage(error, 'resource cleanup failed')
+        );
+        finish();
+      });
+    });
   }
 
   private normalizeControlPhrase(text: string): string {
@@ -562,13 +750,15 @@ export class SingleAgentController {
     this.replacementPromptSubmitted = false;
     this.snapshot.asrUtteranceActive = false;
     this.snapshot.asrTranscript = '';
-    this.output.stopForInterrupt();
+    const outputCleanup = this.output.stopForInterrupt();
     this.clearPendingProtocolRequests();
       this.conversation.completeInterruptedAssistantMessage();
     this.snapshot.agentBusy = false;
     this.snapshot.playback = 'none';
     if (shouldPlayCue) {
-      this.output.playStopCue();
+      outputCleanup.then((): void => {
+        this.output.playStopCue();
+      }).catch(() => undefined);
     }
     this.snapshot.statusDetail = '已停止当前任务';
     this.notify();
@@ -594,6 +784,10 @@ export class SingleAgentController {
     this.output.replayMessage(message);
   }
 
+  onPageVisible(): void {
+    this.output.resumeSuspendedSystemSpeech();
+  }
+
   private ensureConnections(): void {
     if (this.snapshot.connection === 'online') {
       this.startVoiceClients();
@@ -603,7 +797,8 @@ export class SingleAgentController {
   }
 
   private stopVoiceInput(): void {
-    this.input.stop();
+    this.voiceRuntime.setInputIntent('off');
+    this.input.stop().catch(() => undefined);
   }
 
   private stopVoice(): void {
@@ -612,15 +807,17 @@ export class SingleAgentController {
   }
 
   private syncBackgroundVoiceTask(): void {
-    let intent: BackgroundAudioIntent = 'none';
-    if (this.output.prefersBackgroundPlayback()) {
-      intent = 'playback';
-    } else if (this.input.isWanted()) {
-      intent = 'recording';
-    } else if (this.output.hasBackgroundOutput()) {
-      intent = 'playback';
+    if (this.disposed) {
+      this.voiceRuntime.setInputIntent('off');
+      this.voiceRuntime.setPlaybackDemand(false);
+      this.audioContinuity.syncDemand(false, false);
+      return;
     }
-    this.audioContinuity.syncIntent(intent);
+    const recordingDemand = this.input.isWanted();
+    const playbackDemand = this.output.hasBackgroundOutput();
+    this.voiceRuntime.setInputIntent(recordingDemand ? 'conversation' : 'off');
+    this.voiceRuntime.setPlaybackDemand(playbackDemand);
+    this.audioContinuity.syncDemand(recordingDemand, playbackDemand);
   }
 
   private onRuntimeReady(): void {
@@ -674,7 +871,8 @@ export class SingleAgentController {
   }
 
   private startVoiceClients(): void {
-    const capabilities: SystemSpeechCapabilities | undefined = this.systemSpeech?.getCapabilities();
+    const sttSupported = this.systemAsr?.isSupported() === true;
+    const ttsSupported = this.systemTts?.isSupported() === true;
     if (this.config.speechBackend === 'harmony_offline') {
       this.cancelRemoteVoiceReconnects();
       this.output.setUsingSystemSpeech(true);
@@ -682,14 +880,14 @@ export class SingleAgentController {
       this.snapshot.ttsBackend = 'harmony_offline';
       this.input.closeRemote();
       this.output.closeRemote();
-      if (!capabilities || !capabilities.tts) {
+      if (!ttsSupported) {
         this.snapshot.ttsState = 'error';
         this.snapshot.error = '设备不支持鸿蒙本地语音合成';
       } else if (this.snapshot.playback === 'none' && this.snapshot.ttsState !== 'speaking') {
         this.snapshot.ttsState = 'ready';
       }
       if (this.input.isWanted()) {
-        if (capabilities && capabilities.stt) {
+        if (sttSupported) {
           this.input.startSystem();
         } else {
           this.input.failSystemRecognition('设备不支持鸿蒙本地语音识别', '检查本地识别能力');
@@ -707,14 +905,23 @@ export class SingleAgentController {
     if (!this.input.isWanted() && !this.output.isEnabled()) {
       return;
     }
+    const epoch = this.voiceRuntime.begin('reconfiguring', 'switch-speech-backend');
+    this.output.bindEpoch(epoch);
     this.cancelRemoteVoiceReconnects();
-    this.output.stopForVoiceClientRestart();
-    await this.input.prepareRestart();
+    await Promise.all([
+      this.output.stopForConversationChange().catch(() => undefined),
+      this.input.prepareBackendSwitch(epoch).catch(() => undefined)
+    ]);
+    if (!this.voiceRuntime.isCurrent(epoch)) {
+      return;
+    }
     this.output.closeRemote();
     this.snapshot.ttsState = 'stopped';
     if (this.output.isEnabled() && this.snapshot.connection === 'online') {
       this.startVoiceClients();
     }
+    this.input.resumeEpoch(epoch);
+    this.voiceRuntime.complete(epoch, 'switch-speech-backend');
   }
 
   private startRemoteVoiceClients(): void {
@@ -748,13 +955,14 @@ export class SingleAgentController {
       return;
     }
     if (channel === 'STT') {
-      this.input.onSystemSpeechError(message);
+      this.input.onSystemSpeechError(this.voiceRuntime.currentEpoch(), message);
       return;
     }
-    this.output.onSystemSpeechError(message);
+    this.output.failSystemSpeech(message);
   }
 
   private handleRemoteTtsDisconnect(message: string): void {
+    this.clearRemoteTtsStableTimer();
     if (!this.canRecoverRemoteTts()) {
       this.output.clearActiveReplayState();
       this.snapshot.ttsState = this.output.isEnabled() && !this.config.muted ? 'error' : 'stopped';
@@ -773,7 +981,7 @@ export class SingleAgentController {
   }
 
   private canRecoverRemoteTts(): boolean {
-    return !this.output.isUsingSystemSpeech() && this.config.speechBackend === 'remote' &&
+    return !this.disposed && !this.output.isUsingSystemSpeech() && this.config.speechBackend === 'remote' &&
       this.output.isEnabled() && !this.config.muted && this.snapshot.connection === 'online' &&
       this.runtime.getCookie().length > 0;
   }
@@ -783,18 +991,22 @@ export class SingleAgentController {
       this.remoteTtsReconnectTimer !== undefined) {
       return;
     }
-    const index = Math.min(
-      this.remoteTtsReconnectAttempt,
-      REMOTE_VOICE_RECONNECT_DELAYS_MS.length - 1
-    );
-    const delay = REMOTE_VOICE_RECONNECT_DELAYS_MS[index];
-    this.remoteTtsReconnectAttempt = Math.min(
-      this.remoteTtsReconnectAttempt + 1,
-      REMOTE_VOICE_RECONNECT_DELAYS_MS.length
-    );
+    const attempt = this.remoteTtsRecoveryBudget.beginAttempt();
+    if (attempt <= 0) {
+      this.snapshot.ttsState = 'error';
+      this.snapshot.statusDetail = '远端 TTS 已停止恢复';
+      this.snapshot.error = '远端 TTS 恢复次数已耗尽';
+      this.notify();
+      return;
+    }
+    const delay = REMOTE_VOICE_RECONNECT_DELAYS_MS[attempt - 1];
     this.remoteTtsReconnectTimer = setTimeout((): void => {
       this.remoteTtsReconnectTimer = undefined;
       if (!this.canRecoverRemoteTts() || this.output.isRemoteConnected() || this.output.isRemoteConnecting()) {
+        return;
+      }
+      if (this.output.hasActivePlaybackJob()) {
+        this.scheduleRemoteTtsReconnect();
         return;
       }
       this.output.reconnectRemote(
@@ -809,7 +1021,31 @@ export class SingleAgentController {
       clearTimeout(this.remoteTtsReconnectTimer);
       this.remoteTtsReconnectTimer = undefined;
     }
-    this.remoteTtsReconnectAttempt = 0;
+    this.clearRemoteTtsStableTimer();
+    this.remoteTtsRecoveryBudget.reset();
+  }
+
+  private markRemoteTtsReady(): void {
+    if (this.remoteTtsReconnectTimer !== undefined) {
+      clearTimeout(this.remoteTtsReconnectTimer);
+      this.remoteTtsReconnectTimer = undefined;
+    }
+    this.clearRemoteTtsStableTimer();
+    this.remoteTtsRecoveryBudget.observeHealthy();
+    const epoch = this.voiceRuntime.currentEpoch();
+    this.remoteTtsStableTimer = setTimeout((): void => {
+      this.remoteTtsStableTimer = undefined;
+      if (!this.disposed && this.voiceRuntime.isCurrent(epoch) && this.output.isRemoteConnected()) {
+        this.remoteTtsRecoveryBudget.observeHealthy();
+      }
+    }, REMOTE_VOICE_STABLE_RESET_MS);
+  }
+
+  private clearRemoteTtsStableTimer(): void {
+    if (this.remoteTtsStableTimer !== undefined) {
+      clearTimeout(this.remoteTtsStableTimer);
+      this.remoteTtsStableTimer = undefined;
+    }
   }
 
   private cancelRemoteVoiceReconnects(): void {
@@ -818,14 +1054,16 @@ export class SingleAgentController {
   }
 
   private handleEvent(type: string, sessionId: string, payload: Object | undefined): void {
-    hilog.info(
-      CONTROLLER_LOG_DOMAIN,
-      CONTROLLER_LOG_TAG,
-      'gateway event type=%{public}s session=%{public}s runtime=%{public}s',
-      type,
-      sessionId,
-      this.snapshot.runtimeSessionId
-    );
+    if (type !== 'message.delta' && type !== 'thinking.delta' && type !== 'reasoning.delta') {
+      hilog.info(
+        CONTROLLER_LOG_DOMAIN,
+        CONTROLLER_LOG_TAG,
+        'gateway event type=%{public}s session=%{public}s runtime=%{public}s',
+        type,
+        sessionId,
+        this.snapshot.runtimeSessionId
+      );
+    }
     if (sessionId.length > 0 && sessionId !== this.snapshot.runtimeSessionId) {
       // Late event from an older session: drop it.
       hilog.warn(
@@ -1074,41 +1312,83 @@ export class SingleAgentController {
     if (storedId.length === 0 || this.snapshot.agentBusy || this.snapshot.conversationLoading) {
       return;
     }
-    const restoreVoice = this.input.isWanted();
-    const restoreVoiceOutput = this.output.isEnabled();
+    const epoch = this.voiceRuntime.begin('switching_session', 'resume-session');
+    this.output.bindEpoch(epoch);
     this.resetInterruptedTurnGuard();
-    this.stopVoice();
-    this.input.setWanted(restoreVoice);
-    this.output.setEnabled(restoreVoiceOutput);
-    this.conversation.clearMessages();
-    this.snapshot.runtimeSessionId = '';
-    this.snapshot.storedSessionId = storedId;
     this.snapshot.conversationLoading = true;
     this.snapshot.error = '';
     this.notify();
-    this.runtime.resumeSession(storedId, 100).then((result: Object) => {
+    const inputBinding = this.input.bindEpoch(epoch);
+    const outputCleanup = this.output.stopForConversationChange();
+    Promise.all([inputBinding, outputCleanup]).then((): Promise<Object> => {
+      if (!this.voiceRuntime.isCurrent(epoch)) {
+        throw new Error('会话切换已被更新请求替代');
+      }
+      return this.runtime.resumeSession(storedId, 100);
+    }).then((result: Object) => {
+      if (!this.voiceRuntime.isCurrent(epoch)) {
+        return;
+      }
       this.runtime.fetchSessionDetail(
         this.config.gatewayUrl,
         this.config.accessToken,
         this.snapshot.selectedProfile,
         storedId
       ).then((detail: Object) => {
-        if (this.snapshot.storedSessionId === storedId) {
-          this.completeSessionResume(result, detail);
+        if (this.voiceRuntime.isCurrent(epoch)) {
+          this.completeSessionResumeForEpoch(epoch, storedId, result, detail);
         }
       }).catch(() => {
-        if (this.snapshot.storedSessionId === storedId) {
-          this.completeSessionResume(result);
+        if (this.voiceRuntime.isCurrent(epoch)) {
+          this.completeSessionResumeForEpoch(epoch, storedId, result);
         }
       });
     }).catch((error: BusinessError) => {
-      if (this.snapshot.storedSessionId !== storedId) {
-        return;
-      }
-      this.snapshot.conversationLoading = false;
-      this.snapshot.error = this.errorMessage(error, '历史会话恢复失败');
-      this.notify();
+      this.failSessionTransition(epoch, error, '历史会话恢复失败');
     });
+  }
+
+  private completeSessionResumeForEpoch(
+    epoch: number,
+    storedId: string,
+    result: Object,
+    detail?: Object
+  ): void {
+    if (!this.voiceRuntime.isCurrent(epoch)) {
+      return;
+    }
+    this.snapshot.storedSessionId = storedId;
+    this.completeSessionResume(result, detail);
+    this.commitVoiceRuntimeSession(epoch, result);
+    this.input.resumeEpoch(epoch);
+    this.voiceRuntime.complete(epoch, 'resume-session');
+  }
+
+  private commitVoiceRuntimeSession(epoch: number, result: Object): void {
+    const record = result as Record<string, Object>;
+    const runtimeValue = record['session_id'];
+    const storedValue = record['stored_session_id'] !== undefined
+      ? record['stored_session_id'] : record['session_key'];
+    const runtimeId = typeof runtimeValue === 'string' ? runtimeValue : this.snapshot.runtimeSessionId;
+    const storedId = typeof storedValue === 'string' ? storedValue : this.snapshot.storedSessionId;
+    this.voiceRuntime.commitSession(epoch, storedId, runtimeId);
+  }
+
+  private failSessionTransition(epoch: number, error: BusinessError, fallback: string): void {
+    if (!this.voiceRuntime.isCurrent(epoch)) {
+      return;
+    }
+    this.input.resumeEpoch(epoch);
+    this.snapshot.conversationLoading = false;
+    this.snapshot.error = this.errorMessage(error, fallback);
+    const failure = new VoiceFailure();
+    failure.domain = 'session';
+    failure.code = String(error.code !== undefined ? error.code : 'SESSION_TRANSITION_FAILED');
+    failure.recoverable = true;
+    failure.dedupeKey = failure.code + ':' + fallback;
+    failure.message = this.snapshot.error;
+    this.voiceRuntime.fail(epoch, failure);
+    this.notify();
   }
 
   private restoreSessionAfterReconnect(storedId: string): void {
@@ -1330,6 +1610,7 @@ export class SingleAgentController {
     for (const sourceActivity of source.activities) {
       const activity = new MessageActivity();
       activity.id = sourceActivity.id;
+      activity.kind = sourceActivity.kind;
       activity.title = sourceActivity.title;
       activity.detail = sourceActivity.detail;
       activity.state = sourceActivity.state;
@@ -1352,6 +1633,9 @@ export class SingleAgentController {
   }
 
   private notify(): void {
+    if (this.disposed) {
+      return;
+    }
     this.output.syncAudioCues();
     this.syncBackgroundVoiceTask();
     if (this.listener) {

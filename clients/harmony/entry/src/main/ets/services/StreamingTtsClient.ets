@@ -51,7 +51,7 @@ export class StreamingTtsClient {
   }
 
   reconnect(url: string, cookie: string): void {
-    this.open(url, cookie, true);
+    this.open(url, cookie, false);
   }
 
   private open(url: string, cookie: string, preservePendingFrames: boolean): void {
@@ -235,7 +235,7 @@ export class StreamingTtsClient {
     if (generation !== this.connectionGeneration || this.socket !== socket) {
       return;
     }
-    this.detachSocket(false);
+    this.detachSocket(true);
     if (this.listener) {
       this.listener.onError(message.length > 0 ? message : 'TTS 连接失败');
     }
