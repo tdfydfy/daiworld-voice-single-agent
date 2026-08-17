@@ -170,6 +170,32 @@ test('thinking cue remains eligible while it owns the playback gate', () => {
   assert.match(source, /appendAssistantDelta\([\s\S]{0,1200}!this\.ensureAssistantPlaybackJob\(\)/);
 });
 
+test('thinking cue resumes after the accepted cue releases the playback gate', () => {
+  const source = readHarmonyService('VoiceOutputCoordinator');
+  const constructorStart = source.indexOf('constructor(snapshot: SingleAgentSnapshot');
+  const constructorBody = source.slice(constructorStart, source.indexOf('setSystemTts(', constructorStart));
+  const beginTurnStart = source.indexOf('beginAgentTurn(): void');
+  const beginTurnBody = source.slice(beginTurnStart, source.indexOf('endAgentTurn(): void', beginTurnStart));
+  const acceptedStart = source.indexOf('playAcceptedCue(): void');
+  const acceptedBody = source.slice(acceptedStart, source.indexOf('playStopCue(): void', acceptedStart));
+
+  assert.match(beginTurnBody, /this\.agentTurnActive = true;[\s\S]{0,80}this\.syncAudioCues\(\)/);
+  assert.match(constructorBody, /if \(cueCompleted\) \{[\s\S]{0,80}this\.syncAudioCues\(\)/);
+  assert.match(acceptedBody, /active\?\.kind === 'cue' && active\.cue === 'thinking'/);
+  assert.match(acceptedBody, /this\.lastThinkingCueActive = false;[\s\S]{0,80}this\.audioCues\.setRunning\(false\)/);
+  assert.ok(acceptedBody.indexOf("active.cue === 'thinking'") < acceptedBody.indexOf("this.audioCues.playAccepted()"));
+});
+
+test('short cues avoid Bluetooth communication-route cold start', () => {
+  const cues = readHarmonyService('AudioCuePlayer');
+  const output = readHarmonyService('VoiceOutputCoordinator');
+  const player = readHarmonyService('PcmPlayer');
+
+  assert.match(cues, /const player = new PcmPlayer\(false\)/);
+  assert.match(output, /private player: PcmPlayer = new PcmPlayer\(\)/);
+  assert.match(player, /this\.communication[\s\S]{0,180}STREAM_USAGE_VOICE_COMMUNICATION[\s\S]{0,100}STREAM_USAGE_VOICE_ASSISTANT/);
+});
+
 test('terminal local ASR failure cancels and stops capture ownership', () => {
   const source = readHarmonyService('VoiceInputCoordinator');
   const start = source.indexOf('failSystemRecognition(reason: string, phase: string): void');

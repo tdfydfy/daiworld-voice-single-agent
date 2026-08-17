@@ -21,6 +21,8 @@ const REQUIRED_FILES = [
   'entry/src/main/ets/services/HermesGatewayClient.ets',
   'entry/src/main/ets/services/HermesRuntime.ets',
   'entry/src/main/ets/services/HermesSessionDetailClient.ets',
+  'entry/src/main/ets/services/ActivityTimelineReducer.ets',
+  'entry/src/main/ets/services/HistoryRestorePolicy.ets',
   'entry/src/main/ets/services/GatewayTokenStore.ets',
   'entry/src/main/ets/services/AppSettingsStore.ets',
   'entry/src/main/ets/services/ConversationState.ets',
@@ -48,9 +50,11 @@ const REQUIRED_FILES = [
   'entry/src/main/ets/services/VoiceRuntime.ets',
   'entry/src/main/ets/services/VoiceInputCoordinator.ets',
   'entry/src/main/ets/services/VoiceOutputCoordinator.ets',
+  'entry/src/main/ets/services/StopTaskState.ets',
+  'entry/src/main/ets/services/ProtocolReplyPolicy.ets',
   'entry/src/main/ets/pages/Index.ets',
-  'AppScope/resources/base/media/app_icon_v2.svg',
-  'entry/src/main/resources/base/media/app_icon_v2.svg',
+  'AppScope/resources/base/media/app_icon_v3.svg',
+  'entry/src/main/resources/base/media/app_icon_v3.svg',
   'AppScope/app.json5',
   'build-profile.json5',
   'entry/build-profile.json5',
@@ -94,11 +98,13 @@ const DYNAMIC_AGENT_CHECKS = [
 ];
 
 const THINKING_LINE_CHECKS = [
-  ['entry/src/main/ets/pages/Index.ets', /private thinkingLines\(text: string\): string\[\]/, 'natural thinking line splitter'],
   ['entry/src/main/ets/models/SingleAgentState.ets', /ActivityKind = 'thinking' \| 'tool' \| 'status' \| 'error'/, 'ordered process activity kinds'],
-  ['entry/src/main/ets/services/ConversationState.ets', /activity\.kind = 'thinking'/, 'thinking enters the activity timeline'],
-  ['entry/src/main/ets/pages/Index.ets', /this\.thinkingLines\(activity\.detail\)/, 'line-based thinking activity rendering'],
-  ['entry/src/main/ets/pages/Index.ets', /const boundaries = '。！？!\?；;'/, 'sentence boundary grouping']
+  ['entry/src/main/ets/services/ConversationState.ets', /ActivityTimelineReducer\.appendThinking/, 'thinking enters the shared activity timeline'],
+  ['entry/src/main/ets/pages/Index.ets', /private activityLabel\(activity: MessageActivity\)/, 'single-line activity summary'],
+  ['entry/src/main/ets/pages/Index.ets', /activity\.expanded && activity\.detail\.length > 0/, 'activity detail expands on demand'],
+  ['entry/src/main/ets/services/ActivityTimelineReducer.ets', /static appendThinking\(/, 'shared thinking reducer'],
+  ['entry/src/main/ets/services/ActivityTimelineReducer.ets', /static completeTool\(/, 'shared tool completion reducer'],
+  ['entry/src/main/ets/services/ActivityTimelineReducer.ets', /duration_s = suppliedDuration/, 'backend tool duration precedence']
 ];
 
 const MESSAGE_REPLAY_CHECKS = [
@@ -136,8 +142,8 @@ const MODEL_SWITCH_CHECKS = [
 
 const CONVERSATIONAL_PROTOCOL_CHECKS = [
   ['entry/src/main/ets/services/SingleAgentController.ets', /consumePendingProtocolReply\(value, existingMessage\)/, 'pending protocol replies bypass prompt.submit'],
-  ['entry/src/main/ets/services/SingleAgentController.ets', /APPROVAL_ALLOW_PHRASES/, 'exact approval allow phrases'],
-  ['entry/src/main/ets/services/SingleAgentController.ets', /APPROVAL_DENY_PHRASES/, 'exact approval deny phrases'],
+  ['entry/src/main/ets/services/ProtocolReplyPolicy.ets', /APPROVAL_ALLOW_PHRASES/, 'exact approval allow phrases'],
+  ['entry/src/main/ets/services/ProtocolReplyPolicy.ets', /APPROVAL_DENY_PHRASES/, 'exact approval deny phrases'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /approvalConversationText\(description, command\)/, 'approval request enters conversation'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /clarifyConversationText\(question, parsedChoices\)/, 'clarification request enters conversation'],
   ['entry/src/main/ets/services/ConversationState.ets', /approvalResponseInFlight/, 'duplicate approval response guard'],
@@ -232,9 +238,11 @@ const AUDIO_CUE_CHECKS = [
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /this\.audioCues\.playStop\(\)/, 'hard stop cue integration'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /this\.audioCues\.setRunning\(running\)/, 'agent running cue integration'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /beginAgentTurn\(\): void/, 'explicit Agent turn cue start boundary'],
+  ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /beginAgentTurn\(\): void \{[\s\S]{0,100}this\.syncAudioCues\(\)/, 'Agent turn immediately evaluates the thinking cue'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /endAgentTurn\(\): void/, 'explicit Agent turn cue end boundary'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /this\.agentTurnActive && this\.snapshot\.agentBusy/, 'thinking cue requires active Agent turn'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /this\.audioCues\.playError\(\)/, 'voice error cue integration'],
+  ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /if \(cueCompleted\) \{[\s\S]{0,80}this\.syncAudioCues\(\)/, 'thinking cue is re-evaluated after a transient cue'],
   ['entry/src/main/ets/services/AudioCuePlayer.ets', /yieldForSpeech\(\): Promise<void>/, 'cue-to-speech drain boundary'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /this\.audioCues\.yieldForSpeech\(\)\.then/, 'system TTS waits for cue drain'],
   ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /generation !== this\.systemSpeechStartGeneration/, 'stale cue wait cannot start old speech']
@@ -251,7 +259,10 @@ const HISTORY_TIMESTAMP_CHECKS = [
 const HISTORY_TOOL_CHECKS = [
   ['entry/src/main/ets/services/ConversationState.ets', /if \(roleValue === 'tool'\)/, 'stored tool messages excluded from reply bubbles'],
   ['entry/src/main/ets/services/ConversationState.ets', /restoreHistoryToolResult\(row, pendingActivities\)/, 'stored tool results restored as process activities'],
-  ['entry/src/main/ets/services/ConversationState.ets', /message\.activities = pendingActivities/, 'stored activities attached to the assistant response']
+  ['entry/src/main/ets/services/ConversationState.ets', /message\.activities = pendingActivities/, 'stored activities attached to the assistant response'],
+  ['entry/src/main/ets/services/HistoryRestorePolicy.ets', /processComplete: boolean/, 'history completeness state'],
+  ['entry/src/main/ets/services/ConversationState.ets', /processWarning = processComplete \? '' : '历史过程未完整载入'/, 'incomplete history warning'],
+  ['entry/src/main/ets/services/ConversationState.ets', /ActivityTimelineReducer\.completeTool/, 'history tool result uses shared reducer']
 ];
 
 const SYSTEM_TTS_STREAM_CHECKS = [
@@ -304,7 +315,8 @@ const AUDIO_INPUT_ROUTE_CHECKS = [
   ['entry/src/main/ets/services/SingleAgentController.ets', /toggleSpeakerphone\(\): void \{[\s\S]{0,220}showCommunicationOutputPicker\(context\)/, 'phone output opens the native communication picker'],
   ['entry/src/main/ets/services/SingleAgentController.ets', /toggleSpeakerphoneFallback\(\): void \{[\s\S]{0,160}this\.snapshot\.audioOutputRoute !== 'speaker'/, 'phone output keeps a direct fallback from the actual route'],
   ['entry/src/main/ets/services/CommunicationAudioSession.ets', /AVCastPickerHelper\(context\)[\s\S]{0,160}sessionType: 'voice_call'/, 'native output picker uses the voice-call device list'],
-  ['entry/src/main/ets/services/AudioCuePlayer.ets', /const player = new PcmPlayer\(\)/, 'audio cues use the communication route']
+  ['entry/src/main/ets/services/AudioCuePlayer.ets', /const player = new PcmPlayer\(false\)/, 'short cues avoid a cold Bluetooth SCO transition'],
+  ['entry/src/main/ets/services/VoiceOutputCoordinator.ets', /private player: PcmPlayer = new PcmPlayer\(\)/, 'remote speech retains the communication route']
 ];
 
 const VOICE_CONTROL_CHECKS = [
@@ -315,9 +327,34 @@ const VOICE_CONTROL_CHECKS = [
   ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /this\.asr\.isConnected\(\)/, 'ASR reconnect avoids unnecessary TTS reconnect'],
   ['entry/src/main/ets/services/StreamingAsrClient.ets', /isConnected\(\): boolean/, 'ASR connection state inspection'],
   ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /this\.snapshot\.asrState = 'stopped';[\s\S]{0,160}this\.asr\.close\(\);/, 'capture failure clears ASR connecting state'],
-  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /CLOSE_MIC_PHRASES: string\[\] = \['关闭话筒', '关闭麦克风', '关闭microphone', '暂停收音'\]/, 'explicit close-microphone phrase allowlist'],
-  ['entry/src/main/ets/services/SingleAgentController.ets', /private normalizeControlPhrase\(text: string\): string/, 'control phrase normalization boundary'],
-  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /isCloseMicPhrase\(text: string\): boolean[\s\S]{0,180}this\.normalizeControlPhrase\(text\)/, 'close-microphone exact normalized matching']
+  ['entry/src/main/ets/services/VoiceControlPolicy.ets', /CLOSE_MIC_PHRASES: string\[\] = \['关闭话筒', '关闭麦克风', '关闭microphone', '暂停收音'\]/, 'explicit close-microphone phrase allowlist'],
+  ['entry/src/main/ets/services/VoiceControlPolicy.ets', /OPEN_MIC_PHRASES: string\[\] = \['打开话筒', '打开麦克风', '打开microphone', '恢复收音'\]/, 'explicit open-microphone phrase allowlist'],
+  ['entry/src/main/ets/services/VoiceControlPolicy.ets', /STOP_PHRASES: string\[\] = \['停止任务', '停止', 'stop'\]/, 'explicit stop-task phrase allowlist'],
+  ['entry/src/main/ets/services/VoiceControlPolicy.ets', /EXIT_PHRASES: string\[\] = \['退出软件'\]/, 'explicit exit-application phrase allowlist'],
+  ['entry/src/main/ets/services/VoiceControlPolicy.ets', /static resolve\(text: string\): VoiceControlAction/, 'shared executable voice-control policy'],
+  ['entry/src/main/ets/services/StopTaskState.ets', /beginRequest\(\): number[\s\S]{0,180}isCurrentRequest\(generation: number\): boolean/, 'stop requests use a generation guard'],
+  ['entry/src/main/ets/services/StopTaskState.ets', /本地已停止，任务\/队列状态待确认[\s\S]{0,240}停止请求已确认，任务\/队列状态待确认[\s\S]{0,240}本地已停止，停止请求失败，任务\/队列状态待确认/, 'stop status distinguishes local cleanup from request confirmation'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /const requestGeneration = this\.stopTaskState\.beginRequest\(\);[\s\S]{0,1800}StopTaskState\.localStoppedPendingConfirmation\(\)[\s\S]{0,900}isCurrentInterruptRequest\(requestGeneration, interruptedSessionId\)/, 'stop confirmation updates only the current request'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /snapshot\.inputRouting = 'commands_only'/, 'closed microphone keeps a command-only input route'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /if \(this\.isCommandsOnly\(\)\) \{[\s\S]{0,160}this\.discardAndResumePlayback\(\)/, 'ordinary command-only speech is discarded locally'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /isExitPhrase\(value\)[\s\S]{0,140}callbacks\.exitApplication\(\)/, 'exit command bypasses ordinary prompt routing'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /private onFinal\(epoch: number, text: string\): void \{[\s\S]{0,140}!this\.wanted/, 'late ASR finals cannot act after input shutdown'],
+  ['entry/src/main/ets/services/ProtocolReplyPolicy.ets', /static approvalDecision\(text: string\): ApprovalDecision[\s\S]{0,500}APPROVAL_ALLOW_PHRASES\.includes\(normalized\)[\s\S]{0,300}APPROVAL_DENY_PHRASES\.includes\(normalized\)/, 'approval replies share punctuation-tolerant normalization'],
+  ['entry/src/main/ets/services/ProtocolReplyPolicy.ets', /static clarifyAnswer\(text: string, choices: string\[\]\): string[\s\S]{0,500}normalizeChoice\(choice\) === normalized[\s\S]{0,160}return value/, 'clarification replies normalize only known semantic choices'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /可选：' \+ choices\.join\('、'\)[\s\S]{0,120}请直接回复选项内容或说明你的答案/, 'clarification prompt uses semantic choices without numbering'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /ProtocolReplyPolicy\.approvalDecision\(value\)[\s\S]{0,900}ProtocolReplyPolicy\.clarifyAnswer\(value, this\.snapshot\.clarifyChoices\)/, 'pending protocol replies use the shared normalization policy'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /isCloseMicPhrase\(text: string\): boolean[\s\S]{0,140}VoiceControlPolicy\.resolve\(text\)/, 'close-microphone exact normalized matching'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /exitApplication\(\): Promise<void>[\s\S]{0,700}this\.dispose\(\)\.then\([\s\S]{0,120}context\.terminateSelf\(\)/, 'exit disposes resources before terminating the ability']
+];
+
+const MOBILE_INSTRUCTION_CHECKS = [
+  ['entry/src/main/ets/services/AppSettingsStore.ets', /DEFAULT_MOBILE_INSTRUCTIONS\s*=\s*\r?\n\s*'当前使用语音交互，生成的文字回复应当尽量简洁、口语。'/, 'default mobile-only instructions'],
+  ['entry/src/main/ets/services/AppSettingsStore.ets', /putSync\('mobileInstructions', config\.mobileInstructions\)/, 'mobile instructions persistence'],
+  ['entry/src/main/ets/services/HermesGatewayClient.ets', /class CreateSessionParams[\s\S]{0,180}instructions: string/, 'session.create mobile instructions parameter'],
+  ['entry/src/main/ets/services/SingleAgentController.ets', /createSession\(100, this\.config\.mobileInstructions\)/, 'new mobile sessions use the configured instructions'],
+  ['entry/src/main/ets/pages/Index.ets', /TextArea\(\{[\s\S]{0,120}text: this\.mobileInstructions/, 'settings editor for mobile instructions'],
+  ['entry/src/main/ets/pages/Index.ets', /保存后只对新建移动端会话生效，不修改 Hermes 后台提示词。/, 'mobile instructions scope disclosure'],
+  ['entry/src/main/ets/pages/Index.ets', /private HelpPanel\(\)[\s\S]{0,1400}'关闭话筒'[\s\S]{0,400}'打开话筒'[\s\S]{0,400}'停止任务'[\s\S]{0,400}'退出软件'/, 'HarmonyOS voice-command teaching']
 ];
 
 const MESSAGE_BUBBLE_CHECKS = [
@@ -400,7 +437,7 @@ const ASR_FINALIZATION_CHECKS = [
   ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /this\.snapshot\.asrState = 'finalizing'/, 'visible ASR finalizing state'],
   ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /private updateInterim\(epoch: number, text: string\): void[\s\S]{0,700}this\.scheduleFinalization\(epoch\)/, 'ASR interim resets finalization window'],
   ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /private queueFinal\(epoch: number, text: string, isLast: boolean\): void[\s\S]{0,1600}this\.scheduleFinalization\(epoch\)/, 'ASR final resets finalization window'],
-  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /shouldFinalizeImmediately\(text: string\): boolean[\s\S]{0,220}this\.isStopPhrase\(text\)[\s\S]{0,220}this\.isCloseMicPhrase\(text\)[\s\S]{0,220}this\.snapshot\.clarifyPending[\s\S]{0,220}this\.snapshot\.approvalPending/, 'immediate voice-control finalization'],
+  ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /shouldFinalizeImmediately\(text: string\): boolean[\s\S]{0,220}this\.isStopPhrase\(text\)[\s\S]{0,220}this\.isCloseMicPhrase\(text\)[\s\S]{0,220}this\.snapshot\.approvalPending/, 'exact controls and approval replies finalize immediately'],
   ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /finalizeAfterTermination\(\): void/, 'meaningful ASR text flush on termination'],
   ['entry/src/main/ets/services/VoiceInputCoordinator.ets', /!this\.hasSemanticContent\(value\)\)[\s\S]{0,100}this\.discardAndResumePlayback\(\)/, 'discarded ASR false positive resumes paused playback']
 ];
@@ -502,10 +539,6 @@ const captureOwnerCount = sources
 if (captureOwnerCount !== 1) {
   ERRORS.push(`voice runtime must have exactly one CaptureSupervisor owner (found ${captureOwnerCount})`);
 }
-if (allSource.includes('new PcmPlayer(false)')) {
-  ERRORS.push('audio cues and remote speech must share the communication playback route');
-}
-
 for (const [token, label] of REQUIRED_TOKENS) {
   if (!allSource.includes(token)) {
     ERRORS.push(`missing protocol token "${token}" (${label})`);
@@ -543,6 +576,7 @@ for (const [rel, pattern, label] of [
   ...SYSTEM_TTS_STREAM_CHECKS,
   ...AUDIO_INPUT_ROUTE_CHECKS,
   ...VOICE_CONTROL_CHECKS,
+  ...MOBILE_INSTRUCTION_CHECKS,
   ...MESSAGE_BUBBLE_CHECKS,
   ...REACTIVE_UI_CHECKS,
   ...SYSTEM_ASR_STARTUP_CHECKS,
@@ -771,8 +805,8 @@ for (const file of jsons) {
 
 try {
   const appProfile = JSON.parse(fs.readFileSync(path.join(root, 'AppScope/app.json5'), 'utf8'));
-  if (appProfile.app.versionName !== '1.2.10' || appProfile.app.versionCode !== 1020010) {
-    ERRORS.push('HarmonyOS release version must be 1.2.10 (1020010)');
+  if (appProfile.app.versionName !== '1.2.16' || appProfile.app.versionCode !== 1020016) {
+    ERRORS.push('HarmonyOS release version must be 1.2.16 (1020016)');
   }
 } catch (error) {
   // The JSON parse error is reported by the validation loop above.

@@ -148,7 +148,7 @@ Adapter 在 `/api/hermes/ws` 建立后每 25 秒向客户端发送 `gateway.hear
 | `tool.progress` | `name, preview` | 更新工具详情 |
 | `tool.complete` | `tool_id, name, duration_s, summary, error` | 完成工具步骤，耗时同行 |
 | `approval.request` | `description, command` | HarmonyOS 追加对话气泡并进入审批 pending；Web 技术预览保留既有协议回归 |
-| `clarify.request` | `request_id, question, choices` | HarmonyOS 追加含编号选项的对话气泡并进入澄清 pending |
+| `clarify.request` | `request_id, question, choices` | HarmonyOS 追加无编号语义选项的对话气泡并进入澄清 pending |
 | `status.update` | `text/kind` | 更新运行状态 |
 | `error` | `message` | 结束相关忙碌并显示错误 |
 
@@ -221,14 +221,14 @@ Final：
 
 1. `ready` 前不处理 transcript；
 2. partial 更新同一个临时用户气泡；
-3. 普通转写进入约 1.8 秒收句窗口；窗口内连续 interim/final 合并到同一气泡并重新计时，明确的停止、暂停收音、审批和澄清回复仍立即处理；
+3. 普通转写和澄清回复进入约 1.8 秒收句窗口；窗口内连续 interim/final 合并到同一气泡并重新计时，明确的系统控制口令和审批“同意/取消”仍立即处理；
 4. final 不删除重建，直接把同一气泡升级为正式消息；
 5. `idle timeout` 是继续等待，不是重连理由；
 6. 断线且用户仍开启语音时按 `250 / 750 / 1500 / 3000 ms` 封顶退避自动重连，短暂断线不立即拆分已有有效转写；
 7. HarmonyOS 的连接看门覆盖 WebSocket 建连到 Provider `ready` 的完整阶段，10 秒未就绪即进入下一轮恢复；
 8. 重连必须隔离旧 socket 的迟到回调，显式暂停收音、切换本地语音或主动断开必须取消恢复；
 9. exact STOP 先中断，不提交普通 Prompt；
-10. approval pending 时只接受固定同意/拒绝词。
+10. approval pending 时只接受整句“同意”或“取消”；只清理 ASR 附加在口令两端的空格、句号、逗号等标点，不接受近义词、数字或序号。
 
 ## 7. TTS 协议
 
@@ -392,20 +392,20 @@ HarmonyOS 追加普通 Agent 对话气泡，展示：
 - “执行已暂停”；
 - “请回复同意或取消”。
 
-不显示独立审批卡或操作按钮。`clarify.request` 同样把问题和编号选项写入对话气泡，不显示独立选项卡。
+不显示独立审批卡或操作按钮。`clarify.request` 同样把问题和无编号语义选项写入对话气泡，不显示独立选项卡。
 
 ### 11.2 语音
 
-允许词：
+同意口令：
 
 ```text
-同意 / 允许 / 可以 / 执行
+同意
 ```
 
-拒绝词：
+取消口令：
 
 ```text
-取消 / 拒绝 / 阻止 / 不要
+取消
 ```
 
 映射：
@@ -413,7 +413,7 @@ HarmonyOS 追加普通 Agent 对话气泡，展示：
 - 同意 → `approval.respond(choice="session")`；
 - 取消 → `approval.respond(choice="deny")`。
 
-文字和语音共用同一映射。普通回复不入 Agent 队列；未知审批词保持 pending。澄清状态下的下一条有效回复映射到 `clarify.respond`，也不调用 `prompt.submit`。
+文字和语音共用同一映射。只忽略口令两端的 ASR 空格和标点；夹带其他文字、近义词、数字或序号均不触发审批，审批继续保持 pending。澄清选项不编号，完整收句与已知选项文本归一化一致时回传规范选项，其他内容原样交给 `clarify.respond` 做语义处理，也不调用 `prompt.submit`。
 
 ## 12. 附件
 

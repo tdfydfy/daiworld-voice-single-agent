@@ -170,7 +170,7 @@
 - 背景：审批卡和澄清选项卡会打断语音对话的连续感，并形成额外的移动端操作界面。
 - 决策：HarmonyOS 将 `approval.request` 和 `clarify.request` 展示为普通对话内容；用户下一条有效回复仍直接映射到 Hermes `approval.respond` 或 `clarify.respond`，不作为新的 Agent Prompt。
 - 依据：保持单一对话主界面，同时不改变 Hermes 对审批和澄清状态的所有权。
-- 影响：审批必须继续使用精确允许 / 拒绝词表并默认安全失败；澄清回复需在客户端识别 pending 状态后走专用协议。
+- 影响：审批只接受整句“同意/取消”并默认安全失败；澄清选项不编号，完整语义回复在客户端识别 pending 状态后走专用协议，数字和序号不建立别名映射。
 - 假设：Hermes 在 pending 状态下接受现有响应方法并继续原任务。
 - 重新评估条件：未来明确需要复杂表单、多选或无法通过对话可靠表达的结构化输入。
 - 来源：[用户原始任务](plans/2026-08-11-conversational-prompts-and-provider-identity.md)

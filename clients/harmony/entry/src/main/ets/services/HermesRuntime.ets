@@ -364,8 +364,8 @@ export class HermesRuntime extends GatewayListener {
     return this.sessionDetailClient.fetch(baseUrl, accessToken, profile, sessionId);
   }
 
-  createSession(cols: number): Promise<Object> {
-    return this.gateway.createSession(cols);
+  createSession(cols: number, instructions: string): Promise<Object> {
+    return this.gateway.createSession(cols, instructions);
   }
 
   listSessions(limit: number): Promise<Object> {

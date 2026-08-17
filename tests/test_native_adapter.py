@@ -260,6 +260,27 @@ def test_websocket_injects_voice_instructions_only_into_session_create(monkeypat
     }
 
 
+def test_session_create_preserves_client_supplied_mobile_instructions():
+    message = json.dumps({
+        "jsonrpc": "2.0",
+        "id": "mobile-session",
+        "method": "session.create",
+        "params": {
+            "cols": 100,
+            "instructions": "当前使用语音交互，回复尽量简洁。",
+        },
+    })
+
+    transformed = native_main.inject_session_instructions(
+        message,
+        "Adapter default voice instructions.",
+    )
+
+    assert json.loads(transformed)["params"]["instructions"] == (
+        "当前使用语音交互，回复尽量简洁。"
+    )
+
+
 @pytest.mark.parametrize("method", [
     "session.create",
     "session.list",

@@ -217,7 +217,10 @@ export class AudioCuePlayer {
       if (generation !== this.playbackGeneration || this.activeCue !== kind) {
         return;
       }
-      const player = new PcmPlayer();
+      // Short cues must stay on the already-routed assistant/media stream.
+      // A cold Bluetooth SCO transition can outlast the entire cue and consume
+      // its PCM before the communication route becomes audible.
+      const player = new PcmPlayer(false);
       player.setFailureListener((): void => {
         this.finishCue(player, generation);
       });

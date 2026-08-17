@@ -2,9 +2,9 @@
   "app": {
     "bundleName": "cc.daiworld.voice.singleagent",
     "vendor": "daiworld",
-    "versionCode": 1020010,
-    "versionName": "1.2.10",
-    "icon": "$media:app_icon_v2",
+    "versionCode": 1020016,
+    "versionName": "1.2.16",
+    "icon": "$media:app_icon_v3",
     "label": "$string:app_name"
   }
 }

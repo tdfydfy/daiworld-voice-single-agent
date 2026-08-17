@@ -5,6 +5,8 @@ import { CredentialState, ProfileKey, SpeechBackend } from '../models/SingleAgen
 import { GatewayTokenStore } from './GatewayTokenStore';
 
 export const DEFAULT_GATEWAY_URL = 'https://voice.daiworld.cc.cd/voice-native';
+export const DEFAULT_MOBILE_INSTRUCTIONS =
+  '当前使用语音交互，生成的文字回复应当尽量简洁、口语。';
 const SETTINGS_FILE = 'single_agent_settings';
 
 export interface ClientConfig {
@@ -17,6 +19,7 @@ export interface ClientConfig {
   speechBackend: SpeechBackend;
   voicePerson: number;
   speechRate: number;
+  mobileInstructions: string;
 }
 
 export class AppSettingsLoadResult {
@@ -42,7 +45,8 @@ export class AppSettingsStore {
       debugMode: false,
       speechBackend: 'harmony_offline',
       voicePerson: 0,
-      speechRate: 1
+      speechRate: 1,
+      mobileInstructions: DEFAULT_MOBILE_INSTRUCTIONS
     };
   }
 
@@ -59,6 +63,7 @@ export class AppSettingsStore {
       const speechBackend = store.getSync('speechBackend', 'harmony_offline');
       const voicePerson = store.getSync('voicePerson', 0);
       const speechRate = store.getSync('speechRate', 1);
+      const mobileInstructions = store.getSync('mobileInstructions', DEFAULT_MOBILE_INSTRUCTIONS);
       const storedTokenExists = this.tokenStore.hasStoredToken(store);
       let token = '';
       try {
@@ -81,7 +86,9 @@ export class AppSettingsStore {
         debugMode: debugMode === true,
         speechBackend: this.speechBackendFromValue(speechBackend),
         voicePerson: typeof voicePerson === 'number' ? voicePerson : 0,
-        speechRate: typeof speechRate === 'number' ? speechRate : 1
+        speechRate: typeof speechRate === 'number' ? speechRate : 1,
+        mobileInstructions: typeof mobileInstructions === 'string'
+          ? mobileInstructions : DEFAULT_MOBILE_INSTRUCTIONS
       });
       this.persistedAccessToken = token;
       this.queuedAccessToken = token;
@@ -103,7 +110,8 @@ export class AppSettingsStore {
       debugMode: config.debugMode,
       speechBackend: this.speechBackendFromValue(config.speechBackend),
       voicePerson: config.voicePerson,
-      speechRate: this.normalizeSpeechRate(config.speechRate)
+      speechRate: this.normalizeSpeechRate(config.speechRate),
+      mobileInstructions: this.normalizeMobileInstructions(config.mobileInstructions)
     };
   }
 
@@ -125,6 +133,7 @@ export class AppSettingsStore {
       store.putSync('speechBackend', config.speechBackend);
       store.putSync('voicePerson', config.voicePerson);
       store.putSync('speechRate', config.speechRate);
+      store.putSync('mobileInstructions', config.mobileInstructions);
       store.flushSync();
     } catch (error) {
       // Non-secret settings are a convenience; the in-memory configuration remains usable.
@@ -167,6 +176,14 @@ export class AppSettingsStore {
 
   private normalizeSpeechRate(value: number): number {
     return Math.round(Math.max(0.5, Math.min(2, value)) * 10) / 10;
+  }
+
+  private normalizeMobileInstructions(value: string): string {
+    const normalized = value.trim();
+    if (normalized.length === 0) {
+      return DEFAULT_MOBILE_INSTRUCTIONS;
+    }
+    return normalized.substring(0, 1000);
   }
 
   private normalizeGatewayUrl(value: string): string {

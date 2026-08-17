@@ -30,9 +30,11 @@ interface PendingRequest {
 
 class CreateSessionParams {
   cols: number;
+  instructions: string;
 
-  constructor(cols: number) {
+  constructor(cols: number, instructions: string) {
     this.cols = cols;
+    this.instructions = instructions;
   }
 }
 
@@ -212,8 +214,8 @@ export class HermesGatewayClient {
     this.rejectAll('client closed');
   }
 
-  createSession(cols: number): Promise<Object> {
-    return this.request(HermesMethods.SESSION_CREATE, new CreateSessionParams(cols));
+  createSession(cols: number, instructions: string): Promise<Object> {
+    return this.request(HermesMethods.SESSION_CREATE, new CreateSessionParams(cols, instructions));
   }
 
   listSessions(limit: number): Promise<Object> {

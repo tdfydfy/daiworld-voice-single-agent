@@ -17,6 +17,8 @@ export type PlaybackState = 'none' | 'queued' | 'playing' | 'paused_for_user';
 
 export type SpeechBackend = 'harmony_offline' | 'remote';
 
+export type InputRouting = 'off' | 'conversation' | 'commands_only';
+
 export type AudioOutputRoute = 'earpiece' | 'speaker' | 'headset';
 
 export type MessageRole = 'user' | 'assistant' | 'system';
@@ -29,9 +31,13 @@ export class MessageActivity {
   id: string = '';
   kind: ActivityKind = 'status';
   title: string = '';
+  summary: string = '';
   detail: string = '';
   state: ActivityState = 'running';
+  startedAt: number = 0;
+  endedAt: number = 0;
   duration_s?: number;
+  expanded: boolean = false;
 }
 
 export class MessageArtifact {
@@ -63,6 +69,7 @@ export class ChatMessage {
   completedAt: number = 0;
   pending: boolean = false;
   processExpanded: boolean = false;
+  processWarning: string = '';
   replaying: boolean = false;
 }
 
@@ -99,6 +106,7 @@ export class SingleAgentSnapshot {
   runtimeSessionId: string = '';
   storedSessionId: string = '';
   voiceEnabled: boolean = false;
+  inputRouting: InputRouting = 'off';
   asrState: AsrState = 'stopped';
   asrTranscript: string = '';
   asrUtteranceActive: boolean = false;

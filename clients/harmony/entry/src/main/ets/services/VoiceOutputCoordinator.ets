@@ -170,9 +170,14 @@ export class VoiceOutputCoordinator {
     this.playbackQueue.bindEpoch(this.playbackEpoch);
     this.tts.setListener(new CoordinatorTtsListener(this, this.playbackEpoch, ''));
     this.audioCues.setStateListener((): void => {
+      let cueCompleted = false;
       if (this.activeCueJobId.length > 0 && !this.audioCues.isRunning()) {
         this.completePlaybackJob(this.activeCueJobId);
         this.activeCueJobId = '';
+        cueCompleted = true;
+      }
+      if (cueCompleted) {
+        this.syncAudioCues();
       }
       this.callbacks.syncBackgroundState();
     });
@@ -219,6 +224,7 @@ export class VoiceOutputCoordinator {
 
   beginAgentTurn(): void {
     this.agentTurnActive = true;
+    this.syncAudioCues();
   }
 
   endAgentTurn(): void {
@@ -619,6 +625,13 @@ export class VoiceOutputCoordinator {
   }
 
   playAcceptedCue(): void {
+    const active = this.playbackQueue.activeJob();
+    if (active?.kind === 'cue' && active.cue === 'thinking') {
+      this.completePlaybackJob(active.id);
+      this.activeCueJobId = '';
+      this.lastThinkingCueActive = false;
+      this.audioCues.setRunning(false);
+    }
     const jobId = this.beginPlaybackJob('cue', 10, '', 'accepted', true);
     if (jobId.length === 0) {
       return;

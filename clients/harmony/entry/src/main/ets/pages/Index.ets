@@ -15,7 +15,10 @@ import {
   SingleAgentController,
   SnapshotListener
 } from '../services/SingleAgentController';
-import { DEFAULT_GATEWAY_URL } from '../services/AppSettingsStore';
+import {
+  DEFAULT_GATEWAY_URL,
+  DEFAULT_MOBILE_INSTRUCTIONS
+} from '../services/AppSettingsStore';
 import { VoiceOption } from '../services/SystemTtsPlayer';
 
 const COLOR_BG = '#08090A';
@@ -26,6 +29,7 @@ const COLOR_MUTED = '#989FA9';
 const COLOR_ACCENT = '#737DFF';
 const COLOR_SUCCESS = '#45C2A3';
 const COLOR_DANGER = '#E27A84';
+const COLOR_WARNING = '#E5B86B';
 
 class TextSelectItem implements SelectOption {
   value: ResourceStr;
@@ -43,6 +47,7 @@ struct Index {
   @State snapshot: SingleAgentSnapshot = new SingleAgentSnapshot();
   @State showSettings: boolean = false;
   @State showHistory: boolean = false;
+  @State showHelp: boolean = false;
   @State gatewayUrl: string = DEFAULT_GATEWAY_URL;
   @State accessToken: string = '';
   @State hasSavedToken: boolean = false;
@@ -54,6 +59,7 @@ struct Index {
   @State speechBackend: SpeechBackend = 'harmony_offline';
   @State voicePerson: number = 0;
   @State speechRate: number = 1;
+  @State mobileInstructions: string = DEFAULT_MOBILE_INSTRUCTIONS;
   @State debugMode: boolean = false;
   @State appVersion: string = '版本信息读取中';
   @State voiceOptions: VoiceOption[] = [];
@@ -85,7 +91,7 @@ struct Index {
         this.lastAsrUtteranceActive = snapshot.asrUtteranceActive;
         this.snapshot = snapshot;
         this.syncModelSelection(snapshot);
-        if (!this.showSettings && !this.showHistory &&
+        if (!this.showSettings && !this.showHistory && !this.showHelp &&
           (messageAdded || messagesCleared || messagesChanged || speechStarted)) {
           setTimeout((): void => {
             try {
@@ -136,11 +142,13 @@ struct Index {
     this.speechBackend = config.speechBackend;
     this.voicePerson = config.voicePerson;
     this.speechRate = config.speechRate;
+    this.mobileInstructions = config.mobileInstructions;
     this.debugMode = config.debugMode;
     this.selectedModelProvider = '';
     this.selectedRuntimeModel = '';
     this.modelSelectionInitialized = false;
     this.showHistory = false;
+    this.showHelp = false;
     this.showTextComposer = false;
     this.showSettings = true;
     this.syncModelSelection(this.snapshot);
@@ -169,7 +177,8 @@ struct Index {
       debugMode: this.debugMode,
       speechBackend: this.speechBackend,
       voicePerson: this.voicePerson,
-      speechRate: this.speechRate
+      speechRate: this.speechRate,
+      mobileInstructions: this.mobileInstructions
     });
     this.settingsSaving = true;
     this.controller.waitForConfigPersistence().then((): void => {
@@ -201,6 +210,7 @@ struct Index {
     this.speechBackend = config.speechBackend;
     this.voicePerson = config.voicePerson;
     this.speechRate = config.speechRate;
+    this.mobileInstructions = config.mobileInstructions;
     this.debugMode = config.debugMode;
     this.controllerReady = true;
     this.showSettings = this.snapshot.credentialState === 'unconfigured' ||
@@ -434,6 +444,7 @@ struct Index {
 
   private showHistoryPanel(): void {
     this.showSettings = false;
+    this.showHelp = false;
     this.showTextComposer = false;
     this.showHistory = true;
     this.controller.listHistory();
@@ -441,6 +452,17 @@ struct Index {
 
   private closeHistoryPanel(): void {
     this.showHistory = false;
+  }
+
+  private showHelpPanel(): void {
+    this.showSettings = false;
+    this.showHistory = false;
+    this.showTextComposer = false;
+    this.showHelp = true;
+  }
+
+  private closeHelpPanel(): void {
+    this.showHelp = false;
   }
 
   private startNewConversation(): void {
@@ -511,12 +533,35 @@ struct Index {
   }
 
   private microphoneButtonText(): string {
-    const label = this.snapshot.voiceEnabled ? '麦克风已开' : '开启麦克风';
-    if (this.snapshot.voiceEnabled && this.snapshot.microphoneRoute.length > 0) {
+    if (this.snapshot.inputRouting === 'commands_only') {
+      return '话筒已关（口令可用）';
+    }
+    const label = this.snapshot.inputRouting === 'conversation' ? '麦克风已开' : '开启麦克风';
+    if (this.snapshot.inputRouting === 'conversation' && this.snapshot.microphoneRoute.length > 0) {
       const route = this.snapshot.microphoneRoute.includes('耳机') ? '耳机' : '手机';
       return label + '（' + route + '）';
     }
     return label;
+  }
+
+  private microphoneButtonColor(): string {
+    if (this.snapshot.inputRouting === 'conversation') {
+      return COLOR_SUCCESS;
+    }
+    if (this.snapshot.inputRouting === 'commands_only') {
+      return COLOR_WARNING;
+    }
+    return COLOR_TEXT;
+  }
+
+  private microphoneAccessibilityText(): string {
+    if (this.snapshot.inputRouting === 'conversation') {
+      return '关闭话筒，切换到仅系统口令模式';
+    }
+    if (this.snapshot.inputRouting === 'commands_only') {
+      return '打开话筒，恢复普通语音对话';
+    }
+    return '开启麦克风';
   }
 
   private outputRouteText(): string {
@@ -628,11 +673,15 @@ struct Index {
   private hasMessageProcess(message: ChatMessage): boolean {
     return message.role === 'assistant' &&
       (message.pending || message.thinking.length > 0 || message.activities.length > 0 ||
-        message.model.length > 0 || message.provider.length > 0 || message.duration_s !== undefined);
+        message.model.length > 0 || message.provider.length > 0 || message.duration_s !== undefined ||
+        message.processWarning.length > 0);
   }
 
   private processSummary(message: ChatMessage): string {
     const parts: string[] = [];
+    if (message.processWarning.length > 0) {
+      parts.push(message.processWarning);
+    }
     if (message.pending) {
       parts.push('处理中');
     }
@@ -689,28 +738,27 @@ struct Index {
     return COLOR_ACCENT;
   }
 
-  private thinkingLines(text: string): string[] {
-    const lines: string[] = [];
-    const sourceLines = text.replace(/\r\n?/g, '\n').split('\n');
-    const boundaries = '。！？!?；;';
-    for (const source of sourceLines) {
-      let pending = '';
-      for (const char of source) {
-        pending += char;
-        if (boundaries.includes(char)) {
-          const value = pending.trim();
-          if (value.length > 0) {
-            lines.push(value);
-          }
-          pending = '';
-        }
-      }
-      const tail = pending.trim();
-      if (tail.length > 0) {
-        lines.push(tail);
-      }
+  private activityElapsedSeconds(activity: MessageActivity): number | undefined {
+    if (activity.duration_s !== undefined) {
+      return activity.duration_s;
     }
-    return lines;
+    if (activity.startedAt <= 0) {
+      return undefined;
+    }
+    const endedAt = activity.state === 'running' || activity.endedAt <= 0
+      ? this.nowMs : activity.endedAt;
+    return Math.max(0, endedAt - activity.startedAt) / 1000;
+  }
+
+  private activityLabel(activity: MessageActivity): string {
+    if (activity.kind === 'tool') {
+      return '调用 · ' + activity.title +
+        (activity.summary.length > 0 ? ' · ' + activity.summary : '');
+    }
+    if (activity.summary.length > 0) {
+      return activity.title + ' · ' + activity.summary;
+    }
+    return activity.title;
   }
 
   @Builder
@@ -788,6 +836,21 @@ struct Index {
           .fontColor(COLOR_TEXT)
 
         Row({ space: 6 }) {
+          Button('?', { type: ButtonType.Normal })
+            .width(30)
+            .height(30)
+            .padding(0)
+            .fontSize(14)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.showHelp ? COLOR_ACCENT : COLOR_TEXT)
+            .backgroundColor(this.showHelp ? '#1C2033' : COLOR_PANEL)
+            .border({ width: 1, color: this.showHelp ? COLOR_ACCENT : COLOR_LINE })
+            .borderRadius(6)
+            .accessibilityText('打开使用教学')
+            .onClick(() => {
+              this.showHelpPanel();
+            })
+
           Button('历史', { type: ButtonType.Normal })
             .width(54)
             .height(30)
@@ -815,7 +878,7 @@ struct Index {
             })
         }
       }
-      .width(114)
+      .width(150)
       .alignItems(HorizontalAlign.End)
     }
     .width('100%')
@@ -1075,6 +1138,61 @@ struct Index {
         .borderRadius(9)
 
         Column({ space: 10 }) {
+          Text('移动端回复')
+            .width('100%')
+            .fontSize(13)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(COLOR_TEXT)
+
+          Text('移动端系统提示词')
+            .width('100%')
+            .fontSize(11)
+            .fontColor(COLOR_MUTED)
+
+          TextArea({
+            placeholder: DEFAULT_MOBILE_INSTRUCTIONS,
+            text: this.mobileInstructions
+          })
+            .width('100%')
+            .height(104)
+            .fontSize(12)
+            .fontColor(COLOR_TEXT)
+            .placeholderColor(COLOR_MUTED)
+            .caretColor(COLOR_TEXT)
+            .padding(10)
+            .backgroundColor(COLOR_BG)
+            .border({ width: 1, color: COLOR_LINE })
+            .borderRadius(7)
+            .onChange((value: string): void => {
+              this.mobileInstructions = value;
+            })
+
+          Row() {
+            Text('保存后只对新建移动端会话生效，不修改 Hermes 后台提示词。')
+              .fontSize(10)
+              .lineHeight(16)
+              .fontColor(COLOR_MUTED)
+              .layoutWeight(1)
+            Button('恢复默认', { type: ButtonType.Normal })
+              .height(32)
+              .fontSize(10)
+              .fontColor(COLOR_TEXT)
+              .backgroundColor(COLOR_BG)
+              .border({ width: 1, color: COLOR_LINE })
+              .borderRadius(6)
+              .onClick((): void => {
+                this.mobileInstructions = DEFAULT_MOBILE_INSTRUCTIONS;
+              })
+          }
+          .width('100%')
+        }
+        .width('100%')
+        .padding(12)
+        .backgroundColor(COLOR_PANEL)
+        .border({ width: 1, color: COLOR_LINE })
+        .borderRadius(9)
+
+        Column({ space: 10 }) {
           Text('语音引擎')
             .width('100%')
             .fontSize(13)
@@ -1258,6 +1376,97 @@ struct Index {
           .width('100%')
           .textAlign(TextAlign.Center)
           .fontSize(10)
+          .fontColor(COLOR_MUTED)
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, top: 16, bottom: 28 })
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .scrollBar(BarState.Auto)
+  }
+
+  @Builder
+  private CommandGuide(command: string, scene: string, effect: string) {
+    Column({ space: 5 }) {
+      Text('“' + command + '”')
+        .width('100%')
+        .fontSize(13)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(COLOR_ACCENT)
+      Text(scene)
+        .width('100%')
+        .fontSize(11)
+        .lineHeight(17)
+        .fontColor(COLOR_TEXT)
+      Text(effect)
+        .width('100%')
+        .fontSize(10)
+        .lineHeight(16)
+        .fontColor(COLOR_MUTED)
+    }
+    .width('100%')
+    .padding(12)
+    .backgroundColor(COLOR_PANEL)
+    .border({ width: 1, color: COLOR_LINE })
+    .borderRadius(7)
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  @Builder
+  private HelpPanel() {
+    Scroll() {
+      Column({ space: 12 }) {
+        Row({ space: 8 }) {
+          Text('使用教学')
+            .fontSize(18)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(COLOR_TEXT)
+            .layoutWeight(1)
+          Button('关闭', { type: ButtonType.Normal })
+            .height(34)
+            .fontSize(12)
+            .fontColor(COLOR_TEXT)
+            .backgroundColor(COLOR_BG)
+            .border({ width: 1, color: COLOR_LINE })
+            .borderRadius(7)
+            .onClick((): void => {
+              this.closeHelpPanel();
+            })
+        }
+        .width('100%')
+
+        Text('首次使用先点击底部麦克风按钮开启完整语音链路，之后可以直接连续对话。以下口令需要整句说出。')
+          .width('100%')
+          .fontSize(11)
+          .lineHeight(18)
+          .fontColor(COLOR_MUTED)
+
+        this.CommandGuide(
+          '关闭话筒',
+          '暂时只想听 Agent 工作，不希望周围的普通语音继续发送时使用。',
+          '采集和识别保持运行，只响应系统口令；当前任务和播报不受影响。'
+        )
+        this.CommandGuide(
+          '打开话筒',
+          '话筒处于仅系统口令模式，准备恢复普通语音对话时使用。',
+          '恢复普通消息发送，不重启麦克风和识别链路。'
+        )
+        this.CommandGuide(
+          '停止任务',
+          '需要立即终止当前思考、工具调用、排队任务或播报时使用。',
+          '立即停止本地播报并发送停止请求；服务端队列状态以 Hermes 确认为准。'
+        )
+        this.CommandGuide(
+          '退出软件',
+          '本次不再使用语音客户端，需要释放本地音频和网络资源时使用。',
+          '先释放播放、采集、识别、后台任务和连接，再关闭应用；不会停止远端 Agent 任务。'
+        )
+
+        Text('包含其他语义的长句不会按控制口令执行，避免普通对话误触发。')
+          .width('100%')
+          .fontSize(10)
+          .lineHeight(16)
           .fontColor(COLOR_MUTED)
       }
       .width('100%')
@@ -1622,46 +1831,46 @@ struct Index {
   }
 
   @Builder
-  private ActivityItem(activity: MessageActivity) {
-    Row({ space: 8 }) {
-      Circle({ width: 6, height: 6 })
-        .fill(this.activityColor(activity))
-      Column({ space: 3 }) {
-        Row({ space: 6 }) {
-          Text(activity.title)
-            .fontSize(11)
-            .fontWeight(FontWeight.Medium)
-            .fontColor(COLOR_TEXT)
-            .layoutWeight(1)
-          if (activity.duration_s !== undefined) {
-            Text(this.durationText(activity.duration_s))
-              .fontSize(9)
-              .fontColor(COLOR_MUTED)
-          }
+  private ActivityItem(messageId: string, activity: MessageActivity) {
+    Column({ space: 5 }) {
+      Row({ space: 8 }) {
+        Circle({ width: 6, height: 6 })
+          .fill(this.activityColor(activity))
+        Text(this.activityLabel(activity))
+          .fontSize(11)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(activity.state === 'error' ? COLOR_DANGER : COLOR_TEXT)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+        if (this.activityElapsedSeconds(activity) !== undefined) {
+          Text(this.durationText(this.activityElapsedSeconds(activity)))
+            .constraintSize({ minWidth: 34 })
+            .fontSize(9)
+            .fontColor(COLOR_MUTED)
+            .textAlign(TextAlign.End)
         }
-        .width('100%')
-        if (activity.kind === 'thinking' && activity.detail.length > 0) {
-          Column({ space: 3 }) {
-            ForEach(this.thinkingLines(activity.detail), (line: string) => {
-              Text(line)
-                .width('100%')
-                .fontSize(11)
-                .lineHeight(17)
-                .fontColor(COLOR_TEXT)
-            }, (line: string, index: number) => String(index) + '-' + line)
-          }
-          .width('100%')
-          .alignItems(HorizontalAlign.Start)
-        } else if (activity.detail.length > 0) {
-          Text(activity.detail)
-            .width('100%')
-            .fontSize(10)
-            .lineHeight(16)
-            .fontColor(activity.state === 'error' ? COLOR_DANGER : COLOR_MUTED)
+        if (activity.detail.length > 0) {
+          Text(activity.expanded ? '⌃' : '⌄')
+            .fontSize(12)
+            .fontColor(COLOR_MUTED)
         }
       }
-      .layoutWeight(1)
-      .alignItems(HorizontalAlign.Start)
+      .width('100%')
+      .height(28)
+      .onClick(() => {
+        if (activity.detail.length > 0) {
+          this.controller.toggleMessageActivity(messageId, activity.id);
+        }
+      })
+
+      if (activity.expanded && activity.detail.length > 0) {
+        Text(activity.detail)
+          .width('100%')
+          .fontSize(10)
+          .lineHeight(16)
+          .fontColor(activity.state === 'error' ? COLOR_DANGER : COLOR_MUTED)
+      }
     }
     .width('100%')
   }
@@ -1697,6 +1906,13 @@ struct Index {
       })
 
       if (message.pending || message.processExpanded) {
+        if (message.processWarning.length > 0) {
+          Text(message.processWarning)
+            .width('100%')
+            .fontSize(10)
+            .fontColor(COLOR_WARNING)
+        }
+
         if (message.pending && message.activities.length === 0) {
           Text('正在分析请求')
             .width('100%')
@@ -1707,7 +1923,7 @@ struct Index {
         if (message.activities.length > 0) {
           Column({ space: 8 }) {
             ForEach(message.activities, (activity: MessageActivity) => {
-              this.ActivityItem(activity)
+              this.ActivityItem(message.id, activity)
             }, (activity: MessageActivity) => activity.id)
           }
           .width('100%')
@@ -1836,7 +2052,8 @@ struct Index {
   @Builder
   private VoiceStatus() {
     if (this.snapshot.debugMode &&
-      (this.snapshot.voiceEnabled || this.snapshot.asrState !== 'stopped' || this.snapshot.ttsState !== 'stopped')) {
+      (this.snapshot.inputRouting !== 'off' || this.snapshot.asrState !== 'stopped' ||
+        this.snapshot.ttsState !== 'stopped')) {
       Row({ space: 8 }) {
         Text(this.voiceBackendText())
           .fontSize(10)
@@ -1899,23 +2116,25 @@ struct Index {
           Row({ space: 8 }) {
             SymbolGlyph($r('sys.symbol.ohos_mic'))
               .fontSize(21)
-              .fontColor([this.snapshot.voiceEnabled ? COLOR_SUCCESS : COLOR_MUTED])
+              .fontColor([this.microphoneButtonColor()])
             Text(this.microphoneButtonText())
               .fontSize(11)
               .fontWeight(FontWeight.Medium)
-              .fontColor(this.snapshot.voiceEnabled ? COLOR_SUCCESS : COLOR_TEXT)
+              .fontColor(this.microphoneButtonColor())
               .maxLines(1)
           }
         }
           .height(42)
           .layoutWeight(1)
           .padding({ left: 10, right: 10 })
-          .backgroundColor(this.snapshot.voiceEnabled ? '#16362D' : COLOR_PANEL)
-          .border({ width: 1, color: this.snapshot.voiceEnabled ? COLOR_SUCCESS : COLOR_LINE })
+          .backgroundColor(this.snapshot.inputRouting === 'conversation' ? '#16362D' :
+            this.snapshot.inputRouting === 'commands_only' ? '#30291B' : COLOR_PANEL)
+          .border({ width: 1, color: this.snapshot.inputRouting === 'off'
+            ? COLOR_LINE : this.microphoneButtonColor() })
           .borderRadius(8)
           .enabled(!this.snapshot.conversationLoading)
           .opacity(this.snapshot.conversationLoading ? 0.55 : 1)
-          .accessibilityText(this.snapshot.voiceEnabled ? '关闭麦克风' : '开启麦克风')
+          .accessibilityText(this.microphoneAccessibilityText())
           .onClick(() => {
             this.toggleVoice();
           })
@@ -1997,6 +2216,8 @@ struct Index {
         this.SettingsPanel()
       } else if (this.showHistory) {
         this.HistoryPanel()
+      } else if (this.showHelp) {
+        this.HelpPanel()
       } else if (this.showAgentEntry()) {
         this.AgentEntryPanel()
       } else {

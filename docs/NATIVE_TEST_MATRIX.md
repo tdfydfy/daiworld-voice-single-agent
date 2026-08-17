@@ -69,7 +69,7 @@ node --test \
 1. JSON-RPC pending/request ID/Session隔离单测；
 2. Streaming ASR WebSocket ready、idle、final、stop集成测试；
 3. Streaming TTS队列和设备排空集成测试；
-4. 审批卡与语音同意/拒绝端到端测试；
+4. 对话内审批与严格语音“同意/取消”端到端测试；
 5. `queued=true` 多轮顺序浏览器测试；
 6. exact STOP 与非精确“停止”文本矩阵；
 7. Profile切换后历史和迟到事件隔离；

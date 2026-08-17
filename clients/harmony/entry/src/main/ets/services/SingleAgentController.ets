@@ -23,6 +23,7 @@ import {
   ClientConfig
 } from './AppSettingsStore';
 import { ConversationState, ConversationStateCallbacks } from './ConversationState';
+import { HistoryRestorePolicy } from './HistoryRestorePolicy';
 import { HermesRuntime, HermesRuntimeCallbacks } from './HermesRuntime';
 import { SpeechTextFilter } from './SpeechTextFilter';
 import { AudioContinuityCoordinator } from './AudioContinuityCoordinator';
@@ -39,9 +40,9 @@ import { VoiceOutputCallbacks, VoiceOutputCoordinator } from './VoiceOutputCoord
 import { VoiceRuntime } from './VoiceRuntime';
 import { VoiceFailure } from './VoiceRuntimeState';
 import { RecoveryBudget } from './RecoveryBudget';
+import { StopTaskState } from './StopTaskState';
+import { ProtocolReplyPolicy } from './ProtocolReplyPolicy';
 
-const APPROVAL_ALLOW_PHRASES: string[] = ['同意', '允许', '可以', '执行', '允许执行', '同意执行'];
-const APPROVAL_DENY_PHRASES: string[] = ['取消', '拒绝', '阻止', '不要', '拒绝执行', '阻止执行'];
 const REMOTE_VOICE_RECONNECT_DELAYS_MS: number[] = [250, 750, 1500, 3000];
 const REMOTE_VOICE_STABLE_RESET_MS = 10000;
 const DISPOSE_STEP_TIMEOUT_MS = 3000;
@@ -76,6 +77,7 @@ export class SingleAgentController {
   private config: ClientConfig = AppSettingsStore.defaultConfig();
   private discardInterruptedTurnEvents: boolean = false;
   private replacementPromptSubmitted: boolean = false;
+  private stopTaskState: StopTaskState = new StopTaskState();
   private remoteTtsReconnectTimer?: number;
   private remoteTtsStableTimer?: number;
   private remoteTtsRecoveryBudget: RecoveryBudget = new RecoveryBudget(
@@ -83,6 +85,7 @@ export class SingleAgentController {
   );
   private disconnectTask?: Promise<void>;
   private disposeTask?: Promise<void>;
+  private exitTask?: Promise<void>;
   private disposed: boolean = false;
 
   constructor() {
@@ -127,8 +130,11 @@ export class SingleAgentController {
       (): void => this.conversation.discardAsrPreview(),
       (value: string, preview?: ChatMessage): boolean => this.consumePendingProtocolReply(value, preview),
       (value: string, preview?: ChatMessage): void => this.interrupt(value, preview),
+      (): void => {
+        this.exitApplication().catch(() => undefined);
+      },
       (value: string, preview?: ChatMessage): boolean => this.submitText(value, preview),
-      (value: string): boolean => this.isApprovalAllowPhrase(value) || this.isApprovalDenyPhrase(value),
+      (value: string): boolean => ProtocolReplyPolicy.approvalDecision(value) !== 'none',
       (): string => this.wsUrl('/api/audio/transcribe-stream', this.snapshot.selectedProfile),
       (): string => this.runtime.getCookie()
     ));
@@ -221,7 +227,8 @@ export class SingleAgentController {
       debugMode: this.config.debugMode,
       speechBackend: this.config.speechBackend,
       voicePerson: this.config.voicePerson,
-      speechRate: this.config.speechRate
+      speechRate: this.config.speechRate,
+      mobileInstructions: this.config.mobileInstructions
     };
   }
 
@@ -252,6 +259,10 @@ export class SingleAgentController {
 
   toggleMessageProcess(messageId: string): void {
     this.conversation.toggleMessageProcess(messageId);
+  }
+
+  toggleMessageActivity(messageId: string, activityId: string): void {
+    this.conversation.toggleMessageActivity(messageId, activityId);
   }
 
   listSystemVoices(): Promise<VoiceOption[]> {
@@ -331,7 +342,8 @@ export class SingleAgentController {
       debugMode: this.config.debugMode,
       speechBackend: this.config.speechBackend,
       voicePerson: this.config.voicePerson,
-      speechRate: this.config.speechRate
+      speechRate: this.config.speechRate,
+      mobileInstructions: this.config.mobileInstructions
     });
     if (this.snapshot.connection !== 'online') {
       this.conversation.clearMessages();
@@ -364,14 +376,23 @@ export class SingleAgentController {
 
   // Text input path. Also used after ASR final.
   submitText(text: string, existingMessage?: ChatMessage): boolean {
+    if (this.disposed) {
+      return false;
+    }
     const value = text.trim();
     if (value.length === 0) {
       return false;
     }
+    if (this.input.isExitPhrase(value)) {
+      this.exitApplication().catch(() => undefined);
+      return true;
+    }
+    if (this.input.isOpenMicPhrase(value)) {
+      this.input.openConversationRoute();
+      return true;
+    }
     if (this.input.isCloseMicPhrase(value)) {
-      this.stopVoiceInput();
-      this.snapshot.statusDetail = '已关闭麦克风，思考和播报继续';
-      this.notify();
+      this.input.closeConversationRoute();
       return true;
     }
     if (this.input.isStopPhrase(value)) {
@@ -388,6 +409,7 @@ export class SingleAgentController {
       this.notify();
       return false;
     }
+    this.stopTaskState.invalidatePendingRequest();
     if (this.discardInterruptedTurnEvents) {
       this.replacementPromptSubmitted = true;
     }
@@ -402,6 +424,7 @@ export class SingleAgentController {
     } else {
       this.conversation.appendMessage('user', queued ? '你 · 已排队' : '你', value);
     }
+    this.snapshot.error = '';
     this.snapshot.agentBusy = true;
     this.output.beginAgentTurn();
     this.snapshot.statusDetail = queued ? '已排队，等待当前任务完成' : 'Agent 正在思考';
@@ -447,7 +470,11 @@ export class SingleAgentController {
 
   toggleVoice(): void {
     if (this.input.isWanted()) {
-      this.stopVoiceInput();
+      if (this.input.isCommandsOnly()) {
+        this.input.openConversationRoute();
+      } else {
+        this.input.closeConversationRoute();
+      }
       return;
     }
     const outputWasEnabled = this.output.isEnabled();
@@ -527,7 +554,7 @@ export class SingleAgentController {
         this.voiceRuntime.complete(epoch, 'new-conversation-offline');
         return;
       }
-      this.runtime.createSession(100).then((result: Object) => {
+      this.runtime.createSession(100, this.config.mobileInstructions).then((result: Object) => {
         if (!this.voiceRuntime.isCurrent(epoch)) {
           return;
         }
@@ -621,6 +648,30 @@ export class SingleAgentController {
     return task;
   }
 
+  exitApplication(): Promise<void> {
+    const existing = this.exitTask;
+    if (existing) {
+      return existing;
+    }
+    const context = this.context;
+    if (context === undefined) {
+      this.snapshot.error = '应用尚未初始化，无法退出';
+      this.notify();
+      return Promise.resolve();
+    }
+    const task = this.dispose().then((): Promise<void> => context.terminateSelf());
+    this.exitTask = task;
+    task.catch((error: BusinessError): void => {
+      hilog.error(
+        CONTROLLER_LOG_DOMAIN,
+        CONTROLLER_LOG_TAG,
+        'ability termination failed message=%{public}s',
+        this.errorMessage(error, '退出软件失败')
+      );
+    });
+    return task;
+  }
+
   private async disposeResources(epoch: number): Promise<void> {
     await this.waitForDisposeStep(this.output.dispose(), 'output');
     await this.waitForDisposeStep(this.input.stop(), 'input');
@@ -667,18 +718,6 @@ export class SingleAgentController {
     });
   }
 
-  private normalizeControlPhrase(text: string): string {
-    return text.trim().toLowerCase().replace(/[\s\p{P}\p{S}]/gu, '');
-  }
-
-  private isApprovalAllowPhrase(text: string): boolean {
-    return APPROVAL_ALLOW_PHRASES.includes(this.normalizeControlPhrase(text));
-  }
-
-  private isApprovalDenyPhrase(text: string): boolean {
-    return APPROVAL_DENY_PHRASES.includes(this.normalizeControlPhrase(text));
-  }
-
   private commitProtocolReply(value: string, label: string, existingMessage?: ChatMessage): void {
     if (existingMessage !== undefined) {
       existingMessage.text = value;
@@ -701,12 +740,11 @@ export class SingleAgentController {
         this.notify();
         return true;
       }
-      const allow = this.isApprovalAllowPhrase(value);
-      const deny = this.isApprovalDenyPhrase(value);
-      if (allow || deny) {
+      const decision = ProtocolReplyPolicy.approvalDecision(value);
+      if (decision !== 'none') {
         this.commitProtocolReply(value, '你 · 审批回复', existingMessage);
         this.output.stopProtocolPromptPlayback();
-        this.respondApproval(allow);
+        this.respondApproval(decision === 'allow');
         return true;
       }
       this.commitProtocolReply(value, '你 · 未识别为审批回复', existingMessage);
@@ -722,9 +760,10 @@ export class SingleAgentController {
         this.notify();
         return true;
       }
+      const answer = ProtocolReplyPolicy.clarifyAnswer(value, this.snapshot.clarifyChoices);
       this.commitProtocolReply(value, '你 · 补充回复', existingMessage);
       this.output.stopProtocolPromptPlayback();
-      this.respondClarify(value);
+      this.respondClarify(answer);
       return true;
     }
     return false;
@@ -735,6 +774,8 @@ export class SingleAgentController {
   }
 
   private interrupt(displayText: string, existingMessage?: ChatMessage): void {
+    const requestGeneration = this.stopTaskState.beginRequest();
+    const interruptedSessionId = this.snapshot.runtimeSessionId;
     const shouldPlayCue = this.output.prepareInterruptCue();
     if (existingMessage !== undefined) {
       existingMessage.text = displayText;
@@ -752,7 +793,7 @@ export class SingleAgentController {
     this.snapshot.asrTranscript = '';
     const outputCleanup = this.output.stopForInterrupt();
     this.clearPendingProtocolRequests();
-      this.conversation.completeInterruptedAssistantMessage();
+    this.conversation.completeInterruptedAssistantMessage();
     this.snapshot.agentBusy = false;
     this.snapshot.playback = 'none';
     if (shouldPlayCue) {
@@ -760,15 +801,32 @@ export class SingleAgentController {
         this.output.playStopCue();
       }).catch(() => undefined);
     }
-    this.snapshot.statusDetail = '已停止当前任务';
+    this.snapshot.error = '';
+    this.snapshot.statusDetail = StopTaskState.localStoppedPendingConfirmation();
     this.notify();
     if (this.snapshot.connection !== 'online' || this.snapshot.runtimeSessionId.length === 0) {
       return;
     }
-    this.runtime.interrupt().catch((error: BusinessError) => {
+    this.runtime.interrupt().then((): void => {
+      if (!this.isCurrentInterruptRequest(requestGeneration, interruptedSessionId)) {
+        return;
+      }
+      this.snapshot.error = '';
+      this.snapshot.statusDetail = StopTaskState.requestConfirmedPendingConfirmation();
+      this.notify();
+    }).catch((error: BusinessError) => {
+      if (!this.isCurrentInterruptRequest(requestGeneration, interruptedSessionId)) {
+        return;
+      }
       this.snapshot.error = this.errorMessage(error, '停止请求失败');
+      this.snapshot.statusDetail = StopTaskState.requestFailedPendingConfirmation();
       this.notify();
     });
+  }
+
+  private isCurrentInterruptRequest(requestGeneration: number, sessionId: string): boolean {
+    return !this.disposed && this.snapshot.runtimeSessionId === sessionId &&
+      this.stopTaskState.isCurrentRequest(requestGeneration);
   }
 
   stopCurrentTask(): void {
@@ -815,7 +873,7 @@ export class SingleAgentController {
     }
     const recordingDemand = this.input.isWanted();
     const playbackDemand = this.output.hasBackgroundOutput();
-    this.voiceRuntime.setInputIntent(recordingDemand ? 'conversation' : 'off');
+    this.voiceRuntime.setInputIntent(this.input.inputRouting());
     this.voiceRuntime.setPlaybackDemand(playbackDemand);
     this.audioContinuity.syncDemand(recordingDemand, playbackDemand);
   }
@@ -825,7 +883,7 @@ export class SingleAgentController {
       this.restoreSessionAfterReconnect(this.snapshot.storedSessionId);
       return;
     }
-    this.runtime.createSession(100).then((result: Object) => {
+    this.runtime.createSession(100, this.config.mobileInstructions).then((result: Object) => {
       this.onSessionCreated(result);
     }).catch(() => undefined);
   }
@@ -1189,6 +1247,7 @@ export class SingleAgentController {
   private resetInterruptedTurnGuard(): void {
     this.discardInterruptedTurnEvents = false;
     this.replacementPromptSubmitted = false;
+    this.stopTaskState.invalidatePendingRequest();
   }
 
   private payloadText(data: Record<string, Object> | undefined): string {
@@ -1221,13 +1280,9 @@ export class SingleAgentController {
   private clarifyConversationText(question: string, choices: string[]): string {
     let prompt = question;
     if (choices.length > 0) {
-      const lines: string[] = [];
-      for (let index = 0; index < choices.length; index += 1) {
-        lines.push(String(index + 1) + '. ' + choices[index]);
-      }
-      prompt += '\n可选：\n' + lines.join('\n');
+      prompt += '\n可选：' + choices.join('、');
     }
-    return prompt + '\n请直接回复你的选择。';
+    return prompt + '\n请直接回复选项内容或说明你的答案。';
   }
 
   respondApproval(allow: boolean): void {
@@ -1415,7 +1470,7 @@ export class SingleAgentController {
         this.snapshot.runtimeSessionId = '';
         this.conversation.clearMessages();
         this.snapshot.error = '';
-        this.runtime.createSession(100).then((result: Object) => {
+        this.runtime.createSession(100, this.config.mobileInstructions).then((result: Object) => {
           this.onSessionCreated(result);
         }).catch((createError: BusinessError) => {
           this.snapshot.conversationLoading = false;
@@ -1432,17 +1487,12 @@ export class SingleAgentController {
   }
 
   private completeSessionResume(result: Object, detail?: Object): void {
-    const record = result as Record<string, Object>;
-    const detailRecord = detail as Record<string, Object> | undefined;
-    const detailedMessages = detailRecord !== undefined ? detailRecord['messages'] : undefined;
-    const fallbackMessages = record['messages'];
-    const messages = Array.isArray(detailedMessages) && detailedMessages.length > 0
-      ? detailedMessages : fallbackMessages;
-    if (Array.isArray(messages)) {
-      this.conversation.restoreSessionMessages(messages as Object[], this.snapshot.runtimeModel);
-    } else {
-      this.conversation.clearMessages();
-    }
+    const selection = HistoryRestorePolicy.select(result, detail);
+    this.conversation.restoreSessionMessages(
+      selection.messages,
+      this.snapshot.runtimeModel,
+      selection.processComplete
+    );
     this.snapshot.conversationLoading = false;
     this.onSessionCreated(result);
   }
@@ -1533,6 +1583,7 @@ export class SingleAgentController {
     copy.runtimeSessionId = source.runtimeSessionId;
     copy.storedSessionId = source.storedSessionId;
     copy.voiceEnabled = source.voiceEnabled;
+    copy.inputRouting = source.inputRouting;
     copy.asrState = source.asrState;
     copy.asrTranscript = source.asrTranscript;
     copy.asrUtteranceActive = source.asrUtteranceActive;
@@ -1605,6 +1656,7 @@ export class SingleAgentController {
     copy.completedAt = source.completedAt;
     copy.pending = source.pending;
     copy.processExpanded = source.processExpanded;
+    copy.processWarning = source.processWarning;
     copy.replaying = source.replaying;
     const activities: MessageActivity[] = [];
     for (const sourceActivity of source.activities) {
@@ -1612,9 +1664,13 @@ export class SingleAgentController {
       activity.id = sourceActivity.id;
       activity.kind = sourceActivity.kind;
       activity.title = sourceActivity.title;
+      activity.summary = sourceActivity.summary;
       activity.detail = sourceActivity.detail;
       activity.state = sourceActivity.state;
+      activity.startedAt = sourceActivity.startedAt;
+      activity.endedAt = sourceActivity.endedAt;
       activity.duration_s = sourceActivity.duration_s;
+      activity.expanded = sourceActivity.expanded;
       activities.push(activity);
     }
     copy.activities = activities;

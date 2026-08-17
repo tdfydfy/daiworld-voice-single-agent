@@ -1,16 +1,15 @@
 import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { ChatMessage, SingleAgentSnapshot } from '../models/SingleAgentState';
+import { ChatMessage, InputRouting, SingleAgentSnapshot } from '../models/SingleAgentState';
 import { ClientConfig } from './AppSettingsStore';
 import { CaptureSupervisor, CaptureSupervisorCallbacks } from './CaptureSupervisor';
 import { RecoveryBudget } from './RecoveryBudget';
 import { AsrListener, StreamingAsrClient } from './StreamingAsrClient';
 import { SystemAsrEngine } from './SystemAsrEngine';
+import { VoiceControlPolicy } from './VoiceControlPolicy';
 import { VoiceOutputCoordinator } from './VoiceOutputCoordinator';
 
-const STOP_PHRASES: string[] = ['停止', 'stop'];
-const CLOSE_MIC_PHRASES: string[] = ['关闭话筒', '关闭麦克风', '关闭microphone', '暂停收音'];
 const SYSTEM_ASR_STARTUP_TIMEOUT_MS = 15000;
 const ASR_FINALIZATION_GRACE_MS = 1800;
 const REMOTE_ASR_RECONNECT_DELAYS_MS: number[] = [250, 750, 1500, 3000];
@@ -28,6 +27,7 @@ export class VoiceInputCallbacks {
   private discardPreviewCallback: () => void;
   private protocolReplyCallback: (value: string, preview?: ChatMessage) => boolean;
   private interruptCallback: (value: string, preview?: ChatMessage) => void;
+  private exitApplicationCallback: () => void;
   private submitCallback: (value: string, preview?: ChatMessage) => boolean;
   private approvalReplyCallback: (value: string) => boolean;
   private remoteUrlCallback: () => string;
@@ -43,6 +43,7 @@ export class VoiceInputCallbacks {
     discardPreviewCallback: () => void,
     protocolReplyCallback: (value: string, preview?: ChatMessage) => boolean,
     interruptCallback: (value: string, preview?: ChatMessage) => void,
+    exitApplicationCallback: () => void,
     submitCallback: (value: string, preview?: ChatMessage) => boolean,
     approvalReplyCallback: (value: string) => boolean,
     remoteUrlCallback: () => string,
@@ -57,6 +58,7 @@ export class VoiceInputCallbacks {
     this.discardPreviewCallback = discardPreviewCallback;
     this.protocolReplyCallback = protocolReplyCallback;
     this.interruptCallback = interruptCallback;
+    this.exitApplicationCallback = exitApplicationCallback;
     this.submitCallback = submitCallback;
     this.approvalReplyCallback = approvalReplyCallback;
     this.remoteUrlCallback = remoteUrlCallback;
@@ -97,6 +99,10 @@ export class VoiceInputCallbacks {
 
   interrupt(value: string, preview?: ChatMessage): void {
     this.interruptCallback(value, preview);
+  }
+
+  exitApplication(): void {
+    this.exitApplicationCallback();
   }
 
   submit(value: string, preview?: ChatMessage): boolean {
@@ -227,32 +233,61 @@ export class VoiceInputCoordinator {
     return this.wanted;
   }
 
+  inputRouting(): InputRouting {
+    return this.wanted ? this.snapshot.inputRouting : 'off';
+  }
+
+  isCommandsOnly(): boolean {
+    return this.wanted && this.snapshot.inputRouting === 'commands_only';
+  }
+
   setWanted(wanted: boolean): void {
     if (this.wanted !== wanted && !wanted) {
       this.captureStartGeneration += 1;
     }
     this.wanted = wanted;
+    this.snapshot.inputRouting = wanted ? 'conversation' : 'off';
     this.snapshot.voiceEnabled = wanted;
   }
 
   isStopPhrase(text: string): boolean {
-    const normalized = this.normalizeControlPhrase(text);
-    for (const phrase of STOP_PHRASES) {
-      if (normalized === phrase) {
-        return true;
-      }
-    }
-    return false;
+    return VoiceControlPolicy.resolve(text) === 'stop_task';
   }
 
   isCloseMicPhrase(text: string): boolean {
-    const normalized = this.normalizeControlPhrase(text);
-    for (const phrase of CLOSE_MIC_PHRASES) {
-      if (normalized === phrase) {
-        return true;
-      }
+    return VoiceControlPolicy.resolve(text) === 'close_microphone';
+  }
+
+  isOpenMicPhrase(text: string): boolean {
+    return VoiceControlPolicy.resolve(text) === 'open_microphone';
+  }
+
+  isExitPhrase(text: string): boolean {
+    return VoiceControlPolicy.resolve(text) === 'exit_application';
+  }
+
+  closeConversationRoute(): boolean {
+    if (!this.wanted || this.snapshot.inputRouting === 'commands_only') {
+      return false;
     }
-    return false;
+    this.snapshot.inputRouting = 'commands_only';
+    this.snapshot.voiceEnabled = false;
+    this.snapshot.statusDetail = '话筒已关闭，仅响应系统口令';
+    this.callbacks.syncBackgroundState();
+    this.callbacks.notify();
+    return true;
+  }
+
+  openConversationRoute(): boolean {
+    if (!this.wanted || this.snapshot.inputRouting === 'conversation') {
+      return false;
+    }
+    this.snapshot.inputRouting = 'conversation';
+    this.snapshot.voiceEnabled = true;
+    this.snapshot.statusDetail = '话筒已打开，可以继续对话';
+    this.callbacks.syncBackgroundState();
+    this.callbacks.notify();
+    return true;
   }
 
   startRemote(): void {
@@ -339,6 +374,7 @@ export class VoiceInputCoordinator {
     this.capturing = false;
     this.captureReady = false;
     this.snapshot.voiceEnabled = false;
+    this.snapshot.inputRouting = 'off';
     this.snapshot.asrState = 'stopped';
     this.snapshot.asrTranscript = '';
     this.snapshot.asrUtteranceActive = false;
@@ -490,6 +526,7 @@ export class VoiceInputCoordinator {
     this.systemRecognitionStartupPhase = '';
     this.callbacks.syncBackgroundState();
     this.snapshot.voiceEnabled = false;
+    this.snapshot.inputRouting = 'off';
     this.snapshot.asrState = 'stopped';
     this.snapshot.asrTranscript = '';
     this.snapshot.asrUtteranceActive = false;
@@ -713,6 +750,7 @@ export class VoiceInputCoordinator {
     this.capturing = false;
     this.captureReady = false;
     this.snapshot.voiceEnabled = false;
+    this.snapshot.inputRouting = 'off';
     this.snapshot.asrState = 'stopped';
     this.snapshot.microphoneRoute = '';
     this.snapshot.statusDetail = '远端 ASR 已停止：音频采集恢复失败';
@@ -803,6 +841,7 @@ export class VoiceInputCoordinator {
     this.capturing = false;
     this.captureReady = false;
     this.snapshot.voiceEnabled = false;
+    this.snapshot.inputRouting = 'off';
     this.snapshot.asrState = 'stopped';
     this.snapshot.microphoneRoute = '';
     this.snapshot.statusDetail = '远端 ASR 已停止恢复';
@@ -836,13 +875,15 @@ export class VoiceInputCoordinator {
     }
     if (!this.snapshot.asrUtteranceActive) {
       this.snapshot.asrUtteranceActive = true;
-      this.callbacks.ensurePreview();
+      if (!this.isCommandsOnly()) {
+        this.callbacks.ensurePreview();
+      }
     }
     this.output.onUserSpeechDetected();
   }
 
   private onFinal(epoch: number, text: string): void {
-    if (epoch !== this.epoch || this.submissionFrozen) {
+    if (epoch !== this.epoch || !this.wanted || this.submissionFrozen) {
       return;
     }
     const value = this.mergeSegments(this.combinedText(), text.trim());
@@ -853,11 +894,25 @@ export class VoiceInputCoordinator {
     if (this.snapshot.asrState === 'finalizing') {
       this.snapshot.asrState = this.wanted ? 'listening' : 'stopped';
     }
+    if (this.isExitPhrase(value)) {
+      this.callbacks.discardPreview();
+      this.callbacks.exitApplication();
+      return;
+    }
+    if (this.isOpenMicPhrase(value)) {
+      this.callbacks.discardPreview();
+      this.openConversationRoute();
+      if (this.output.isPausedForUser()) {
+        this.output.resumePausedPlayback();
+      }
+      return;
+    }
     if (this.isCloseMicPhrase(value)) {
       this.callbacks.discardPreview();
-      this.stop();
-      this.snapshot.statusDetail = '已关闭麦克风，思考和播报继续';
-      this.callbacks.notify();
+      this.closeConversationRoute();
+      if (this.output.isPausedForUser()) {
+        this.output.resumePausedPlayback();
+      }
       return;
     }
     if (!this.hasSemanticContent(value)) {
@@ -866,6 +921,11 @@ export class VoiceInputCoordinator {
     }
     if (this.isStopPhrase(value)) {
       this.callbacks.interrupt(value, preview);
+      return;
+    }
+    if (this.isCommandsOnly()) {
+      this.snapshot.statusDetail = '话筒已关闭，普通语音未发送';
+      this.discardAndResumePlayback();
       return;
     }
     if (this.callbacks.consumeProtocolReply(value, preview)) {
@@ -886,7 +946,7 @@ export class VoiceInputCoordinator {
   }
 
   private updateInterim(epoch: number, text: string): void {
-    if (epoch !== this.epoch || this.submissionFrozen) {
+    if (epoch !== this.epoch || !this.wanted || this.submissionFrozen) {
       return;
     }
     this.asrLatestInterimText = text.trim();
@@ -898,16 +958,18 @@ export class VoiceInputCoordinator {
     if (this.wanted) {
       this.snapshot.asrState = 'listening';
     }
-    const preview = this.callbacks.ensurePreview();
-    preview.label = '你 · 正在识别';
-    preview.text = value;
-    preview.revision += 1;
+    if (!this.isCommandsOnly()) {
+      const preview = this.callbacks.ensurePreview();
+      preview.label = '你 · 正在识别';
+      preview.text = value;
+      preview.revision += 1;
+    }
     this.scheduleFinalization(epoch);
     this.callbacks.notify();
   }
 
   private queueFinal(epoch: number, text: string, isLast: boolean): void {
-    if (epoch !== this.epoch || this.submissionFrozen) {
+    if (epoch !== this.epoch || !this.wanted || this.submissionFrozen) {
       return;
     }
     const value = text.trim();
@@ -929,10 +991,12 @@ export class VoiceInputCoordinator {
     this.snapshot.asrTranscript = combined;
     this.snapshot.asrUtteranceActive = true;
     this.snapshot.asrState = 'finalizing';
-    const preview = this.callbacks.ensurePreview();
-    preview.label = '你 · 等待收句';
-    preview.text = combined;
-    preview.revision += 1;
+    if (!this.isCommandsOnly()) {
+      const preview = this.callbacks.ensurePreview();
+      preview.label = '你 · 等待收句';
+      preview.text = combined;
+      preview.revision += 1;
+    }
     hilog.info(
       INPUT_LOG_DOMAIN,
       INPUT_LOG_TAG,
@@ -970,7 +1034,8 @@ export class VoiceInputCoordinator {
   }
 
   private shouldFinalizeImmediately(text: string): boolean {
-    return this.isStopPhrase(text) || this.isCloseMicPhrase(text) || this.snapshot.clarifyPending ||
+    return this.isExitPhrase(text) || this.isStopPhrase(text) || this.isCloseMicPhrase(text) ||
+      this.isOpenMicPhrase(text) ||
       (this.snapshot.approvalPending && this.callbacks.isApprovalReply(text));
   }
 
@@ -1013,10 +1078,6 @@ export class VoiceInputCoordinator {
 
   private isCaptureStartCurrent(generation: number): boolean {
     return generation === this.captureStartGeneration && this.wanted;
-  }
-
-  private normalizeControlPhrase(text: string): string {
-    return text.trim().toLowerCase().replace(/[\s\p{P}\p{S}]/gu, '');
   }
 
   private hasSemanticContent(text: string): boolean {

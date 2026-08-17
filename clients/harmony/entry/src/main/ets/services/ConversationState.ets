@@ -7,6 +7,7 @@ import {
   MessageRole,
   SingleAgentSnapshot
 } from '../models/SingleAgentState';
+import { ActivityTimelineReducer } from './ActivityTimelineReducer';
 
 const THINKING_ACTIVITY_MAX_CHARS = 180;
 
@@ -41,6 +42,7 @@ export class ConversationStateCallbacks {
 class HistoryToolResult {
   success: boolean = true;
   message: string = '';
+  duration_s?: number;
 }
 
 // Owns the mutable conversation graph shown by the UI. Networking and voice
@@ -73,6 +75,21 @@ export class ConversationState {
         this.callbacks.notify();
         return;
       }
+    }
+  }
+
+  toggleMessageActivity(messageId: string, activityId: string): void {
+    for (const message of this.snapshot.messages) {
+      if (message.id !== messageId) {
+        continue;
+      }
+      const activity = ActivityTimelineReducer.find(message.activities, activityId);
+      if (activity !== undefined && activity.detail.length > 0) {
+        activity.expanded = !activity.expanded;
+        message.revision += 1;
+        this.callbacks.notify();
+      }
+      return;
     }
   }
 
@@ -149,13 +166,9 @@ export class ConversationState {
       last.thinking_s = Math.max(0, firstTokenAt - last.timestamp) / 1000;
       last.generation_s = Math.max(0, endedAt - firstTokenAt) / 1000;
       last.duration_s = Math.max(0, endedAt - last.timestamp) / 1000;
-      for (const activity of last.activities) {
-        if (activity.state === 'running') {
-          activity.state = 'completed';
-        }
-      }
+      ActivityTimelineReducer.finishAll(last.activities, endedAt);
       last.pending = false;
-      last.processExpanded = false;
+      last.processExpanded = last.activities.length > 0;
       last.revision += 1;
     }
     this.activeAssistantMessageId = '';
@@ -170,13 +183,13 @@ export class ConversationState {
       return;
     }
     const endedAt = Date.now();
-    const activity = new MessageActivity();
-    activity.id = 'error-' + String(message.activities.length);
-    activity.kind = 'error';
-    activity.title = '执行失败';
-    activity.detail = errorText;
-    activity.state = 'error';
-    message.activities.push(activity);
+    ActivityTimelineReducer.appendError(
+      message.activities,
+      'error-' + String(message.activities.length),
+      '执行失败',
+      errorText,
+      endedAt
+    );
     message.completedAt = endedAt;
     message.duration_s = Math.max(0, endedAt - message.timestamp) / 1000;
     message.pending = false;
@@ -197,20 +210,19 @@ export class ConversationState {
     message.thinking_s = Math.max(0, firstTokenAt - message.timestamp) / 1000;
     message.generation_s = Math.max(0, endedAt - firstTokenAt) / 1000;
     message.duration_s = Math.max(0, endedAt - message.timestamp) / 1000;
-    for (const item of message.activities) {
-      if (item.state === 'running') {
-        item.state = 'completed';
-      }
+    ActivityTimelineReducer.finishAll(message.activities, endedAt);
+    const activity = ActivityTimelineReducer.appendStatus(
+      message.activities,
+      'stopped-' + String(message.activities.length),
+      '已按用户要求停止当前任务',
+      endedAt
+    );
+    if (activity !== undefined) {
+      activity.title = '任务已停止';
     }
-    const activity = new MessageActivity();
-    activity.id = 'stopped-' + String(message.activities.length);
-    activity.kind = 'status';
-    activity.title = '任务已停止';
-    activity.detail = '已按用户要求停止当前任务';
-    activity.state = 'completed';
-    message.activities.push(activity);
+    ActivityTimelineReducer.finishAll(message.activities, endedAt);
     message.pending = false;
-    message.processExpanded = false;
+    message.processExpanded = message.activities.length > 0;
     message.revision += 1;
     this.activeAssistantMessageId = '';
   }
@@ -245,33 +257,30 @@ export class ConversationState {
     if (message && text.length > 0) {
       message.thinking += text;
       let remaining = text;
+      const now = Date.now();
       while (remaining.length > 0) {
-        let activity: MessageActivity | undefined;
+        let currentLength = 0;
         if (message.activities.length > 0) {
           const lastActivity = message.activities[message.activities.length - 1];
           if (lastActivity.kind === 'thinking' && lastActivity.state === 'running') {
-            activity = lastActivity;
+            currentLength = lastActivity.detail.length;
           }
         }
-        if (!activity) {
-          activity = new MessageActivity();
-          activity.id = 'thinking-' + String(message.activities.length);
-          activity.kind = 'thinking';
-          activity.title = '思考';
-          activity.state = 'running';
-          message.activities.push(activity);
-        }
-        const capacity = THINKING_ACTIVITY_MAX_CHARS - activity.detail.length;
+        const capacity = THINKING_ACTIVITY_MAX_CHARS - currentLength;
         if (capacity <= 0) {
-          activity.state = 'completed';
+          ActivityTimelineReducer.finishTrailing(message.activities, now);
           continue;
         }
         const chunkLength = this.thinkingChunkLength(remaining, capacity);
-        activity.detail += remaining.substring(0, chunkLength);
+        const chunk = remaining.substring(0, chunkLength);
         remaining = remaining.substring(chunkLength);
-        if (remaining.length > 0) {
-          activity.state = 'completed';
-        }
+        ActivityTimelineReducer.appendThinking(
+          message.activities,
+          'thinking-' + String(message.activities.length),
+          chunk,
+          now,
+          remaining.length > 0
+        );
       }
       message.processExpanded = true;
       message.revision += 1;
@@ -283,26 +292,12 @@ export class ConversationState {
     if (!message || text.length === 0) {
       return;
     }
-    let previous: MessageActivity | undefined;
-    if (message.activities.length > 0) {
-      const lastActivity = message.activities[message.activities.length - 1];
-      if (lastActivity.kind === 'status' && lastActivity.state === 'running') {
-        previous = lastActivity;
-      }
-    }
-    if (!previous || previous.detail !== text) {
-      if (previous) {
-        previous.state = 'completed';
-      }
-      this.completeTrailingProcessActivity(message);
-      const activity = new MessageActivity();
-      activity.id = 'status-' + String(message.activities.length);
-      activity.kind = 'status';
-      activity.title = '状态';
-      activity.detail = text;
-      activity.state = 'running';
-      message.activities.push(activity);
-    }
+    ActivityTimelineReducer.appendStatus(
+      message.activities,
+      'status-' + String(message.activities.length),
+      text,
+      Date.now()
+    );
     message.revision += 1;
   }
 
@@ -312,42 +307,47 @@ export class ConversationState {
     if (!message) {
       return name;
     }
-    const rawId = data !== undefined && data['tool_id'] !== undefined ? String(data['tool_id']) : name;
+    const rawId = data !== undefined && data['tool_id'] !== undefined
+      ? String(data['tool_id']) : data !== undefined && data['call_id'] !== undefined
+        ? String(data['call_id']) : name;
     const id = 'tool-' + rawId;
-    if (type === 'tool.start') {
-      this.completeTrailingProcessActivity(message);
-    }
-    let activity = this.findActivity(message, id);
-    if (!activity) {
-      activity = new MessageActivity();
-      activity.id = id;
-      activity.kind = 'tool';
-      activity.title = '调用 · ' + this.historyToolTitle(name);
-      message.activities.push(activity);
-    }
+    const title = this.historyToolTitle(name);
+    const now = Date.now();
     if (type === 'tool.start') {
       const context = data !== undefined && data['context'] !== undefined
         ? String(data['context']) : data !== undefined && data['args_text'] !== undefined
           ? String(data['args_text']) : '';
-      activity.detail = context.length > 0 ? '输入：' + this.activityExcerpt(context) : '已发起调用';
-      activity.state = 'running';
+      ActivityTimelineReducer.startTool(
+        message.activities,
+        id,
+        title,
+        this.activityExcerpt(context),
+        now
+      );
       message.processExpanded = true;
     } else if (type === 'tool.progress') {
       const preview = data !== undefined && data['preview'] !== undefined ? String(data['preview']) : '';
-      if (preview.length > 0) {
-        activity.detail = '进展：' + this.activityExcerpt(preview);
-      }
-      activity.state = 'running';
+      ActivityTimelineReducer.progressTool(
+        message.activities,
+        id,
+        title,
+        this.activityExcerpt(preview),
+        now
+      );
     } else {
       const summary = data !== undefined && data['summary'] !== undefined ? String(data['summary']) : '';
       const error = data !== undefined && data['error'] !== undefined ? String(data['error']) : '';
-      activity.detail = error.length > 0
-        ? '失败：' + this.activityExcerpt(error)
-        : '结果：' + this.activityExcerpt(summary.length > 0 ? summary : '执行完成');
-      activity.state = error.length > 0 ? 'error' : 'completed';
-      if (data !== undefined && typeof data['duration_s'] === 'number') {
-        activity.duration_s = data['duration_s'] as number;
-      }
+      const duration = data !== undefined && typeof data['duration_s'] === 'number'
+        ? data['duration_s'] as number : undefined;
+      ActivityTimelineReducer.completeTool(
+        message.activities,
+        id,
+        title,
+        this.activityExcerpt(error.length > 0 ? error : summary.length > 0 ? summary : '执行完成'),
+        error.length > 0,
+        now,
+        duration
+      );
     }
     message.revision += 1;
     return name;
@@ -513,7 +513,11 @@ export class ConversationState {
     return sessions;
   }
 
-  restoreSessionMessages(messageItems: Object[], initialModel: string): void {
+  restoreSessionMessages(
+    messageItems: Object[],
+    initialModel: string,
+    processComplete: boolean = true
+  ): void {
     this.clearMessages();
     let currentModel = initialModel;
     let pendingActivities: MessageActivity[] = [];
@@ -556,7 +560,8 @@ export class ConversationState {
       } else {
         message.thinking = this.historyThinkingText(pendingActivities);
         message.activities = pendingActivities;
-        message.processExpanded = false;
+        message.processWarning = processComplete ? '' : '历史过程未完整载入';
+        message.processExpanded = message.activities.length > 0 || message.processWarning.length > 0;
         pendingActivities = [];
       }
       this.snapshot.messages.push(message);
@@ -616,21 +621,25 @@ export class ConversationState {
     if (value.length === 0) {
       return;
     }
-    const lastActivity = activities.length > 0 ? activities[activities.length - 1] : undefined;
-    if (lastActivity !== undefined && lastActivity.kind === 'thinking' &&
-      lastActivity.state === 'completed') {
-      if (!lastActivity.detail.includes(value)) {
-        lastActivity.detail += (lastActivity.detail.length > 0 ? '\n\n' : '') + value;
-      }
+    const activity = ActivityTimelineReducer.appendThinking(
+      activities,
+      'history-thinking-' + String(activities.length),
+      value,
+      0,
+      true
+    );
+    if (activity === undefined) {
       return;
     }
-    const activity = new MessageActivity();
-    activity.id = 'history-thinking-' + String(activities.length);
-    activity.kind = 'thinking';
-    activity.title = '思考';
-    activity.detail = value;
-    activity.state = 'completed';
-    activities.push(activity);
+    const startedAt = this.timelineTimestamp(row['started_at']);
+    const endedAt = this.timelineTimestamp(
+      row['completed_at'] !== undefined ? row['completed_at'] : row['ended_at']
+    );
+    if (startedAt > 0 && endedAt >= startedAt) {
+      activity.startedAt = startedAt;
+      activity.endedAt = endedAt;
+      activity.duration_s = (endedAt - startedAt) / 1000;
+    }
   }
 
   private restoreHistoryToolCalls(row: Record<string, Object>, activities: MessageActivity[]): void {
@@ -641,55 +650,41 @@ export class ConversationState {
     for (const rawCall of rawCalls as Object[]) {
       const call = rawCall as Record<string, Object>;
       const rawFunction = call['function'];
-      const toolFunction = rawFunction !== undefined
+      const toolFunction = rawFunction !== undefined && typeof rawFunction === 'object'
         ? rawFunction as Record<string, Object> : undefined;
       const name = toolFunction !== undefined && toolFunction['name'] !== undefined
-        ? String(toolFunction['name']) : 'tool';
+        ? String(toolFunction['name']) : call['name'] !== undefined ? String(call['name']) : 'tool';
       const callId = call['call_id'] !== undefined
-        ? String(call['call_id']) : call['id'] !== undefined ? String(call['id']) : name;
-      const activityId = 'history-tool-' + callId;
-      if (this.findActivityById(activities, activityId)) {
-        continue;
-      }
-      const activity = new MessageActivity();
-      activity.id = activityId;
-      activity.kind = 'tool';
-      activity.title = '调用 · ' + this.historyToolTitle(name);
+        ? String(call['call_id']) : call['tool_call_id'] !== undefined
+          ? String(call['tool_call_id']) : call['id'] !== undefined ? String(call['id']) : name;
+      const activityId = 'tool-' + callId;
       const rawArguments = toolFunction !== undefined ? toolFunction['arguments'] : undefined;
-      const argumentsText = rawArguments !== undefined ? String(rawArguments) : '';
-      activity.detail = argumentsText.length > 0
-        ? '输入：' + this.activityExcerpt(argumentsText) : '正在执行';
-      activity.state = 'running';
-      activities.push(activity);
+      ActivityTimelineReducer.startTool(
+        activities,
+        activityId,
+        this.historyToolTitle(name),
+        this.activityExcerpt(this.objectText(rawArguments)),
+        this.timelineTimestamp(row['timestamp'])
+      );
     }
   }
 
   private restoreHistoryToolResult(row: Record<string, Object>, activities: MessageActivity[]): void {
     const name = row['tool_name'] !== undefined ? String(row['tool_name']) : 'tool';
     const callId = row['tool_call_id'] !== undefined ? String(row['tool_call_id']) : name;
-    const activityId = 'history-tool-' + callId;
-    let activity = this.findActivityById(activities, activityId);
-    if (!activity) {
-      activity = new MessageActivity();
-      activity.id = activityId;
-      activity.kind = 'tool';
-      activity.title = '调用 · ' + this.historyToolTitle(name);
-      activities.push(activity);
-    }
+    const activityId = 'tool-' + callId;
     const result = this.historyToolResult(row['content']);
-    activity.detail = result.success
-      ? '结果：' + this.historyToolSuccessText(name, result.message)
-      : '失败：' + (result.message.length > 0 ? this.activityExcerpt(result.message) : '执行失败');
-    activity.state = result.success ? 'completed' : 'error';
-  }
-
-  private findActivityById(activities: MessageActivity[], id: string): MessageActivity | undefined {
-    for (const activity of activities) {
-      if (activity.id === id) {
-        return activity;
-      }
-    }
-    return undefined;
+    ActivityTimelineReducer.completeTool(
+      activities,
+      activityId,
+      this.historyToolTitle(name),
+      result.success
+        ? this.historyToolSuccessText(name, result.message)
+        : result.message.length > 0 ? this.activityExcerpt(result.message) : '执行失败',
+      !result.success,
+      this.timelineTimestamp(row['timestamp']),
+      result.duration_s
+    );
   }
 
   private historyToolTitle(name: string): string {
@@ -708,9 +703,15 @@ export class ConversationState {
       return result;
     }
     try {
-      const parsed = JSON.parse(String(rawContent)) as Record<string, Object>;
+      const parsed = typeof rawContent === 'string'
+        ? JSON.parse(rawContent) as Record<string, Object>
+        : rawContent as Record<string, Object>;
       result.success = parsed['success'] !== false && parsed['error'] === undefined;
-      result.message = parsed['message'] !== undefined ? String(parsed['message']) : '';
+      result.message = parsed['message'] !== undefined
+        ? String(parsed['message']) : parsed['error'] !== undefined ? String(parsed['error']) : '';
+      if (typeof parsed['duration_s'] === 'number') {
+        result.duration_s = parsed['duration_s'] as number;
+      }
     } catch (error) {
       result.success = true;
     }
@@ -736,7 +737,13 @@ export class ConversationState {
   }
 
   private activityExcerpt(value: string): string {
-    const normalized = value.replace(/\s+/g, ' ').trim();
+    const redacted = value
+      .replace(/("(?:access_token|api_key|authorization|password|secret|token)"\s*:\s*")[^"]*(")/gi,
+        '$1[已隐藏]$2')
+      .replace(/((?:access_token|api_key|authorization|password|secret|token)\s*=\s*)[^&\s,}]+/gi,
+        '$1[已隐藏]')
+      .replace(/(bearer\s+)[a-z0-9._-]+/gi, '$1[已隐藏]');
+    const normalized = redacted.replace(/\s+/g, ' ').trim();
     if (normalized.length <= 240) {
       return normalized;
     }
@@ -767,13 +774,26 @@ export class ConversationState {
   }
 
   private completeTrailingProcessActivity(message: ChatMessage): void {
-    if (message.activities.length === 0) {
-      return;
+    ActivityTimelineReducer.finishTrailing(message.activities, Date.now());
+  }
+
+  private objectText(value: Object | undefined): string {
+    if (value === undefined) {
+      return '';
     }
-    const activity = message.activities[message.activities.length - 1];
-    if ((activity.kind === 'thinking' || activity.kind === 'status') && activity.state === 'running') {
-      activity.state = 'completed';
+    if (typeof value === 'string') {
+      return value;
     }
+    try {
+      return JSON.stringify(value);
+    } catch (error) {
+      return '';
+    }
+  }
+
+  private timelineTimestamp(value: Object | undefined): number {
+    const parsed = this.parseTimestamp(value);
+    return parsed > 0 && parsed < 100000000000 ? parsed * 1000 : parsed;
   }
 
   private parseTimestamp(value: Object | undefined): number {
@@ -793,12 +813,4 @@ export class ConversationState {
     return 0;
   }
 
-  private findActivity(message: ChatMessage, id: string): MessageActivity | undefined {
-    for (const activity of message.activities) {
-      if (activity.id === id) {
-        return activity;
-      }
-    }
-    return undefined;
-  }
 }
