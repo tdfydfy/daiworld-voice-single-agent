@@ -1,583 +1,104 @@
-# 单 Agent 跨端交互与协议规范
+# 跨端交互与协议规范
 
-> 版本：Single Agent v22
-> Web 参考实现：`web_native/app.js`  
-> 服务边界：`app/native_main.py`  
-> 迁移目标：单 Agent HarmonyOS 形态  
-> 不适用：主持人多 Agent 版
+本文定义 HarmonyOS 和 Web Native 必须保持一致的用户语义。平台可以使用不同的录音、播放和 UI API，但不得改变 Hermes 协议含义。
 
-## 1. 规范目标
+## Agent 与 Session
 
-Web 和 HarmonyOS 可以使用不同 UI、录音和播放 API，但必须保持相同语义：
+- Agent 目录来自 Adapter `/api/agents`，其权威来源是 Hermes `/api/status.profiles`；客户端把 `id` 视为不透明值。
+- 一次只连接一个 Profile；切换 Agent 时关闭旧连接并创建该 Profile 的新 Session。
+- 新对话创建 Hermes Session，但不删除旧历史。
+- 历史列表按 20 条增量加载；恢复使用持久 ID，继续工作使用恢复后返回的运行时 ID。
+- 当前 Session 的模型切换通过 Hermes `config.set(... --session)` 完成，只有匹配的 `session.info` 才能确认 UI 状态。
 
-- 一个客户端当前只面对一个 Hermes Profile；
-- Hermes 官方 Session 是唯一上下文；
-- ASR final 自动成为当前 Session 的用户消息；
-- 忙碌时普通补充使用 `queued:true`；
-- 只有精确整句“停止 / stop”是破坏性中断；
-- 播放、收音、Agent任务互不隐式关闭；
-- 审批、文件和历史都来自 Hermes 官方能力。
+## 文本和语音提交
 
-## 2. 产品操作
+- 空白或仅标点的 ASR final 不创建 Prompt。
+- Agent 空闲时发送普通 `prompt.submit`；Agent 繁忙时的补充使用 `queued=true`。
+- 用户开口可以暂停当前播报；普通补充提交后继续已接受的播报队列。
+- `message.complete` 只完成当前回答，不得无条件抢断前一条尚未播完的回答。
+- TTS 必须过滤代码、链接、文件路径和附件指令，附件本身不得被朗读。
 
-### 2.1 选择 Agent
+## HarmonyOS 控制命令
 
-客户端从 Adapter `GET /api/agents` 读取 Agent 目录，只把 `id` 当作不透明标识，并显示服务端返回的名称和可选头像。客户端不得写死 Profile 数量、名称或后端地址。
+控制命令按规范化后的精确整句匹配，不做模糊意图推断：
 
-切换 Profile：
-
-1. 关闭当前 JSON-RPC / ASR / TTS 连接；
-2. 清空当前运行时播放；
-3. 连接对应 Profile 的 Adapter 路由；
-4. 创建新的 Hermes Session；
-5. 加载该 Profile 自己的历史。
-
-这不是主持人调度，也不桥接不同 Profile 的上下文。
-
-### 2.2 切换当前会话模型
-
-- 设置页通过 `GET /api/hermes/model/options?profile=<agent-id>` 读取公开的 Provider / 模型标识；密钥和内部配置不下发客户端；
-- 客户端发送 `config.set(session_id, key=model, value="<model> --provider <provider> --session")`；
-- `--session` 表示只影响当前运行 Session，不写回 Agent / Profile 默认配置；
-- 切换期间不重建对话、ASR 或 TTS 连接，当前 Agent 忙碌时禁止切换；
-- RPC 失败或 10 秒内没有匹配的 `session.info` 时，顶部继续显示上一次已确认身份；
-- 只有 `session.info` 返回目标模型后，客户端才把切换标为已确认，并以该事件中的 Provider 更新顶部身份。
-- Adapter 将 `slug=open1, name=OPENAIAPI` 这类通用名称规范化为具体公开标识，并可返回 `active_provider_label`；HarmonyOS 不把 `custom` / `OPENAIAPI` 当成具体服务名。
-
-### 2.3 新对话
-
-- 创建新的 Hermes Session；
-- 页面消息清空；
-- 不删除旧持久会话；
-- 历史栏仍可恢复旧会话。
-
-### 2.4 恢复历史
-
-- 列表首次显示最新 20 个持久会话；
-- 到底后再显示 20；
-- 点击条目执行 `session.resume`；
-- 使用返回的运行时 ID 继续；
-- 显示用 REST timestamp/model，不伪造旧耗时；
-- 恢复后直接发送或开麦即继续原上下文。
-
-## 3. JSON-RPC Gateway
-
-### 3.1 连接
-
-```text
-POST /api/auth/session
-  Header: X-Voice-Token=<long-term-access>
-  → Set-Cookie: voice_session=<http-only>
-
-WSS /api/hermes/ws?profile=<profile>
-```
-
-连接前客户端请求 `GET /api/agents`（`X-Voice-Token`），目录返回 `id`、`name`、`is_default` 和可选 `avatar_url`。URL、凭据、Provider 标签和语音策略只留在 Adapter；保存的 Agent 不存在时回退到 `is_default`，空目录显示离线空状态。
-
-模型设置面板按需请求 `GET /api/hermes/model/options?profile=<agent-id>`（`X-Voice-Token`）。返回值只包含可选择的 Provider / 模型公开标识，不包含任何 Provider Key。
-
-服务端连接成功后发送 `gateway.ready` 事件。客户端再调用 `session.create` 或 `session.resume`。
-
-`session.create.params.instructions` 是移动端的会话偏好，不是对 Adapter / Agent 预设规则的替换。Adapter 按“Agent 预设 → 客户端偏好 → 服务端强制契约”的顺序合并三者；客户端不得覆盖附件投递、安全或协议约束。
-
-Adapter 在 `/api/hermes/ws` 建立后每 25 秒向客户端发送 `gateway.heartbeat`。该事件不转发到上游 Hermes，也不进入消息或状态 UI。HarmonyOS 只在收到首个心跳后启动 70 秒看门狗；70 秒内没有后续心跳时关闭旧 socket 并进入有界重连。没有发送心跳的旧 Adapter 不启用该看门狗，以保持协议兼容。
-
-瞬态错误恢复时，客户端重新鉴权并恢复当前 `storedSessionId`，但不得调用手动历史恢复路径、关闭语音输出、清空现有消息或自动重放 Prompt。401/403 仍是终止鉴权失败，不自动重试。
-
-### 3.2 请求格式
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": "42",
-  "method": "session.create",
-  "params": {"cols": 100}
-}
-```
-
-响应：
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": "42",
-  "result": {}
-}
-```
-
-事件：
-
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "event",
-  "params": {
-    "type": "message.delta",
-    "session_id": "runtime-id",
-    "payload": {"text": "...", "speech_text": "可选的简短播报正文"}
-  }
-}
-```
-
-客户端必须用 `session_id` 隔离旧连接和旧 Session 的迟到事件。
-
-## 4. 客户端调用的 Hermes 方法
-
-| 方法 | 关键参数 | 客户端用途 |
-|---|---|---|
-| `session.create` | `cols` | 新对话 |
-| `session.list` | `limit` | 历史列表；20条递增 |
-| `session.resume` | `session_id=storedId, cols` | 恢复上下文 |
-| `session.delete` | `session_id=storedId` | 删除非活动历史 |
-| `prompt.submit` | `session_id, text, queued?` | 文字或ASR final |
-| `session.interrupt` | `session_id` | 精确停止 / 停止按钮 |
-| `approval.respond` | `session_id, choice` | `session` 或 `deny` |
-| `clarify.respond` | `session_id, request_id, answer` | 回答澄清 |
-| `config.set` | `session_id, key=model, value="<model> --provider <provider> --session"` | 只切换当前 Session 的模型 / Provider |
-
-## 5. 客户端处理的 Hermes 事件
-
-| 事件 | 关键字段 | 行为 |
-|---|---|---|
-| `gateway.ready` | — | create/resume Session |
-| `gateway.heartbeat` | — | 客户端内部刷新网关看门狗，不转发到业务事件监听器 |
-| `session.info` | `model, provider, provider_label/provider_name, profile_name` | 更新运行时身份并确认待处理的模型切换；具体 Provider 名优先于类型字段 |
-| `message.start` | — | 创建 Agent 气泡和 SpeechJob |
-| `message.delta` | `text/rendered, speech_text?` | 屏幕追加完整正文；TTS 优先追加 `speech_text` |
-| `message.complete` | `text/rendered, speech_text?, artifacts?` | 屏幕保留完整正文，TTS 使用 `speech_text` 或最小清理后的兼容正文 |
-| `thinking.delta` / `reasoning.delta` | `text` | 更新思考区，不作为正式回答 |
-| `tool.start` | `tool_id, name, args_text/context` | 创建工具步骤 |
-| `tool.progress` | `name, preview` | 更新工具详情 |
-| `tool.complete` | `tool_id, name, duration_s, summary, error` | 完成工具步骤，耗时同行 |
-| `approval.request` | `description, command` | HarmonyOS 追加对话气泡并进入审批 pending；Web 技术预览保留既有协议回归 |
-| `clarify.request` | `request_id, question, choices` | HarmonyOS 追加无编号语义选项的对话气泡并进入澄清 pending |
-| `status.update` | `text/kind` | 更新运行状态 |
-| `error` | `message` | 结束相关忙碌并显示错误 |
-
-HarmonyOS 不应继续监听旧主持人版的 `host_route / host_message / supplement_queued / agent_result / runtime_refresh` 作为单 Agent 主协议。
-
-## 6. 连续 ASR 协议
-
-### 6.1 连接
-
-```text
-WSS /api/audio/transcribe-stream?profile=<profile>
-```
-
-鉴权使用前置HTTP会话Cookie，不把长期访问口令放入WebSocket URL。
-客户端连接后应**并行**启动麦克风采集，不要先等待 `ready` 再录音。
-
-### 6.2 上行
-
-- 二进制 PCM signed 16-bit little-endian；
-- 16 kHz；
-- 单声道；
-- Web 当前每次发送 6400 bytes；
-- `ready` 前允许本地短缓冲；
-- HarmonyOS 在未连接、重连或等待 `ready` 时保留最近 4 个 PCM 块（约 0.8 秒），只在显式“暂停收音”或关闭麦克风时清空；
-- 结束时发送：
-
-```json
-{"stop": true}
-```
-
-### 6.3 下行
-
-Ready：
-
-```json
-{"type":"ready"}
-```
-
-转写：
-
-```json
-{
-  "type": "transcript",
-  "text": "用户正在说的内容",
-  "interim": true,
-  "final": false
-}
-```
-
-Final：
-
-```json
-{
-  "type": "transcript",
-  "text": "完整用户输入",
-  "interim": false,
-  "final": true
-}
-```
-
-错误：
-
-```json
-{"type":"error","message":"..."}
-```
-
-共同语义边界：`final=true` 且 `text` 不含 Unicode 字母或数字（Unicode General Category `L` / `N`）时，Adapter 不丢弃转写帧，而是把 `text` 改为空字符串并保留 `final=true`，让客户端清理当前临时气泡和暂停状态。HarmonyOS 保留同一规则作为防御性过滤；Web 只保留协议回归实现，不定义另一套判定。
-
-### 6.4 ASR 客户端规则
-
-1. `ready` 前不处理 transcript；
-2. partial 更新同一个临时用户气泡；
-3. 普通转写和澄清回复进入约 1.8 秒收句窗口；窗口内连续 interim/final 合并到同一气泡并重新计时，明确的系统控制口令和审批“同意/取消”仍立即处理；
-4. final 不删除重建，直接把同一气泡升级为正式消息；
-5. `idle timeout` 是继续等待，不是重连理由；
-6. 断线且用户仍开启语音时按 `250 / 750 / 1500 / 3000 ms` 封顶退避自动重连，短暂断线不立即拆分已有有效转写；
-7. HarmonyOS 的连接看门覆盖 WebSocket 建连到 Provider `ready` 的完整阶段，10 秒未就绪即进入下一轮恢复；
-8. 重连必须隔离旧 socket 的迟到回调，显式暂停收音、切换本地语音或主动断开必须取消恢复；
-9. exact STOP 先中断，不提交普通 Prompt；
-10. approval pending 时只接受整句“同意”或“取消”；只清理 ASR 附加在口令两端的空格、句号、逗号等标点，不接受近义词、数字或序号。
-
-## 7. TTS 协议
-
-### 7.1 流式连接
-
-```text
-WSS /api/audio/speak-stream?profile=<profile>
-```
-
-鉴权使用前置HTTP会话Cookie。
-客户端发送：
-
-```json
-{"text":"一段增量文本"}
-{"done":true}
-{"stop":true}
-```
-
-服务端发送：
-
-- JSON 生命周期事件；
-- 二进制 PCM signed 16-bit little-endian；
-- 24 kHz；
-- 单声道。
-
-Web 当前识别的 JSON：
-
-```json
-{"type":"start"}
-{"type":"end"}
-{"type":"fallback"}
-{"type":"error","message":"..."}
-```
-
-### 7.2 播放排空
-
-收到 `end` 后：
-
-```text
-remaining = speechNext - AudioClock.currentTime
-```
-
-客户端必须等待 remaining 排空，再释放当前 SpeechJob。HarmonyOS 应用 `AudioRenderer` 的真实队列/回调实现等价语义。
-
-远端 TTS 断线时，HarmonyOS 先排空已经收到的 PCM，再把播放状态归零；重连只恢复后续待发送任务，不伪造已经丢失的服务端 PCM。
-
-### 7.3 TTS 队列
-
-```text
-activeSpeechJob
-speechQueue[]
-```
-
-- 一次只播放一个 Job；
-- 后续 Agent 回答按顺序排队；
-- `message.complete` 不等于前一条播完；
-- HarmonyOS 的文本和 `done` 帧使用单通道有序发送；发送失败时失败帧留在队首，重连后继续，不能按 Promise 回调顺序重排；
-- 远端连接按 `250 / 750 / 1500 / 3000 ms` 封顶退避恢复，单次建连超过 10 秒视为失败，旧 socket 回调不得改变新连接；
-- STOP 和显式关闭才清空待发送队列。
-- 单条重读按当前语音后端清理：系统 TTS 只停止 CoreSpeech 请求，不等待无关的远端 PCM renderer；远端 TTS 必须等待旧 renderer 清理完成，并用代际隔离迟到回调后再启动新任务。
-
-### 7.4 MEDIA 文本过滤
-
-Hermes 可能把附件路径拆成：
-
-```text
-"MEDIA" → ":/" → "tmp" → "/file.pdf"
-```
-
-客户端必须使用**行首有限前缀状态机**过滤 TTS，不能只做 `delta.includes("MEDIA:")`。
-
-## 8. 繁忙输入与补充
-
-```text
-append = agentBusy || activeSpeechJob || speechQueue.length > 0
-```
-
-普通 final：
-
-```json
-{
-  "method": "prompt.submit",
-  "params": {
-    "session_id": "runtime-id",
-    "text": "补充内容",
-    "queued": true
-  }
-}
-```
-
-UI 必须显示：
-
-```text
-豆包流式ASR · 提交中
-→ 已排队
-```
-
-禁止：
-
-- 用关键词猜 APPEND / REPLACE / SWITCH；
-- 每次说话都中断 Agent；
-- 把转写气泡删掉却不提交；
-- 用模型自述代替 RPC 回执。
-
-## 9. 精确停止
-
-只匹配标准化后的整句：
-
-```text
-停止
-stop
-```
-
-其他内容，例如“不要停止”“停止当前任务后解释一下”“先停一下这个观点”，默认是普通输入，不做破坏性操作。
-
-STOP 行为：
-
-1. `session.interrupt`；
-2. 清理本地 SpeechJob 和播放队列；
-3. 清理 pending approval；
-4. 显示“已停止当前任务”；
-5. 不自动发起下一轮模型回答。
-
-## 10. 播放中用户说话
-
-### 10.1 判定
-
-```text
-getUserMedia echoCancellation
-+ RMS 门槛
-+ 播放阶段门槛
-+ 连续帧多数
-+ 有序文本回音判断
-```
-
-### 10.2 行为
-
-真人 partial：
-
-```text
-AudioContext.suspend / AudioRenderer.pause
-```
-
-final 提交后：
-
-```text
-AudioContext.resume / AudioRenderer.resume
-```
-
-ASR 误判为回音时才删除预览；普通补充必须保留。
-
-## 11. 审批
-
-### 11.1 对话展示
-
-HarmonyOS 追加普通 Agent 对话气泡，展示：
-
-- 高风险；
-- 简短说明；
-- 完整命令；
-- “执行已暂停”；
-- “请回复同意或取消”。
-
-不显示独立审批卡或操作按钮。`clarify.request` 同样把问题和无编号语义选项写入对话气泡，不显示独立选项卡。
-
-### 11.2 语音
-
-同意口令：
-
-```text
-同意
-```
-
-取消口令：
-
-```text
-取消
-```
-
-映射：
-
-- 同意 → `approval.respond(choice="session")`；
-- 取消 → `approval.respond(choice="deny")`。
-
-文字和语音共用同一映射。只忽略口令两端的 ASR 空格和标点；夹带其他文字、近义词、数字或序号均不触发审批，审批继续保持 pending。澄清选项不编号，完整收句与已知选项文本归一化一致时回传规范选项，其他内容原样交给 `clarify.respond` 做语义处理，也不调用 `prompt.submit`。
-
-## 12. 附件
-
-Live `message.complete` 可能带：
-
-```json
-{
-  "artifacts": [
-    {
-      "token": "opaque-random-token",
-      "name": "report.pdf",
-      "mime_type": "application/pdf",
-      "size": 12345,
-      "is_image": false
-    }
-  ]
-}
-```
-
-客户端：
-
-- `is_image=true`：内联预览；
-- 其他：下载卡；
-- URL：`/api/artifacts/{token}`；
-- 下载：`?download=1`；
-- 不显示真实服务器路径。
-
-Adapter 在新建 Session 时要求 Agent 先把最终文件复制到首个 `VOICE_ARTIFACT_ROOTS` 目录，再输出独立的 `MEDIA:<绝对路径>` 行。收到 `[附件不可用：name]` 表示 Adapter 已识别 `MEDIA:`，但源文件不存在、不可读、超限或不在允许目录；这不是客户端预览失败。
-
-## 13. 历史
-
-### 13.1 列表
-
-```json
-{
-  "method":"session.list",
-  "params":{"limit":20}
-}
-```
-
-滚到底依次请求 40、60……；因为官方接口无 offset，客户端只新增新出现的后 20 条。
-
-条目显示：
-
-- title；
-- preview；
-- started_at；
-- message_count；
-- source。
-
-### 13.2 恢复
-
-并行：
-
-```text
-session.resume(storedId)
-GET /api/hermes/sessions/{storedId}?profile=...
-```
-
-前者恢复运行时上下文，后者提供：
-
-- 持久 timestamp；
-- session model；
-- display_metadata；
-- 历史附件令牌。
-
-### 13.3 元数据
-
-实时：
-
-```text
-赫小码 · gpt-5.6-sol
-思考 4.4s · 生成 0.3s · 总计 4.6s · 18:59:09
-```
-
-历史：
-
-```text
-赫小码 · gpt-5.6-sol
-总计 7.2s · 2026/08/07 17:51:01
-```
-
-历史没有 thinking/generation 持久字段，不得补假数字。
-
-## 14. UI 结构
-
-桌面：
-
-```text
-280px历史左栏 | 对话主区
-```
-
-移动：
-
-```text
-全屏左抽屉
-→ 选择后关闭
-→ 对话主区
-```
-
-回答垂直顺序：
-
-```text
-思考
-工具
-发言
-身份/模型
-耗时/时间
-附件（位于正文和元数据之间）
-```
-
-附件实际顺序以 UI 视觉为准：正文 → 附件 → 元数据。
-
-## 15. HarmonyOS 等价实现要求
-
-| Web | HarmonyOS |
+| 命令 | 行为 |
 |---|---|
-| `getUserMedia` | `AudioCapturer` |
-| `AudioContext` | `AudioRenderer` |
-| Browser WebSocket | `@kit.NetworkKit.webSocket` |
-| `localStorage` 口令 | Preferences / HUKS 安全存储 |
-| DOM Store | `ConversationStore` |
-| `<img>/<a download>` | ArkUI Image / 文件保存与分享 |
-| 页面可见性 | Ability 生命周期 + 后台任务 |
+| `关闭话筒` | 保持采集和 ASR，切换到仅系统命令路由；普通 final 本地丢弃 |
+| `打开话筒` | 恢复普通对话路由 |
+| `停止任务` | 立即清理本地正文、重读、待播和提醒，再发送 `session.interrupt` |
+| `退出软件` | 释放本地音频、后台任务和网络连接后退出；不隐式停止远端任务 |
 
-移植语义，不移植 DOM 和 ScriptProcessor 代码。
+冷启动后必须由用户手动开启一次完整收音链路。麦克风按钮在链路启动后切换与 `关闭话筒` / `打开话筒` 相同的路由状态。
 
-## 16. 跨端验收矩阵
+`停止任务`的本地效果是立即且可确认的；Hermes 当前任务和排队工作的最终状态以后续服务端事件为准，客户端不得用本地清理推断服务端已完全收敛。
 
-| 场景 | Web 与 HarmonyOS 必须一致 |
-|---|---|
-| 新 Session | Profile、模型和运行时 ID 正确 |
-| 两轮连续对话 | 第二轮知道第一轮 |
-| ASR partial/final | 同一气泡升级，不重复 |
-| 首句开口 | ready 前 PCM 不丢 |
-| Agent 思考中补充 | `queued:true`，不打断当前工作 |
-| 播报中补充 | 暂停 → final入队 → 恢复 |
-| 回音 | 不提交 Agent 自己的 TTS |
-| 普通短句 | 不被回音过滤吞掉 |
-| 精确停止 | Agent + TTS 队列停止 |
-| 非精确“停止”文本 | 普通下一轮 |
-| 工具调用 | 名称、摘要、耗时可见 |
-| 高风险审批 | 对话和语音均可处理，无独立卡片，未知词不批准 |
-| 图片 | 内联可见，路径不泄漏 |
-| 文件 | 可下载/保存，token 过期后失败 |
-| 历史首屏 | 20条 |
-| 历史加载更多 | 每次新增20条 |
-| 历史继续 | 同一持久上下文 |
-| 历史模型/时间 | 与实时同一视觉结构 |
-| Profile切换 | 历史和Session隔离 |
-| 网络恢复 | 25 秒心跳维持网关；70 秒看门狗关闭悬挂连接；不显示旧连接迟到事件、不清空消息或关闭语音输出；远端 ASR 保留短 PCM，TTS 待发帧保持顺序并自动恢复 |
-| 后台/锁屏 | 按平台真实能力显示，不虚假在线 |
+## 审批与澄清
 
-## 17. 变更规则
+收到 `approval.request` 后：
 
-任何协议改动必须同步：
+- 在 Agent 对话流中显示完整风险命令；
+- 只接受去除两端空白和有限句末标点后的精确 `同意` 或 `取消`；
+- 直接调用 `approval.respond`，不创建新的 Prompt；
+- 未识别输入保持审批等待，不自动批准。
 
-1. Web 参考实现；
-2. 本规范；
-3. 单 Agent HarmonyOS 协议模型；
-4. Python/Node 回归；
-5. 桌面和移动端真实探针；
-6. HarmonyOS DevEco 编译和真机验收。
+`clarify.request` 同样进入对话流。客户端显示服务端原始问题和选项，用户完整回复通过 `clarify.respond` 提交；客户端不把序号自行解释成语义选项。
 
-主持人多 Agent 版有自己的协议，不要求与本规范合并。
+## 连接与恢复
+
+1. 用 `X-Voice-Token` 调用 `POST /api/auth/session`。
+2. 保存服务端下发的 HttpOnly `voice_session` Cookie。
+3. 建立带 Profile 的 JSON-RPC、ASR 或 TTS WebSocket。
+4. 收到 `gateway.ready` 后创建或恢复 Session。
+5. 收到首个 `gateway.heartbeat` 后启用 70 秒看门狗。
+
+瞬态断线使用有限退避重新鉴权，并恢复当前 `storedSessionId`。恢复路径不得清空消息、重放 Prompt 或把当前本地音频状态伪造成新的 Agent 事件。401/403 不自动重试。
+
+## 附件契约
+
+Agent 可以显式使用 `MEDIA:`，也可以在普通回复中给出受支持后缀的文件引用。Adapter 支持：
+
+```text
+MEDIA:/absolute/path/report.docx
+sandbox:/absolute/path/report.docx
+file:///absolute/path/report.docx
+/absolute/path/report.docx
+[下载报告](sandbox:/absolute/path/report.docx)
+https://example.test/report.docx
+```
+
+支持的常见后缀包括：
+
+```text
+图片: apng avif bmp gif heic heif ico jpeg jpg png svg tif tiff webp
+文档: csv doc docx epub json md odf ods odt pdf ppt pptx rtf txt xls xlsx xml
+压缩: 7z gz rar tar zip
+```
+
+处理规则：
+
+- 显式 `MEDIA:` 可投递可验证的本地文件或合格 HTTPS 文件地址；
+- 非 `MEDIA:` 引用只有后缀在支持列表中才提升为附件；
+- 本地路径必须存在、可读、为普通文件并满足大小限制；
+- HTTPS 必须无用户名密码、具有文件名，并移除 fragment；
+- HTTP、`artifact:` 等未知协议和普通网页链接不提升；
+- 消息正文移除已成功转换的原始路径或地址；失败引用保留为文字并记录服务端诊断；
+- 客户端只使用 `/api/artifacts/{token}`，不得显示或持久化服务器路径；
+- 图片内联显示，其他文件显示名称、类型、大小和打开/下载操作。
+
+## 历史
+
+- `session.list` 提供持久会话列表；
+- `session.resume` 恢复上下文并返回新的运行时 ID；
+- Adapter REST 聚合真实时间、模型和附件；
+- 恢复历史中的附件时重新签发令牌；
+- 当前已绑定的会话不得在客户端直接删除；
+- 缺失的旧思考或耗时数据保持缺失，不由客户端伪造。
+
+## 客户端不得实现
+
+- Profile 名称、数量或内部 URL 的硬编码；
+- 第二套 Agent 上下文、工具路由或审批权限；
+- 对普通语音做破坏性命令的模糊匹配；
+- 将服务器绝对路径直接交给浏览器或系统文件打开器；
+- 因 ASR/TTS 某一路失败而擅自切换用户未选择的语音后端。

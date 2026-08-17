@@ -1,127 +1,89 @@
-# 单 Agent v21 验证矩阵
+# Native 测试矩阵
 
-> 目的：区分“有自动化证据”“有真实服务证据”和“尚未验证”，避免把整个仓库测试通过等同于单 Agent 全链路完成。
+测试分为纯逻辑、Adapter 集成、HarmonyOS 静态契约、构建和真机五层。低层通过不能替代高层证据；安装成功或 Ability 拉起也不能记为功能验收。
 
-## 1. 基线
+## 自动化
 
-| 项目 | 值 |
+在仓库根目录执行：
+
+```bash
+python -m pytest -q
+node --test tests/*.test.js
+node clients/harmony/scripts/verify.mjs
+```
+
+这些检查覆盖：
+
+- Adapter 鉴权、Profile 目录、JSON-RPC、历史和附件转换；
+- Web Native 语音过滤、播放连续性、恢复和移动布局逻辑；
+- HarmonyOS 单 Agent 路由、权限、语音状态和附件渲染静态契约。
+
+完整 HarmonyOS 构建：
+
+```powershell
+cd clients/harmony
+hvigorw assembleHap --mode module -p product=default -p buildMode=debug
+```
+
+构建依赖 DevEco Studio、匹配的 HarmonyOS SDK、Hvigor、Node 和 JBR。
+
+## Adapter 集成
+
+| 用例 | 期望 |
 |---|---|
-| 运行代码基线 | `native-open-source` 清理分支 |
-| 文档基线 | `native-open-source` 分支 |
-| Python Native专属回归 | 10 passed |
-| Node单Agent回归 | 7 passed |
-| 公网入口 | 按部署者配置 |
-| Adapter服务 | `daiworld-voice-native.service` |
+| 无口令或错误口令 | HTTP/WS 拒绝，内部 Hermes 令牌不泄漏 |
+| 首次 Agent 目录 | 从 Hermes profiles 建立缓存，只返回公开字段 |
+| `?refresh=1` | 显式刷新目录，不启动后台轮询 |
+| 创建/恢复 Session | 运行时 ID 与持久 ID 分离，Profile 不串线 |
+| 网关心跳 | 约 25 秒下发，只由客户端连接层消费 |
+| 历史详情 | 保留真实时间、模型和可重签附件 |
+| 失效附件令牌 | 返回不存在/过期，不泄漏原路径 |
 
-> 当前分支只包含Native单Agent代码；全链路真实服务证据仍需由部署者按环境复测。
+## 附件专项
 
-## 2. 单 Agent 专属自动化
+至少验证下列输入：
 
-| 能力 | 测试文件 | 已覆盖 |
-|---|---|---|
-| MEDIA令牌 | `tests/test_native_artifacts.py` | 路径选择、令牌、MIME、历史重签、禁止未选择路径 |
-| 历史详情 | `tests/test_native_history.py` | Session model与消息timestamp聚合 |
-| 回音过滤 | `tests/voice_filters.test.js` | 有序短语/二元组、正常补充不误杀、播放暂停判定 |
-| MEDIA TTS过滤 | `tests/media_speech_filter.test.js` | 分片MEDIA行过滤、普通文本保留 |
+| 输入 | 期望 |
+|---|---|
+| `MEDIA:/.../image.png` | 图片附件，正文不显示路径 |
+| `sandbox:/.../report.docx` | 文件附件，正文不显示 sandbox 地址 |
+| `file:///.../report.pdf` | 文件附件 |
+| 裸绝对路径 `.../sheet.xlsx` | 文件附件 |
+| Markdown 包装的本地引用 | 保留可读标签，生成附件 |
+| HTTPS `.../slides.pptx` | 令牌端点重定向，不由 Adapter 抓取 |
+| 普通网页 URL | 保持链接，不误判附件 |
+| HTTP、未知协议或未知后缀 | 保持文字，不放行 |
+| 不存在、不可读、目录或超限文件 | 不签发附件 |
+| 历史中的同一引用 | 恢复时生成新令牌 |
 
-运行：
+## HarmonyOS 真机
 
-```bash
-python -m pytest tests/test_native_artifacts.py tests/test_native_history.py \
-  -q -o 'addopts='
+| 领域 | 必测行为 |
+|---|---|
+| 登录与目录 | 正确口令在线，错误口令明确失败，Agent 可刷新切换 |
+| 文字 | 新对话、繁忙补充、历史恢复、模型切换 |
+| 连续语音 | 手动启用、partial/final、长时间监听、暂停恢复 |
+| 系统命令 | `关闭话筒`、`打开话筒`、`停止任务`、`退出软件` 精确语义 |
+| 审批/澄清 | `同意`、`取消` 和未识别输入均符合协议 |
+| 播放 | 自动播报、单条重读、停止、耳机/听筒/扬声器切换 |
+| 生命周期 | 前后台、息屏、网络断开恢复、进程退出后无残留重连 |
+| 附件 | 图片内联；Word/PDF 等文件显示文件项并可打开或下载 |
+| 安全显示 | UI、日志和系统打开器参数不出现 `/root/...` 等原始路径 |
 
-node --test \
-  tests/voice_filters.test.js \
-  tests/media_speech_filter.test.js
-```
+## 证据边界
 
-## 3. 已有真实服务证据
+- 自动化通过：证明代码契约和可模拟路径，不证明设备音频体验。
+- HAP 构建通过：证明工程可编译，不证明安装、权限和网络可用。
+- 安装并拉起：证明签名和 Ability 可运行，不证明产品流程正确。
+- 真机功能验收：需要实际执行操作并记录结果；语音听感和视觉判断由用户确认。
 
-| 层级 | 证据 | 状态 |
-|---|---|---|
-| Profile隔离 | default/hexiaoma/hexiaoxin三个 `serve --isolated` 后端 | 已验证 |
-| JSON-RPC | `gateway.ready`、create、submit、delta、complete | 已验证 |
-| Session连续性 | 真实两轮Session继续 | 已验证 |
-| 历史分页 | 浏览器DOM `20 → 40 → 60` | 已验证 |
-| 历史恢复 | 原Session继续、模型/时间恢复 | 已验证 |
-| 历史删除 | 二次确认、删除后条目消失 | 已验证 |
-| 图片/文件 | PNG内联、TXT/PDF类文件下载卡、历史附件重签 | 已验证 |
-| 桌面布局 | Chromium 1280px | 已验证 |
-| 移动布局 | Chromium 390px | 已验证 |
-| 服务发布 | systemd active、公网版本资源可读、无warning | 已验证 |
+长期允许的 AI 真机冒烟范围见 [永久真机授权](./plans/2026-08-12-permanent-device-smoke-authorization.md)。
 
-## 4. 浏览器语音能力证据边界
+## 发布门槛
 
-| 能力 | 当前状态 | 说明 |
-|---|---|---|
-| Streaming ASR ready/partial/final | 已在真实服务链路实现；需持续保留回归 | Provider和浏览器联合链路 |
-| 首句PCM缓冲 | 源码和浏览器探针已验证 | 采集与WS并行启动 |
-| Agent流式TTS | 已实现并运行 | Provider end与客户端排空分离 |
-| queued补充 | 已验证RPC与UI状态 | `prompt.submit(queued=true)` |
-| 播放暂停/恢复 | 浏览器逻辑和Node判定已验证 | 真实不同硬件AEC效果仍需测量 |
-| 精确STOP | 已实现 | `停止/stop`整句；仍需保留端到端回归 |
-| 审批语音 | 已实现 | 屏幕按钮和固定语音词表；需专项端到端自动化 |
-
-## 5. 尚缺的单 Agent 自动化
-
-按优先级补充：
-
-1. JSON-RPC pending/request ID/Session隔离单测；
-2. Streaming ASR WebSocket ready、idle、final、stop集成测试；
-3. Streaming TTS队列和设备排空集成测试；
-4. 对话内审批与严格语音“同意/取消”端到端测试；
-5. `queued=true` 多轮顺序浏览器测试；
-6. exact STOP 与非精确“停止”文本矩阵；
-7. Profile切换后历史和迟到事件隔离；
-8. 移动端软键盘、安全区和抽屉交互回归；
-9. token过期后的附件错误UI；
-10. 网络断开/重连时不重复提交final。
-
-这些缺项不否定当前v21稳定基线，但在HarmonyOS迁移前应转化为跨端fixture。
-
-## 6. HarmonyOS验证阶梯
-
-单 Agent HarmonyOS 每项必须标注实际完成层级：
-
-```text
-L1 源码静态契约
-L2 ArkTS类型检查
-L3 DevEco/Hvigor构建
-L4 模拟器
-L5 真机前台
-L6 真机后台/锁屏
-```
-
-验收矩阵：
-
-| 场景 | L1 | L2 | L3 | L4 | L5 | L6 |
-|---|---:|---:|---:|---:|---:|---:|
-| JSON-RPC文字两轮 | 待迁移 | 待迁移 | 待迁移 | 待迁移 | 待迁移 | 不适用 |
-| 历史20→40 | 待迁移 | 待迁移 | 待迁移 | 待迁移 | 待迁移 | 不适用 |
-| PCM16k持续ASR | 待迁移 | 待迁移 | 待迁移 | 待迁移 | 待迁移 | 待迁移 |
-| PCM24k连续TTS | 待迁移 | 待迁移 | 待迁移 | 待迁移 | 待迁移 | 待迁移 |
-| queued补充 | 待迁移 | 待迁移 | 待迁移 | 待迁移 | 待迁移 | 待迁移 |
-| exact STOP | 待迁移 | 待迁移 | 待迁移 | 待迁移 | 待迁移 | 待迁移 |
-| 审批 | 待迁移 | 待迁移 | 待迁移 | 待迁移 | 待迁移 | 待迁移 |
-| 图片/文件 | 待迁移 | 待迁移 | 待迁移 | 待迁移 | 待迁移 | 不适用 |
-| 网络切换 | 待迁移 | 待迁移 | 待迁移 | 待迁移 | 待迁移 | 待迁移 |
-| 蓝牙/来电/音频焦点 | 不适用 | 不适用 | 不适用 | 不充分 | 待迁移 | 待迁移 |
-
-当前服务器没有DevEco Studio、Harmony SDK、OHPM、Hvigor和HDC，因此不得提前填写L2-L6为通过。
-
-## 7. 发布前固定命令
-
-```bash
-# 单Agent与全仓回归
-python -m pytest -q -o 'addopts='
-node --check web_native/app.js
-node --test tests/voice_filters.test.js tests/media_speech_filter.test.js
-
-# 语法与差异
-node --check web_native/app.js
-git diff --check
-
-# 服务
-systemctl is-active daiworld-voice-native.service
-journalctl -u daiworld-voice-native.service --since '10 minutes ago' -p warning --no-pager
-```
+1. 三组自动化命令通过。
+2. DevEco/Hvigor 构建通过。
+3. 生产 Adapter 健康、目录、鉴权和心跳正常。
+4. 真机完成本次变更相关用例及基础回归。
+5. 附件改动必须同时验证一张图片和一个非图片文件。
+6. 文档、应用版本和生产服务名与实际部署一致。
