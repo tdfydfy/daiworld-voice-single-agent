@@ -56,7 +56,12 @@ DEFAULT_VOICE_INSTRUCTIONS = (
 
 def artifact_delivery_instructions(allowed_roots: tuple[Path, ...]) -> str:
     if not allowed_roots:
-        return ""
+        return (
+            "Attachment delivery requirement: save the final image or file as a readable regular "
+            "file, then include exactly one standalone line in the final response in the form "
+            "MEDIA:<absolute-path>. Any absolute path readable by Hermes can be delivered; "
+            "relative, missing, unreadable, and oversized files are rejected."
+        )
     staging_root = allowed_roots[0]
     return (
         "Attachment delivery requirement: before sending an image or file, copy the final "
@@ -474,7 +479,10 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
     settings = settings or NativeSettings()
     app = FastAPI(title="Daiworld Native Hermes Web", version="0.2.0-native-open-source")
     app.state.settings = settings
-    artifact_roots = [
+    allow_all_readable_artifacts = os.getenv(
+        "VOICE_ARTIFACT_ALLOW_ALL_READABLE", ""
+    ).lower() in {"1", "true", "yes"}
+    artifact_roots = [] if allow_all_readable_artifacts else [
         item.strip()
         for item in os.getenv("VOICE_ARTIFACT_ROOTS", tempfile.gettempdir()).split(os.pathsep)
         if item.strip()

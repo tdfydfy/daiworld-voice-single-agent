@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 import mimetypes
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ from typing import Callable, Iterable
 _STANDALONE_MEDIA = re.compile(r"^\s*[`\"'*_]{0,3}MEDIA:\s*(.+?)[`\"'*_]{0,3}\s*$", re.IGNORECASE)
 _INLINE_MEDIA = re.compile(r"MEDIA:\s*((?:~?/|/)[^\s`\"']+)", re.IGNORECASE)
 _IMAGE_MIME_PREFIX = "image/"
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,8 @@ class ArtifactRegistry:
                 self._items.pop(token, None)
 
     def _is_allowed(self, path: Path) -> bool:
+        if not self.allowed_roots:
+            return True
         if path.name.lower() in _SENSITIVE_NAMES or any(part.lower() in _SENSITIVE_PARTS for part in path.parts):
             return False
         return any(path == root or root in path.parents for root in self.allowed_roots)
@@ -106,12 +110,19 @@ def _extract_media(text: str, registry: ArtifactRegistry) -> tuple[str, list[dic
     output: list[str] = []
 
     def register(candidate: str) -> bool:
+        normalized_candidate = _clean_candidate(candidate)
         try:
-            resolved = Path(_clean_candidate(candidate)).expanduser().resolve(strict=True)
+            resolved = Path(normalized_candidate).expanduser().resolve(strict=True)
             if resolved in seen:
                 return True
             artifact = registry.register(resolved)
-        except (OSError, RuntimeError, ValueError):
+        except (OSError, RuntimeError, ValueError) as exc:
+            _LOGGER.warning(
+                "MEDIA attachment rejected: candidate=%r error=%s detail=%s",
+                normalized_candidate[:1000],
+                type(exc).__name__,
+                exc,
+            )
             return False
         seen.add(resolved)
         artifacts.append(artifact)

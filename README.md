@@ -99,9 +99,9 @@ Hermes 发出 `approval.request` 时：
 
 Agent 显式返回 `MEDIA:<path>` 后：
 
-- 默认只允许 `VOICE_ARTIFACT_ROOTS` 配置的目录；未配置时仅允许 `/tmp`；
+- 默认只允许 `VOICE_ARTIFACT_ROOTS` 配置的目录；正式 Hermes 同权限部署可设置 `VOICE_ARTIFACT_ALLOW_ALL_READABLE=true`，允许投递 Hermes 可读的任意普通文件；
 - 令牌有效期 15 分钟，单文件默认上限 50 MiB；
-- 禁止 `.env`、凭据、SSH和Git目录等敏感路径；
+- 受限目录模式继续禁止 `.env`、凭据、SSH 和 Git 目录等敏感路径；同权限模式以 Hermes 自身文件读取权限为边界；
 - 图片可内联预览，其他文件默认下载；
 - 浏览器不能直接提交服务器路径；
 - 分片出现的 `MEDIA:` 不会显示或被 TTS 朗读。

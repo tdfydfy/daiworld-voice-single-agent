@@ -302,6 +302,18 @@ def test_artifact_delivery_instructions_use_first_allowlisted_root(tmp_path):
     assert "MEDIA:<absolute-path>" in instructions
 
 
+def test_allow_all_readable_artifacts_overrides_configured_roots(monkeypatch, tmp_path):
+    monkeypatch.setenv("VOICE_ARTIFACT_ALLOW_ALL_READABLE", "true")
+    monkeypatch.setenv("VOICE_ARTIFACT_ROOTS", str(tmp_path))
+
+    app = create_native_app(NativeSettings())
+
+    assert app.state.artifact_registry.allowed_roots == ()
+    instructions = artifact_delivery_instructions(app.state.artifact_registry.allowed_roots)
+    assert "Any absolute path readable by Hermes can be delivered" in instructions
+    assert "MEDIA:<absolute-path>" in instructions
+
+
 @pytest.mark.parametrize("method", [
     "session.create",
     "session.list",

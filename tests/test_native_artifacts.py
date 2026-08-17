@@ -1,4 +1,5 @@
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -59,6 +60,30 @@ def test_artifact_allowlist_rejects_outside_root_and_sensitive_files(tmp_path: P
         registry.register(secret)
     with pytest.raises(OSError):
         registry.register(outside)
+
+
+def test_unrestricted_registry_allows_any_readable_regular_file(tmp_path: Path):
+    readable = tmp_path / ".env"
+    readable.write_text("TEST_ONLY=value")
+    registry = ArtifactRegistry(allowed_roots=[])
+
+    artifact = registry.register(readable)
+
+    assert artifact["name"] == ".env"
+    assert registry.resolve(artifact["token"]).path == readable.resolve()
+
+
+def test_rejected_media_path_writes_server_diagnostic(caplog: pytest.LogCaptureFixture, tmp_path: Path):
+    missing = tmp_path / "missing-image.png"
+
+    with caplog.at_level(logging.WARNING, logger="app.artifacts"):
+        payload = json.loads(
+            transform_hermes_message(_complete(f"MEDIA:{missing}"), ArtifactRegistry())
+        )["params"]["payload"]
+
+    assert payload["text"] == "[附件不可用：missing-image.png]"
+    assert "missing-image.png" in caplog.text
+    assert "FileNotFoundError" in caplog.text
 
 
 def test_artifact_size_limit(tmp_path: Path):
