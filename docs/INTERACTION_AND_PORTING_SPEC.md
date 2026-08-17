@@ -78,6 +78,8 @@ WSS /api/hermes/ws?profile=<profile>
 
 服务端连接成功后发送 `gateway.ready` 事件。客户端再调用 `session.create` 或 `session.resume`。
 
+`session.create.params.instructions` 是移动端的会话偏好，不是对 Adapter / Agent 预设规则的替换。Adapter 按“Agent 预设 → 客户端偏好 → 服务端强制契约”的顺序合并三者；客户端不得覆盖附件投递、安全或协议约束。
+
 Adapter 在 `/api/hermes/ws` 建立后每 25 秒向客户端发送 `gateway.heartbeat`。该事件不转发到上游 Hermes，也不进入消息或状态 UI。HarmonyOS 只在收到首个心跳后启动 70 秒看门狗；70 秒内没有后续心跳时关闭旧 socket 并进入有界重连。没有发送心跳的旧 Adapter 不启用该看门狗，以保持协议兼容。
 
 瞬态错误恢复时，客户端重新鉴权并恢复当前 `storedSessionId`，但不得调用手动历史恢复路径、关闭语音输出、清空现有消息或自动重放 Prompt。401/403 仍是终止鉴权失败，不自动重试。
@@ -440,6 +442,8 @@ Live `message.complete` 可能带：
 - URL：`/api/artifacts/{token}`；
 - 下载：`?download=1`；
 - 不显示真实服务器路径。
+
+Adapter 在新建 Session 时要求 Agent 先把最终文件复制到首个 `VOICE_ARTIFACT_ROOTS` 目录，再输出独立的 `MEDIA:<绝对路径>` 行。收到 `[附件不可用：name]` 表示 Adapter 已识别 `MEDIA:`，但源文件不存在、不可读、超限或不在允许目录；这不是客户端预览失败。
 
 ## 13. 历史
 

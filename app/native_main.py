@@ -54,6 +54,19 @@ DEFAULT_VOICE_INSTRUCTIONS = (
 )
 
 
+def artifact_delivery_instructions(allowed_roots: tuple[Path, ...]) -> str:
+    if not allowed_roots:
+        return ""
+    staging_root = allowed_roots[0]
+    return (
+        "Attachment delivery requirement: before sending an image or file, copy the final "
+        f"artifact to a readable regular file under {staging_root} using a unique filename. "
+        "Then include exactly one standalone line in the final response in the form "
+        "MEDIA:<absolute-path>. "
+        f"Only MEDIA paths under {staging_root} can be delivered; paths elsewhere are rejected."
+    )
+
+
 def has_semantic_content(text: object) -> bool:
     """Return whether text contains a Unicode letter or number."""
     value = str(text or "")
@@ -272,9 +285,11 @@ async def fetch_hermes_profiles(
     return _hermes_profile_agents(response.json(), backend_url)
 
 
-def inject_session_instructions(message: str, instructions: str) -> str:
-    if not instructions:
-        return message
+def inject_session_instructions(
+    message: str,
+    instructions: str,
+    required_instructions: str = "",
+) -> str:
     try:
         frame = json.loads(message)
     except (json.JSONDecodeError, TypeError):
@@ -282,9 +297,17 @@ def inject_session_instructions(message: str, instructions: str) -> str:
     if not isinstance(frame, dict) or frame.get("method") != "session.create":
         return message
     params = frame.get("params")
-    if not isinstance(params, dict) or params.get("instructions"):
+    if not isinstance(params, dict):
         return message
-    params["instructions"] = instructions
+    client_value = params.get("instructions")
+    client_instructions = client_value.strip() if isinstance(client_value, str) else ""
+    sections: list[str] = []
+    for value in (instructions.strip(), client_instructions, required_instructions.strip()):
+        if value and value not in sections:
+            sections.append(value)
+    if not sections:
+        return message
+    params["instructions"] = "\n\n".join(sections)
     return json.dumps(frame, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -466,6 +489,9 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
         max_bytes=artifact_max_bytes,
     )
     app.state.artifact_registry = artifact_registry
+    required_artifact_instructions = artifact_delivery_instructions(
+        artifact_registry.allowed_roots
+    )
 
     def require_access(token: str) -> None:
         if not settings.access_token or not hmac.compare_digest(token, settings.access_token):
@@ -795,6 +821,7 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
             transform_client_text=lambda message: inject_session_instructions(
                 inject_session_profile(message, profile),
                 settings.instructions[profile],
+                required_artifact_instructions,
             ),
             heartbeat_interval=GATEWAY_HEARTBEAT_INTERVAL_SECONDS,
         )

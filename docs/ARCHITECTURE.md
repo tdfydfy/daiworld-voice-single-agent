@@ -296,6 +296,7 @@ stateDiagram-v2
 
 ```text
 Agent明确输出 MEDIA:/path
+→ 新建Session的强制契约要求Agent先复制到首个VOICE_ARTIFACT_ROOTS目录
 → Adapter仅允许 VOICE_ARTIFACT_ROOTS 内的普通文件
 → 拒绝 .env、凭据、SSH、Git等敏感路径
 → 校验可读性和单文件大小上限
@@ -307,6 +308,7 @@ Agent明确输出 MEDIA:/path
 安全约束：
 
 - 默认只允许 `/tmp`，生产应配置专用artifact目录；
+- Agent 预设、客户端会话偏好和附件强制契约必须合并，客户端 `instructions` 不能覆盖服务端规则；
 - token只在内存中，15分钟过期或服务重启后失效；
 - 历史中的 MEDIA 每次恢复重新签发；
 - 图片可内联，其他文件默认作为附件下载；

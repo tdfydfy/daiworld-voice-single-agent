@@ -9,6 +9,7 @@ from starlette.websockets import WebSocketDisconnect
 from app import native_main
 from app.native_main import (
     NativeSettings,
+    artifact_delivery_instructions,
     create_native_app,
     has_semantic_content,
     inject_session_profile,
@@ -222,7 +223,8 @@ def test_gateway_websocket_emits_downstream_heartbeat(monkeypatch):
     assert upstream.sent == []
 
 
-def test_websocket_injects_voice_instructions_only_into_session_create(monkeypatch):
+def test_websocket_merges_server_client_and_artifact_instructions(monkeypatch, tmp_path):
+    monkeypatch.setenv("VOICE_ARTIFACT_ROOTS", str(tmp_path))
     monkeypatch.setenv("HERMES_AGENTS_JSON", json.dumps([
         {
             "id": "writer",
@@ -248,37 +250,56 @@ def test_websocket_injects_voice_instructions_only_into_session_create(monkeypat
             "jsonrpc": "2.0",
             "id": "1",
             "method": "session.create",
-            "params": {"cols": 100},
+            "params": {
+                "cols": 100,
+                "instructions": "Use the mobile voice preference.",
+            },
         }))
         time.sleep(0.05)
 
     sent = json.loads(upstream.sent[0])
-    assert sent["params"] == {
-        "cols": 100,
-        "profile": "writer",
-        "instructions": "Keep the spoken answer short.",
-    }
+    assert sent["params"]["cols"] == 100
+    assert sent["params"]["profile"] == "writer"
+    assert sent["params"]["instructions"] == "\n\n".join([
+        "Keep the spoken answer short.",
+        "Use the mobile voice preference.",
+        artifact_delivery_instructions((tmp_path.resolve(),)),
+    ])
 
 
-def test_session_create_preserves_client_supplied_mobile_instructions():
+def test_session_create_merges_client_instructions_after_server_policy():
     message = json.dumps({
         "jsonrpc": "2.0",
         "id": "mobile-session",
         "method": "session.create",
         "params": {
             "cols": 100,
-            "instructions": "当前使用语音交互，回复尽量简洁。",
+            "instructions": "Use concise spoken Chinese.",
         },
     })
 
     transformed = native_main.inject_session_instructions(
         message,
         "Adapter default voice instructions.",
+        "MEDIA delivery is mandatory.",
     )
 
-    assert json.loads(transformed)["params"]["instructions"] == (
-        "当前使用语音交互，回复尽量简洁。"
-    )
+    assert json.loads(transformed)["params"]["instructions"] == "\n\n".join([
+        "Adapter default voice instructions.",
+        "Use concise spoken Chinese.",
+        "MEDIA delivery is mandatory.",
+    ])
+
+
+def test_artifact_delivery_instructions_use_first_allowlisted_root(tmp_path):
+    primary = (tmp_path / "delivery").resolve()
+    fallback = (tmp_path / "fallback").resolve()
+
+    instructions = artifact_delivery_instructions((primary, fallback))
+
+    assert str(primary) in instructions
+    assert str(fallback) not in instructions
+    assert "MEDIA:<absolute-path>" in instructions
 
 
 @pytest.mark.parametrize("method", [
