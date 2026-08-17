@@ -312,6 +312,8 @@ def test_allow_all_readable_artifacts_overrides_configured_roots(monkeypatch, tm
     instructions = artifact_delivery_instructions(app.state.artifact_registry.allowed_roots)
     assert "Any absolute path readable by Hermes can be delivered" in instructions
     assert "MEDIA:<absolute-path-or-https-url>" in instructions
+    assert "Never copy it to a web root" in instructions
+    assert "public domain URL" in instructions
 
 
 @pytest.mark.parametrize("method", [

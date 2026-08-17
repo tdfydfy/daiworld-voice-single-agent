@@ -49,7 +49,10 @@ chmod 0644 "$policy_file"
 (
   cd "$release_dir"
   VOICE_ARTIFACT_ALLOW_ALL_READABLE=true "$release_dir/.venv/bin/python" - <<'PY'
+import json
+
 from app.native_main import NativeSettings, artifact_delivery_instructions, create_native_app
+from app.artifacts import transform_hermes_message
 
 app = create_native_app(NativeSettings())
 registry = app.state.artifact_registry
@@ -58,6 +61,19 @@ assert registry.register("app/artifacts.py")["name"] == "artifacts.py"
 instructions = artifact_delivery_instructions(registry.allowed_roots)
 assert "Any absolute path readable by Hermes can be delivered" in instructions
 assert "MEDIA:<absolute-path-or-https-url>" in instructions
+assert "Never copy it to a web root" in instructions
+frame = json.dumps({
+    "method": "event",
+    "params": {
+        "type": "message.complete",
+        "payload": {
+            "text": "文档：https://show.example.test/files/report.docx?signature=opaque",
+        },
+    },
+})
+payload = json.loads(transform_hermes_message(frame, registry))["params"]["payload"]
+assert "show.example.test" not in payload["text"]
+assert payload["artifacts"][0]["name"] == "report.docx"
 PY
 )
 

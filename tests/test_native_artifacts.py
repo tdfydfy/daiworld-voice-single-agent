@@ -105,6 +105,36 @@ def test_https_media_url_becomes_an_image_artifact_without_link_text():
     assert issued.remote_url == "https://show.example.test/assets/logo%20final.png?version=2"
 
 
+@pytest.mark.parametrize("text", [
+    "文档已生成：[下载 Word](https://show.example.test/files/report%20final.docx?signature=opaque)",
+    "文档已生成：https://show.example.test/files/report%20final.docx?signature=opaque",
+])
+def test_https_document_link_becomes_an_artifact_without_exposing_the_domain(text: str):
+    registry = ArtifactRegistry()
+
+    payload = json.loads(transform_hermes_message(_complete(text), registry))["params"]["payload"]
+
+    assert "show.example.test" not in payload["text"]
+    artifact = payload["artifacts"][0]
+    assert artifact["name"] == "report final.docx"
+    assert artifact["mime_type"] == (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+    assert artifact["is_image"] is False
+    assert registry.resolve(artifact["token"]).remote_url.endswith("?signature=opaque")
+
+
+def test_plain_web_link_is_not_promoted_to_an_artifact():
+    text = "详情：https://show.example.test/articles/report"
+
+    payload = json.loads(transform_hermes_message(_complete(text), ArtifactRegistry()))[
+        "params"
+    ]["payload"]
+
+    assert payload["text"] == text
+    assert "artifacts" not in payload
+
+
 @pytest.mark.parametrize("remote_url", [
     "http://show.example.test/logo.png",
     "https://user:password@show.example.test/logo.png",

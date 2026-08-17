@@ -60,7 +60,10 @@ def artifact_delivery_instructions(allowed_roots: tuple[Path, ...]) -> str:
             "Attachment delivery requirement: save the final image or file as a readable regular "
             "file, then include exactly one standalone line in the final response in the form "
             "MEDIA:<absolute-path-or-https-url>. Any absolute path readable by Hermes can be "
-            "delivered. Existing HTTPS image or file URLs can also be delivered directly; "
+            "delivered. When a requested artifact already exists locally, always deliver its "
+            "existing absolute path directly. Never copy it to a web root, upload it, or turn it "
+            "into a public domain URL merely to send it. Existing HTTPS image or file URLs can "
+            "only be used when no readable local file exists; "
             "relative, missing, unreadable, and oversized files are rejected."
         )
     staging_root = allowed_roots[0]
@@ -69,7 +72,9 @@ def artifact_delivery_instructions(allowed_roots: tuple[Path, ...]) -> str:
         f"artifact to a readable regular file under {staging_root} using a unique filename. "
         "Then include exactly one standalone line in the final response in the form "
         "MEDIA:<absolute-path-or-https-url>. "
-        f"Local MEDIA paths must be under {staging_root}; existing HTTPS URLs can be delivered directly."
+        f"Local MEDIA paths must be under {staging_root}. Never publish a local artifact to a web "
+        "root or turn it into a public domain URL merely to send it; existing HTTPS URLs can only "
+        "be used when no readable local file exists."
     )
 
 

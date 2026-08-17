@@ -17,8 +17,17 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 
 _STANDALONE_MEDIA = re.compile(r"^\s*[`\"'*_]{0,3}MEDIA:\s*(.+?)[`\"'*_]{0,3}\s*$", re.IGNORECASE)
 _INLINE_MEDIA = re.compile(r"MEDIA:\s*((?:(?:https://)|(?:~?/|/))[^\s`\"']+)", re.IGNORECASE)
+_MARKDOWN_HTTPS_LINK = re.compile(r"\[([^\]\r\n]+)\]\((https://[^\s)]+)\)", re.IGNORECASE)
+_BARE_HTTPS_URL = re.compile(r"https://[^\s<>\[\]()`\"']+", re.IGNORECASE)
 _IMAGE_MIME_PREFIX = "image/"
 _LOGGER = logging.getLogger(__name__)
+
+_DOWNLOADABLE_EXTENSIONS = frozenset({
+    ".7z", ".csv", ".doc", ".docx", ".epub", ".gz", ".json", ".md", ".odf",
+    ".ods", ".odt", ".pdf", ".ppt", ".pptx", ".rar", ".rtf", ".tar", ".txt",
+    ".xls", ".xlsx", ".xml", ".zip",
+})
+_TRAILING_URL_PUNCTUATION = ".,;:!?，。；：！？"
 
 
 @dataclass(frozen=True)
@@ -153,6 +162,15 @@ def _diagnostic_candidate(value: str) -> str:
     return value[:1000]
 
 
+def _implicit_download_url(value: str) -> str:
+    candidate = _clean_candidate(value).rstrip(_TRAILING_URL_PUNCTUATION)
+    parsed = urlsplit(candidate)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        return ""
+    suffix = Path(unquote(parsed.path)).suffix.lower()
+    return candidate if suffix in _DOWNLOADABLE_EXTENSIONS else ""
+
+
 def _extract_media(text: str, registry: ArtifactRegistry) -> tuple[str, list[dict[str, object]]]:
     artifacts: list[dict[str, object]] = []
     seen: set[str] = set()
@@ -197,7 +215,24 @@ def _extract_media(text: str, registry: ArtifactRegistry) -> tuple[str, list[dic
             candidate = match.group(1)
             return "" if register(candidate) else f"[附件不可用：{Path(candidate).name or '未知文件'}]"
 
-        output.append(_INLINE_MEDIA.sub(replace_inline, line).rstrip())
+        line = _INLINE_MEDIA.sub(replace_inline, line)
+
+        def replace_markdown_link(match: re.Match[str]) -> str:
+            candidate = _implicit_download_url(match.group(2))
+            if not candidate or not register(candidate):
+                return match.group(0)
+            return match.group(1).strip()
+
+        line = _MARKDOWN_HTTPS_LINK.sub(replace_markdown_link, line)
+
+        def replace_bare_url(match: re.Match[str]) -> str:
+            raw_candidate = match.group(0)
+            candidate = _implicit_download_url(raw_candidate)
+            if not candidate or not register(candidate):
+                return raw_candidate
+            return raw_candidate[len(candidate):]
+
+        output.append(_BARE_HTTPS_URL.sub(replace_bare_url, line).rstrip())
 
     cleaned = "\n".join(line for line in output if line.strip()).strip()
     return cleaned, artifacts
@@ -206,7 +241,7 @@ def _extract_media(text: str, registry: ArtifactRegistry) -> tuple[str, list[dic
 def _decorate_text_container(container: dict, registry: ArtifactRegistry) -> None:
     key = "text" if isinstance(container.get("text"), str) else "content"
     text = container.get(key)
-    if not isinstance(text, str) or "MEDIA:" not in text.upper():
+    if not isinstance(text, str):
         return
     cleaned, artifacts = _extract_media(text, registry)
     container[key] = cleaned
