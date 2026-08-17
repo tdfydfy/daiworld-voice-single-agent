@@ -15,7 +15,7 @@ from urllib.parse import quote, urlencode
 import httpx
 import websockets
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .artifacts import ArtifactRegistry, transform_hermes_message
@@ -59,7 +59,8 @@ def artifact_delivery_instructions(allowed_roots: tuple[Path, ...]) -> str:
         return (
             "Attachment delivery requirement: save the final image or file as a readable regular "
             "file, then include exactly one standalone line in the final response in the form "
-            "MEDIA:<absolute-path>. Any absolute path readable by Hermes can be delivered; "
+            "MEDIA:<absolute-path-or-https-url>. Any absolute path readable by Hermes can be "
+            "delivered. Existing HTTPS image or file URLs can also be delivered directly; "
             "relative, missing, unreadable, and oversized files are rejected."
         )
     staging_root = allowed_roots[0]
@@ -67,8 +68,8 @@ def artifact_delivery_instructions(allowed_roots: tuple[Path, ...]) -> str:
         "Attachment delivery requirement: before sending an image or file, copy the final "
         f"artifact to a readable regular file under {staging_root} using a unique filename. "
         "Then include exactly one standalone line in the final response in the form "
-        "MEDIA:<absolute-path>. "
-        f"Only MEDIA paths under {staging_root} can be delivered; paths elsewhere are rejected."
+        "MEDIA:<absolute-path-or-https-url>. "
+        f"Local MEDIA paths must be under {staging_root}; existing HTTPS URLs can be delivered directly."
     )
 
 
@@ -861,11 +862,22 @@ def create_native_app(settings: NativeSettings | None = None) -> FastAPI:
         )
 
     @app.get("/api/artifacts/{token}")
-    async def artifact(token: str, download: bool = False) -> FileResponse:
+    async def artifact(token: str, download: bool = False) -> Response:
         try:
             item = artifact_registry.resolve(token)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="附件不存在或已过期") from exc
+        if item.remote_url:
+            return RedirectResponse(
+                item.remote_url,
+                status_code=307,
+                headers={
+                    "Cache-Control": "private, no-store",
+                    "Referrer-Policy": "no-referrer",
+                },
+            )
+        if item.path is None:
+            raise HTTPException(status_code=404, detail="附件不存在或已过期")
         is_image = item.mime_type.startswith("image/")
         return FileResponse(
             item.path,

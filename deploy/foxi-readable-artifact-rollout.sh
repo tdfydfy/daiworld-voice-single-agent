@@ -57,7 +57,7 @@ assert registry.allowed_roots == ()
 assert registry.register("app/artifacts.py")["name"] == "artifacts.py"
 instructions = artifact_delivery_instructions(registry.allowed_roots)
 assert "Any absolute path readable by Hermes can be delivered" in instructions
-assert "MEDIA:<absolute-path>" in instructions
+assert "MEDIA:<absolute-path-or-https-url>" in instructions
 PY
 )
 

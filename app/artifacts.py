@@ -12,19 +12,21 @@ import tempfile
 import threading
 import time
 from typing import Callable, Iterable
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 
 _STANDALONE_MEDIA = re.compile(r"^\s*[`\"'*_]{0,3}MEDIA:\s*(.+?)[`\"'*_]{0,3}\s*$", re.IGNORECASE)
-_INLINE_MEDIA = re.compile(r"MEDIA:\s*((?:~?/|/)[^\s`\"']+)", re.IGNORECASE)
+_INLINE_MEDIA = re.compile(r"MEDIA:\s*((?:(?:https://)|(?:~?/|/))[^\s`\"']+)", re.IGNORECASE)
 _IMAGE_MIME_PREFIX = "image/"
 _LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class _Artifact:
-    path: Path
+    path: Path | None
     expires_at: float
     mime_type: str
+    remote_url: str = ""
 
 
 _SENSITIVE_NAMES = frozenset({
@@ -65,6 +67,32 @@ class ArtifactRegistry:
             return False
         return any(path == root or root in path.parents for root in self.allowed_roots)
 
+    def _issue(
+        self,
+        *,
+        path: Path | None,
+        name: str,
+        mime_type: str,
+        size: int,
+        remote_url: str = "",
+    ) -> dict[str, object]:
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._prune()
+            self._items[token] = _Artifact(
+                path=path,
+                expires_at=self.clock() + self.ttl_seconds,
+                mime_type=mime_type,
+                remote_url=remote_url,
+            )
+        return {
+            "token": token,
+            "name": name,
+            "mime_type": mime_type,
+            "size": size,
+            "is_image": mime_type.startswith(_IMAGE_MIME_PREFIX),
+        }
+
     def register(self, raw_path: str | Path) -> dict[str, object]:
         path = Path(raw_path).expanduser().resolve(strict=True)
         if not self._is_allowed(path):
@@ -74,20 +102,33 @@ class ArtifactRegistry:
         size = path.stat().st_size
         if size > self.max_bytes:
             raise OSError("file exceeds artifact size limit")
-        token = secrets.token_urlsafe(32)
         mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        with self._lock:
-            self._prune()
-            self._items[token] = _Artifact(
-                path=path, expires_at=self.clock() + self.ttl_seconds, mime_type=mime_type
-            )
-        return {
-            "token": token,
-            "name": path.name,
-            "mime_type": mime_type,
-            "size": size,
-            "is_image": mime_type.startswith(_IMAGE_MIME_PREFIX),
-        }
+        return self._issue(path=path, name=path.name, mime_type=mime_type, size=size)
+
+    def register_remote_url(self, raw_url: str) -> dict[str, object]:
+        value = str(raw_url or "").strip()
+        if len(value) > 8192:
+            raise ValueError("remote artifact URL is too long")
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme.lower() != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise ValueError("remote artifact must use an HTTPS URL without credentials")
+        name = Path(unquote(parsed.path)).name
+        if not name:
+            raise ValueError("remote artifact URL has no filename")
+        remote_url = urlunsplit(("https", parsed.netloc, parsed.path, parsed.query, ""))
+        mime_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        return self._issue(
+            path=None,
+            name=name,
+            mime_type=mime_type,
+            size=0,
+            remote_url=remote_url,
+        )
 
     def resolve(self, token: str) -> _Artifact:
         with self._lock:
@@ -95,7 +136,7 @@ class ArtifactRegistry:
             item = self._items.get(str(token))
         if item is None:
             raise KeyError("artifact token missing or expired")
-        if not item.path.is_file() or not os.access(item.path, os.R_OK):
+        if item.path is not None and (not item.path.is_file() or not os.access(item.path, os.R_OK)):
             raise KeyError("artifact no longer readable")
         return item
 
@@ -104,27 +145,42 @@ def _clean_candidate(value: str) -> str:
     return value.strip().strip("`\"'").strip()
 
 
+def _diagnostic_candidate(value: str) -> str:
+    if value.lower().startswith(("http://", "https://")):
+        parsed = urlsplit(value)
+        host = parsed.hostname or "invalid-host"
+        return urlunsplit((parsed.scheme, host, parsed.path, "", ""))[:1000]
+    return value[:1000]
+
+
 def _extract_media(text: str, registry: ArtifactRegistry) -> tuple[str, list[dict[str, object]]]:
     artifacts: list[dict[str, object]] = []
-    seen: set[Path] = set()
+    seen: set[str] = set()
     output: list[str] = []
 
     def register(candidate: str) -> bool:
         normalized_candidate = _clean_candidate(candidate)
         try:
-            resolved = Path(normalized_candidate).expanduser().resolve(strict=True)
-            if resolved in seen:
-                return True
-            artifact = registry.register(resolved)
+            if normalized_candidate.lower().startswith("https://"):
+                identity = normalized_candidate
+                if identity in seen:
+                    return True
+                artifact = registry.register_remote_url(normalized_candidate)
+            else:
+                resolved = Path(normalized_candidate).expanduser().resolve(strict=True)
+                identity = str(resolved)
+                if identity in seen:
+                    return True
+                artifact = registry.register(resolved)
         except (OSError, RuntimeError, ValueError) as exc:
             _LOGGER.warning(
                 "MEDIA attachment rejected: candidate=%r error=%s detail=%s",
-                normalized_candidate[:1000],
+                _diagnostic_candidate(normalized_candidate),
                 type(exc).__name__,
                 exc,
             )
             return False
-        seen.add(resolved)
+        seen.add(identity)
         artifacts.append(artifact)
         return True
 

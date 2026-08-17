@@ -299,7 +299,7 @@ def test_artifact_delivery_instructions_use_first_allowlisted_root(tmp_path):
 
     assert str(primary) in instructions
     assert str(fallback) not in instructions
-    assert "MEDIA:<absolute-path>" in instructions
+    assert "MEDIA:<absolute-path-or-https-url>" in instructions
 
 
 def test_allow_all_readable_artifacts_overrides_configured_roots(monkeypatch, tmp_path):
@@ -311,7 +311,7 @@ def test_allow_all_readable_artifacts_overrides_configured_roots(monkeypatch, tm
     assert app.state.artifact_registry.allowed_roots == ()
     instructions = artifact_delivery_instructions(app.state.artifact_registry.allowed_roots)
     assert "Any absolute path readable by Hermes can be delivered" in instructions
-    assert "MEDIA:<absolute-path>" in instructions
+    assert "MEDIA:<absolute-path-or-https-url>" in instructions
 
 
 @pytest.mark.parametrize("method", [

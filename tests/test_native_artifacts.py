@@ -86,6 +86,38 @@ def test_rejected_media_path_writes_server_diagnostic(caplog: pytest.LogCaptureF
     assert "FileNotFoundError" in caplog.text
 
 
+def test_https_media_url_becomes_an_image_artifact_without_link_text():
+    remote_url = "https://show.example.test/assets/logo%20final.png?version=2#preview"
+    registry = ArtifactRegistry()
+
+    payload = json.loads(
+        transform_hermes_message(_complete(f"图片如下\nMEDIA:{remote_url}"), registry)
+    )["params"]["payload"]
+
+    assert payload["text"] == "图片如下"
+    artifact = payload["artifacts"][0]
+    assert artifact["name"] == "logo final.png"
+    assert artifact["mime_type"] == "image/png"
+    assert artifact["is_image"] is True
+    assert "show.example.test" not in json.dumps(payload)
+    issued = registry.resolve(artifact["token"])
+    assert issued.path is None
+    assert issued.remote_url == "https://show.example.test/assets/logo%20final.png?version=2"
+
+
+@pytest.mark.parametrize("remote_url", [
+    "http://show.example.test/logo.png",
+    "https://user:password@show.example.test/logo.png",
+])
+def test_unsafe_remote_media_url_is_not_issued(remote_url: str):
+    payload = json.loads(
+        transform_hermes_message(_complete(f"MEDIA:{remote_url}"), ArtifactRegistry())
+    )["params"]["payload"]
+
+    assert "artifacts" not in payload
+    assert payload["text"] == "[附件不可用：logo.png]"
+
+
 def test_artifact_size_limit(tmp_path: Path):
     report = tmp_path / "large.bin"
     report.write_bytes(b"12345")
@@ -218,3 +250,22 @@ def test_artifact_http_route_serves_only_issued_tokens(tmp_path: Path):
     assert download.status_code == 200
     assert "attachment" in download.headers["content-disposition"]
     assert missing.status_code == 404
+
+
+def test_remote_image_artifact_route_redirects_without_exposing_url_in_metadata():
+    settings = NativeSettings()
+    settings.access_token = "test-token"
+    app = create_native_app(settings)
+    remote_url = "https://show.example.test/image/logo.png?signature=opaque"
+    artifact = app.state.artifact_registry.register_remote_url(remote_url)
+    client = TestClient(app)
+
+    response = client.get(
+        f"/api/artifacts/{artifact['token']}",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 307
+    assert response.headers["location"] == remote_url
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.headers["referrer-policy"] == "no-referrer"

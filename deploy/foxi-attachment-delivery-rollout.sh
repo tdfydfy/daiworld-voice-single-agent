@@ -43,7 +43,7 @@ instructions = transformed["params"]["instructions"]
 assert "agent policy" in instructions
 assert "mobile preference" in instructions
 assert "Attachment delivery requirement" in instructions
-assert "MEDIA:<absolute-path>" in instructions
+assert "MEDIA:<absolute-path-or-https-url>" in instructions
 assert "/tmp" in instructions
 PY
 )
