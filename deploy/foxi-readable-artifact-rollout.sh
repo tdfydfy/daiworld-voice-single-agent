@@ -50,6 +50,7 @@ chmod 0644 "$policy_file"
   cd "$release_dir"
   VOICE_ARTIFACT_ALLOW_ALL_READABLE=true "$release_dir/.venv/bin/python" - <<'PY'
 import json
+import tempfile
 
 from app.native_main import NativeSettings, artifact_delivery_instructions, create_native_app
 from app.artifacts import transform_hermes_message
@@ -74,6 +75,21 @@ frame = json.dumps({
 payload = json.loads(transform_hermes_message(frame, registry))["params"]["payload"]
 assert "show.example.test" not in payload["text"]
 assert payload["artifacts"][0]["name"] == "report.docx"
+with tempfile.NamedTemporaryFile(suffix=".docx") as report:
+    sandbox_frame = json.dumps({
+        "method": "event",
+        "params": {
+            "type": "message.complete",
+            "payload": {
+                "text": f"[下载 Word 文件](sandbox:{report.name})",
+            },
+        },
+    })
+    sandbox_payload = json.loads(
+        transform_hermes_message(sandbox_frame, registry)
+    )["params"]["payload"]
+    assert "sandbox:" not in sandbox_payload["text"]
+    assert sandbox_payload["artifacts"][0]["name"].endswith(".docx")
 PY
 )
 

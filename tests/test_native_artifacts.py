@@ -124,8 +124,58 @@ def test_https_document_link_becomes_an_artifact_without_exposing_the_domain(tex
     assert registry.resolve(artifact["token"]).remote_url.endswith("?signature=opaque")
 
 
+def test_sandbox_markdown_link_becomes_a_local_artifact(tmp_path: Path):
+    report = tmp_path / "sandbox-report.docx"
+    report.write_bytes(b"PK-docx-test")
+    sandbox_reference = "sandbox:/" + report.as_posix().lstrip("/")
+
+    payload = json.loads(transform_hermes_message(
+        _complete(f"[下载文件：{report.name}]({sandbox_reference})"),
+        ArtifactRegistry(allowed_roots=[]),
+    ))["params"]["payload"]
+
+    assert payload["text"] == f"下载文件：{report.name}"
+    assert payload["artifacts"][0]["name"] == report.name
+    assert payload["artifacts"][0]["is_image"] is False
+
+
+def test_file_uri_and_bare_local_path_become_local_artifacts(tmp_path: Path):
+    report = tmp_path / "local-report.pdf"
+    report.write_bytes(b"%PDF-test")
+    registry = ArtifactRegistry(allowed_roots=[])
+
+    file_reference = "file:///" + report.as_posix().lstrip("/")
+    file_payload = json.loads(transform_hermes_message(
+        _complete(f"文件：{file_reference}"), registry,
+    ))["params"]["payload"]
+    bare_payload = json.loads(transform_hermes_message(
+        _complete(f"文件：{report}"), registry,
+    ))["params"]["payload"]
+
+    assert file_payload["text"] == "文件："
+    assert file_payload["artifacts"][0]["name"] == report.name
+    assert bare_payload["text"] == "文件："
+    assert bare_payload["artifacts"][0]["name"] == report.name
+
+
 def test_plain_web_link_is_not_promoted_to_an_artifact():
     text = "详情：https://show.example.test/articles/report"
+
+    payload = json.loads(transform_hermes_message(_complete(text), ArtifactRegistry()))[
+        "params"
+    ]["payload"]
+
+    assert payload["text"] == text
+    assert "artifacts" not in payload
+
+
+@pytest.mark.parametrize("reference", [
+    "ftp://files.example.test/report.docx",
+    "artifact:/root/report.docx",
+    "blob:https://show.example.test/report.docx",
+])
+def test_unknown_or_unsupported_protocol_is_not_promoted(reference: str):
+    text = f"[下载文件]({reference})"
 
     payload = json.loads(transform_hermes_message(_complete(text), ArtifactRegistry()))[
         "params"

@@ -17,17 +17,24 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 
 _STANDALONE_MEDIA = re.compile(r"^\s*[`\"'*_]{0,3}MEDIA:\s*(.+?)[`\"'*_]{0,3}\s*$", re.IGNORECASE)
 _INLINE_MEDIA = re.compile(r"MEDIA:\s*((?:(?:https://)|(?:~?/|/))[^\s`\"']+)", re.IGNORECASE)
-_MARKDOWN_HTTPS_LINK = re.compile(r"\[([^\]\r\n]+)\]\((https://[^\s)]+)\)", re.IGNORECASE)
-_BARE_HTTPS_URL = re.compile(r"https://[^\s<>\[\]()`\"']+", re.IGNORECASE)
+_MARKDOWN_LINK = re.compile(r"\[([^\]\r\n]+)\]\(([^\s)]+)\)", re.IGNORECASE)
+_BARE_REFERENCE = re.compile(
+    r"(?<![A-Za-z0-9_:/+.-])(?:"
+    r"(?:https?://|sandbox:|file://)[^\s<>\[\]()`\"']+|"
+    r"(?:~?/|\.\.?/|[A-Za-z]:[\\/])[^\s<>\[\]()`\"']+)",
+    re.IGNORECASE,
+)
 _IMAGE_MIME_PREFIX = "image/"
 _LOGGER = logging.getLogger(__name__)
 
 _DOWNLOADABLE_EXTENSIONS = frozenset({
-    ".7z", ".csv", ".doc", ".docx", ".epub", ".gz", ".json", ".md", ".odf",
-    ".ods", ".odt", ".pdf", ".ppt", ".pptx", ".rar", ".rtf", ".tar", ".txt",
-    ".xls", ".xlsx", ".xml", ".zip",
+    ".7z", ".apng", ".avif", ".bmp", ".csv", ".doc", ".docx", ".epub", ".gif",
+    ".gz", ".heic", ".heif", ".ico", ".jpeg", ".jpg", ".json", ".md", ".odf",
+    ".ods", ".odt", ".pdf", ".png", ".ppt", ".pptx", ".rar", ".rtf", ".svg",
+    ".tar", ".tif", ".tiff", ".txt", ".webp", ".xls", ".xlsx", ".xml", ".zip",
 })
 _TRAILING_URL_PUNCTUATION = ".,;:!?，。；：！？"
+_LOCAL_REFERENCE_SCHEMES = frozenset({"file", "sandbox"})
 
 
 @dataclass(frozen=True)
@@ -162,13 +169,52 @@ def _diagnostic_candidate(value: str) -> str:
     return value[:1000]
 
 
-def _implicit_download_url(value: str) -> str:
+def _implicit_attachment_reference(value: str) -> str:
     candidate = _clean_candidate(value).rstrip(_TRAILING_URL_PUNCTUATION)
+    if re.match(r"^[A-Za-z]:[\\/]", candidate):
+        return candidate if Path(unquote(candidate)).suffix.lower() in _DOWNLOADABLE_EXTENSIONS else ""
     parsed = urlsplit(candidate)
-    if parsed.scheme.lower() != "https" or not parsed.hostname:
+    scheme = parsed.scheme.lower()
+    if scheme == "https":
+        if not parsed.hostname:
+            return ""
+        suffix = Path(unquote(parsed.path)).suffix.lower()
+        return candidate if suffix in _DOWNLOADABLE_EXTENSIONS else ""
+    if scheme in _LOCAL_REFERENCE_SCHEMES:
+        local_path = _local_path_from_reference(candidate)
+        if local_path is None or local_path.suffix.lower() not in _DOWNLOADABLE_EXTENSIONS:
+            return ""
+        return candidate
+    if scheme:
         return ""
-    suffix = Path(unquote(parsed.path)).suffix.lower()
-    return candidate if suffix in _DOWNLOADABLE_EXTENSIONS else ""
+    try:
+        local_path = Path(unquote(candidate)).expanduser()
+    except (OSError, ValueError):
+        return ""
+    return candidate if local_path.suffix.lower() in _DOWNLOADABLE_EXTENSIONS else ""
+
+
+def _local_path_from_reference(value: str) -> Path | None:
+    candidate = _clean_candidate(value)
+    if re.match(r"^[A-Za-z]:[\\/]", candidate):
+        return Path(unquote(candidate)).expanduser()
+    parsed = urlsplit(candidate)
+    scheme = parsed.scheme.lower()
+    if scheme not in _LOCAL_REFERENCE_SCHEMES:
+        if scheme:
+            return None
+        return Path(unquote(candidate)).expanduser()
+    if parsed.query or parsed.fragment:
+        return None
+    if parsed.netloc and parsed.netloc.lower() not in {"", "localhost"}:
+        return None
+    path = unquote(parsed.path)
+    if not path:
+        return None
+    # Keep local references testable on Windows while preserving POSIX paths in production.
+    if os.name == "nt" and re.match(r"^/[A-Za-z]:[\\/]", path):
+        path = path[1:]
+    return Path(path).expanduser()
 
 
 def _extract_media(text: str, registry: ArtifactRegistry) -> tuple[str, list[dict[str, object]]]:
@@ -185,7 +231,10 @@ def _extract_media(text: str, registry: ArtifactRegistry) -> tuple[str, list[dic
                     return True
                 artifact = registry.register_remote_url(normalized_candidate)
             else:
-                resolved = Path(normalized_candidate).expanduser().resolve(strict=True)
+                local_path = _local_path_from_reference(normalized_candidate)
+                if local_path is None:
+                    raise ValueError("unsupported attachment reference")
+                resolved = local_path.resolve(strict=True)
                 identity = str(resolved)
                 if identity in seen:
                     return True
@@ -218,21 +267,25 @@ def _extract_media(text: str, registry: ArtifactRegistry) -> tuple[str, list[dic
         line = _INLINE_MEDIA.sub(replace_inline, line)
 
         def replace_markdown_link(match: re.Match[str]) -> str:
-            candidate = _implicit_download_url(match.group(2))
-            if not candidate or not register(candidate):
+            candidate = _implicit_attachment_reference(match.group(2))
+            if not candidate:
                 return match.group(0)
+            if not register(candidate):
+                return f"[附件不可用：{match.group(1).strip() or '未知文件'}]"
             return match.group(1).strip()
 
-        line = _MARKDOWN_HTTPS_LINK.sub(replace_markdown_link, line)
+        line = _MARKDOWN_LINK.sub(replace_markdown_link, line)
 
-        def replace_bare_url(match: re.Match[str]) -> str:
+        def replace_bare_reference(match: re.Match[str]) -> str:
             raw_candidate = match.group(0)
-            candidate = _implicit_download_url(raw_candidate)
-            if not candidate or not register(candidate):
+            candidate = _implicit_attachment_reference(raw_candidate)
+            if not candidate:
                 return raw_candidate
+            if not register(candidate):
+                return f"[附件不可用：{Path(unquote(urlsplit(candidate).path)).name or '未知文件'}]"
             return raw_candidate[len(candidate):]
 
-        output.append(_BARE_HTTPS_URL.sub(replace_bare_url, line).rstrip())
+        output.append(_BARE_REFERENCE.sub(replace_bare_reference, line).rstrip())
 
     cleaned = "\n".join(line for line in output if line.strip()).strip()
     return cleaned, artifacts
